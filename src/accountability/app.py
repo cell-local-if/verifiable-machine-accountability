@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import chain, rotation_chain
+from . import chain, incidents, rotation_chain
 from .db import (
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
@@ -23,6 +23,7 @@ from .db import (
     AuthorizationDecisionIncident,
     Base,
     BehaviorDeclaration,
+    IncidentStatusEvent,
     KeyRotationEvent,
     Machine,
     PolicyRule,
@@ -972,6 +973,105 @@ def list_incidents(machine_id: str, event_id: str, session: SessionDep):
         )
     ).all()
     return [incident_to_out(record) for record in records]
+
+
+class IncidentStatusUpdate(BaseModel):
+    status: Literal["acknowledged", "resolved"]
+
+
+class IncidentStatusEventOut(BaseModel):
+    id: str
+    machine_id: str
+    event_id: str
+    incident_id: str
+    from_status: str
+    to_status: str
+    created_at: str
+
+
+def incident_status_event_to_out(
+    record: IncidentStatusEvent,
+) -> IncidentStatusEventOut:
+    return IncidentStatusEventOut(
+        id=record.id,
+        machine_id=record.machine_id,
+        event_id=record.event_id,
+        incident_id=record.incident_id,
+        from_status=record.from_status,
+        to_status=record.to_status,
+        created_at=record.created_at,
+    )
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/incidents/"
+    "{incident_id}/status",
+    response_model=IncidentOut,
+)
+def transition_incident_status(
+    machine_id: str,
+    event_id: str,
+    incident_id: str,
+    body: IncidentStatusUpdate,
+    session: SessionDep,
+):
+    """Advance one incident along ``open -> acknowledged -> resolved``.
+
+    Body validation runs before any path lookup, so a missing, non-string, or
+    otherwise invalid ``status`` is a 422 even when the machine, event, or
+    incident does not exist. A missing machine, event, or incident, or an
+    ownership mismatch, is a 404. Any transition other than ``open ->
+    acknowledged`` and ``acknowledged -> resolved`` returns 409
+    ``invalid_status_transition`` and writes nothing. On success the incident
+    status update and one append-only history record are committed in a single
+    transaction, and the updated incident is returned with status 200.
+    """
+    engine = session.get_bind()
+    # Release the read connection before opening the locked write transaction,
+    # matching the chain appenders: concurrent transitions never hold two pool
+    # connections at once.
+    session.close()
+    result = incidents.change_incident_status(
+        engine,
+        machine_id=machine_id,
+        event_id=event_id,
+        incident_id=incident_id,
+        to_status=body.status,
+    )
+    if result["status"] == "not_found":
+        return error_response(404, "not_found")
+    if result["status"] == "invalid_status_transition":
+        return error_response(409, "invalid_status_transition")
+    return IncidentOut(**result["incident"])
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/incidents/"
+    "{incident_id}/status-history",
+    response_model=list[IncidentStatusEventOut],
+)
+def list_incident_status_history(
+    machine_id: str,
+    event_id: str,
+    incident_id: str,
+    session: SessionDep,
+):
+    """Read-only, immutable history of one incident's status transitions.
+
+    The machine, event, and incident must all exist and belong together; a
+    missing one or an ownership mismatch returns 404 ``not_found``. Entries are
+    returned in ``created_at``, then ``id`` order (``[]`` for an incident that
+    has never moved). The query only reads: history records are never updated
+    or deleted, and no other table is touched.
+    """
+    incident = incidents.get_machine_event_incident(
+        session, machine_id, event_id, incident_id
+    )
+    if incident is None:
+        return error_response(404, "not_found")
+
+    records = incidents.list_status_history(session, machine_id, event_id, incident_id)
+    return [incident_status_event_to_out(record) for record in records]
 
 
 # Evidence fingerprints are checked exactly as stored: 64 characters drawn

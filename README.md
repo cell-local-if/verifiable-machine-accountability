@@ -130,6 +130,40 @@ against an event it does not own), survive application restarts, and neither
 endpoint ever writes or modifies events, evidence, hash chains, or causal
 links.
 
+## Incident status transitions and immutable history
+
+An incident moves through a fixed state machine: `open` (the status assigned
+at registration) → `acknowledged` → `resolved`.
+
+`POST /machines/{machine_id}/authorization-decision-events/{event_id}/incidents/{incident_id}/status`
+advances one incident. The body is `{"status": "..."}` where `status` must be
+the string `"acknowledged"` or `"resolved"`; a missing field, a non-string
+value, or any other string returns `422`, and body validation runs before any
+path lookup (so a malformed payload is `422` even when nothing on the path
+exists). After validation, the machine, event, and incident must all exist and
+belong to one another; a missing one or an ownership mismatch returns
+`404 {"error":{"code":"not_found"}}`. Only `open → acknowledged` and
+`acknowledged → resolved` are legal; any other transition returns
+`409 {"error":{"code":"invalid_status_transition"}}` and writes nothing. On
+success the incident's `status` is updated and one history record is appended
+inside a single transaction (so the two can never diverge, and concurrent
+transitions cannot both observe the same prior status); the response is `200`
+with the full updated incident (the same fields as the incident create/list
+endpoints).
+
+`GET .../incidents/{incident_id}/status-history` returns the incident's
+immutable transition records in `created_at`, then `id` order (`[]` for an
+incident that has never moved). The machine, event, and incident are validated
+exactly as for the POST, including the same `404 not_found` outcomes. Each
+entry contains exactly `{id, machine_id, event_id, incident_id, from_status,
+to_status, created_at}`: a fresh UUID `id` and `created_at` a UTC RFC 3339
+date-time ending in `Z`. History rows are append-only — they are never updated
+or deleted, so a rejected transition leaves the incident status and the history
+both untouched, and neither endpoint ever writes or modifies events, evidence,
+hash chains, or causal links. History is strictly isolated to its own incident
+(another incident, event, or machine can never read it) and persists across
+application restarts.
+
 ## Bounded causal traces
 
 `GET /machines/{machine_id}/authorization-decision-events/{event_id}/causal-trace`
