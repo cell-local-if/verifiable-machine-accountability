@@ -42,6 +42,32 @@ otherwise it reports `false`, the total count, and the first event whose
 content hash, link, or chain hash does not verify. A missing machine returns
 `404 not_found`.
 
+## Read-only evidence integrity audit
+
+`GET /machines/{machine_id}/authorization-decision-events/evidence/integrity`
+audits every evidence record owned by one machine, in `(created_at, id)`
+order, and returns `{valid, checked_count, broken_evidence_id}`. A missing
+machine returns `404 {"error":{"code":"not_found"}}`; a machine with no
+evidence returns `200` with `true`, `0`, and `null`.
+
+Each record passes only when:
+
+- its `event_id` resolves to an existing authorization decision event that
+  belongs to the same machine (missing or foreign-owned events fail);
+- `evidence_type` is a string that stays non-empty after trimming surrounding
+  whitespace;
+- `content_hash`, compared exactly as stored with no case folding, is exactly
+  64 lowercase hexadecimal characters (`^[0-9a-f]{64}$`).
+
+The first failing record sets `valid` to `false` and `broken_evidence_id` to
+its id; `checked_count` is always the machine's total evidence count, and it
+is `null` when every record passes. Only the path machine's records are
+checked, so damaged evidence under another machine never fails this audit.
+The query is strictly read-only — it never writes, repairs, deletes, or
+normalizes evidence, events, hash chains, or causal links — gives identical
+results on repeat calls against unchanged data, and audits data persisted
+across application restarts.
+
 ## Bounded causal traces
 
 `GET /machines/{machine_id}/authorization-decision-events/{event_id}/causal-trace`

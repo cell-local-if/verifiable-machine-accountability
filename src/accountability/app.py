@@ -791,6 +791,88 @@ def list_evidence(machine_id: str, event_id: str, session: SessionDep):
     return [evidence_to_out(record) for record in records]
 
 
+# Evidence fingerprints are checked exactly as stored: 64 characters drawn
+# only from lowercase hexadecimal. The pattern never case-folds, so an
+# uppercase fingerprint fails verification instead of being normalized away.
+_EVIDENCE_LOWER_HEX_HASH_RE = re.compile(r"[0-9a-f]{64}")
+
+
+class EvidenceIntegrityOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_evidence_id: str | None
+
+
+def find_broken_evidence(
+    session: Session, machine_id: str
+) -> tuple[int, str | None]:
+    """Scan one machine's evidence records in (created_at, id) order.
+
+    Returns ``(total_count, broken_evidence_id)``. A record is broken when its
+    ``event_id`` does not resolve to an existing authorization decision event
+    owned by the path machine (missing or owned by another machine), when
+    ``evidence_type`` is not a string that stays non-empty after trimming
+    surrounding whitespace, or when ``content_hash`` is not exactly 64
+    lowercase hexadecimal characters compared as stored. Read-only: it issues
+    no writes and never normalizes, repairs, or deletes a bad value.
+    """
+    records = session.scalars(
+        select(AuthorizationDecisionEvidence)
+        .where(AuthorizationDecisionEvidence.machine_id == machine_id)
+        .order_by(
+            AuthorizationDecisionEvidence.created_at,
+            AuthorizationDecisionEvidence.id,
+        )
+    ).all()
+
+    machine_event_ids = set(
+        session.scalars(
+            select(AuthorizationDecisionEvent.id).where(
+                AuthorizationDecisionEvent.machine_id == machine_id
+            )
+        ).all()
+    )
+
+    for record in records:
+        if (
+            record.event_id not in machine_event_ids
+            or not isinstance(record.evidence_type, str)
+            or not record.evidence_type.strip()
+            or not isinstance(record.content_hash, str)
+            or _EVIDENCE_LOWER_HEX_HASH_RE.fullmatch(record.content_hash) is None
+        ):
+            return len(records), record.id
+
+    return len(records), None
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/evidence/integrity",
+    response_model=EvidenceIntegrityOut,
+)
+def check_evidence_integrity(machine_id: str, session: SessionDep):
+    """Read-only integrity audit of one machine's evidence records.
+
+    Returns ``{valid, checked_count, broken_evidence_id}``: no records or all
+    sound records report ``true``, the machine's total evidence count, and
+    ``null``; otherwise the first record failing the event reference,
+    evidence-type, or exact lowercase-hex-content-hash check is reported. Only
+    evidence owned by the path machine is examined, so another machine's
+    damaged records can never fail this machine's audit. The query never
+    writes, repairs, or deletes evidence, events, chains, or links.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    checked_count, broken_evidence_id = find_broken_evidence(session, machine_id)
+    return EvidenceIntegrityOut(
+        valid=broken_evidence_id is None,
+        checked_count=checked_count,
+        broken_evidence_id=broken_evidence_id,
+    )
+
+
 class ComplianceExportOut(BaseModel):
     machine_id: str
     from_created_at: str
