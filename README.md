@@ -42,6 +42,37 @@ otherwise it reports `false`, the total count, and the first event whose
 content hash, link, or chain hash does not verify. A missing machine returns
 `404 not_found`.
 
+## Key rotation integrity chain
+
+Each machine's key rotation history forms its own per-machine, tamper-evident
+hash chain, following the same rules as the authorization event integrity
+chain. Every record returned by the key-rotation list endpoint carries:
+
+- `previous_rotation_id` — `null` for the machine's first rotation, otherwise
+  the id of the preceding record in `(created_at, id)` order;
+- `content_hash` — `SHA-256(UTF-8(compact key-sorted JSON of {id, machine_id,
+  old_public_key, new_public_key, version, created_at}))`;
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first
+  record and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))`
+  thereafter.
+
+All hashes are 64-character lowercase hexadecimal strings. A successful
+rotation updates the machine and appends the record to the chain tail inside
+a single write transaction, so concurrent rotations cannot lose records,
+fork, or break the chain. On startup the service adds the new columns to
+pre-existing databases and backfills missing chain data in `(created_at, id)`
+order; the recomputation is deterministic, so restarting with an already
+complete database performs no writes.
+
+`GET /machines/{machine_id}/key-rotation-events/integrity` verifies the chain
+read-only and returns `{valid, checked_count, broken_rotation_id}`: a complete
+or empty chain reports `true`, the total count, and `null`; otherwise it
+reports `false`, the total count, and the first record whose content hash,
+link, or chain hash does not verify. The check never writes, repairs, or
+deletes records, is stable across repeat calls and restarts, and only
+examines the path machine's records. A missing machine returns
+`404 not_found`.
+
 ## Read-only evidence integrity audit
 
 `GET /machines/{machine_id}/authorization-decision-events/evidence/integrity`
