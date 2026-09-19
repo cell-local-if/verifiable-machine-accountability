@@ -7,12 +7,12 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, StringConstraints
-from sqlalchemy import create_engine, event, update
+from pydantic import BaseModel, StrictBool, StringConstraints
+from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .db import Base, Machine
+from .db import Base, BehaviorDeclaration, Machine
 
 DEFAULT_DATABASE_URL = "sqlite:///./accountability.db"
 
@@ -111,6 +111,34 @@ def to_out(machine: Machine) -> MachineOut:
     )
 
 
+class BehaviorDeclarationCreate(BaseModel):
+    action_type: NonEmptyStr
+    resource_pattern: NonEmptyStr
+    enabled: StrictBool
+
+
+class BehaviorDeclarationOut(BaseModel):
+    id: str
+    machine_id: str
+    action_type: str
+    resource_pattern: str
+    enabled: bool
+    created_at: str
+    updated_at: str
+
+
+def declaration_to_out(declaration: BehaviorDeclaration) -> BehaviorDeclarationOut:
+    return BehaviorDeclarationOut(
+        id=declaration.id,
+        machine_id=declaration.machine_id,
+        action_type=declaration.action_type,
+        resource_pattern=declaration.resource_pattern,
+        enabled=declaration.enabled,
+        created_at=declaration.created_at,
+        updated_at=declaration.updated_at,
+    )
+
+
 @app.post("/machines", status_code=201, response_model=MachineOut)
 def create_machine(body: MachineCreate, session: SessionDep):
     now = utc_now_iso()
@@ -169,3 +197,53 @@ def rotate_key(machine_id: str, body: RotateKeyRequest, session: SessionDep):
     session.commit()
     session.refresh(machine)
     return to_out(machine)
+
+
+@app.post(
+    "/machines/{machine_id}/behavior-declarations",
+    status_code=201,
+    response_model=BehaviorDeclarationOut,
+)
+def create_behavior_declaration(
+    machine_id: str, body: BehaviorDeclarationCreate, session: SessionDep
+):
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    now = utc_now_iso()
+    declaration = BehaviorDeclaration(
+        id=str(uuid.uuid4()),
+        machine_id=machine_id,
+        action_type=body.action_type,
+        resource_pattern=body.resource_pattern,
+        enabled=body.enabled,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(declaration)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        if session.get(Machine, machine_id) is None:
+            return error_response(404, "not_found")
+        return error_response(409, "duplicate_behavior_declaration")
+    return declaration_to_out(declaration)
+
+
+@app.get(
+    "/machines/{machine_id}/behavior-declarations",
+    response_model=list[BehaviorDeclarationOut],
+)
+def list_behavior_declarations(machine_id: str, session: SessionDep):
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    declarations = session.scalars(
+        select(BehaviorDeclaration)
+        .where(BehaviorDeclaration.machine_id == machine_id)
+        .order_by(BehaviorDeclaration.created_at, BehaviorDeclaration.id)
+    ).all()
+    return [declaration_to_out(d) for d in declarations]
