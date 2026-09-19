@@ -20,6 +20,7 @@ from .db import (
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
     AuthorizationDecisionEvidence,
+    AuthorizationDecisionIncident,
     Base,
     BehaviorDeclaration,
     KeyRotationEvent,
@@ -871,6 +872,106 @@ def list_evidence(machine_id: str, event_id: str, session: SessionDep):
         )
     ).all()
     return [evidence_to_out(record) for record in records]
+
+
+class IncidentCreate(BaseModel):
+    incident_type: NonEmptyStr
+    summary: NonEmptyStr
+
+
+class IncidentOut(BaseModel):
+    id: str
+    machine_id: str
+    event_id: str
+    incident_type: str
+    summary: str
+    status: str
+    created_at: str
+
+
+def incident_to_out(record: AuthorizationDecisionIncident) -> IncidentOut:
+    return IncidentOut(
+        id=record.id,
+        machine_id=record.machine_id,
+        event_id=record.event_id,
+        incident_type=record.incident_type,
+        summary=record.summary,
+        status=record.status,
+        created_at=record.created_at,
+    )
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/incidents",
+    status_code=201,
+    response_model=IncidentOut,
+)
+def create_incident(
+    machine_id: str,
+    event_id: str,
+    body: IncidentCreate,
+    session: SessionDep,
+):
+    """Register one persistent exception-handling incident on a decision event.
+
+    Body validation runs before any path lookup, so a malformed payload is a
+    422 even when the machine or event does not exist. The write touches only
+    the incidents table: the event, its evidence, hash chain, and causal links
+    are never modified.
+    """
+    event = get_machine_event(session, machine_id, event_id)
+    if event is None:
+        return error_response(404, "not_found")
+
+    existing = session.scalar(
+        select(AuthorizationDecisionIncident).where(
+            AuthorizationDecisionIncident.event_id == event_id,
+            AuthorizationDecisionIncident.incident_type == body.incident_type,
+            AuthorizationDecisionIncident.summary == body.summary,
+        )
+    )
+    if existing is not None:
+        return error_response(409, "duplicate_incident")
+
+    record = AuthorizationDecisionIncident(
+        id=str(uuid.uuid4()),
+        machine_id=machine_id,
+        event_id=event_id,
+        incident_type=body.incident_type,
+        summary=body.summary,
+        status="open",
+        created_at=utc_now_iso(),
+    )
+    session.add(record)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return error_response(409, "duplicate_incident")
+    return incident_to_out(record)
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/incidents",
+    response_model=list[IncidentOut],
+)
+def list_incidents(machine_id: str, event_id: str, session: SessionDep):
+    event = get_machine_event(session, machine_id, event_id)
+    if event is None:
+        return error_response(404, "not_found")
+
+    records = session.scalars(
+        select(AuthorizationDecisionIncident)
+        .where(
+            AuthorizationDecisionIncident.machine_id == machine_id,
+            AuthorizationDecisionIncident.event_id == event_id,
+        )
+        .order_by(
+            AuthorizationDecisionIncident.created_at,
+            AuthorizationDecisionIncident.id,
+        )
+    ).all()
+    return [incident_to_out(record) for record in records]
 
 
 # Evidence fingerprints are checked exactly as stored: 64 characters drawn

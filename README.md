@@ -99,6 +99,37 @@ normalizes evidence, events, hash chains, or causal links — gives identical
 results on repeat calls against unchanged data, and audits data persisted
 across application restarts.
 
+## Persistent exception-handling incident registrations
+
+`POST /machines/{machine_id}/authorization-decision-events/{event_id}/incidents`
+registers a persistent exception-handling incident on one authorization
+decision event. The body requires:
+
+- `incident_type`, `summary` — strings that stay non-empty after trimming
+  surrounding whitespace; missing, non-string, or blank values return `422`.
+  Body validation runs before any path lookup, so a malformed payload is `422`
+  even when the machine or event does not exist.
+
+After validation, the machine and event must both exist and the event must
+belong to the machine; otherwise the endpoint returns
+`404 {"error":{"code":"not_found"}}`. Success returns `201` with
+`{id, machine_id, event_id, incident_type, summary, status, created_at}`: a
+fresh UUID `id`, `status` always `"open"`, and `created_at` a UTC RFC 3339
+date-time ending in `Z`. The trimmed `incident_type` and `summary` are stored
+as supplied. A repeat registration with the same `incident_type` and
+`summary` on the same event returns
+`409 {"error":{"code":"duplicate_incident"}}` and writes nothing; the same
+combination is allowed on a different event.
+
+`GET` on the same path returns the event's incidents in `created_at`, then
+`id` order (`[]` when none), with the same fields as the create response; a
+missing machine, missing event, or an event owned by another machine returns
+`404 {"error":{"code":"not_found"}}`. Incidents live in their own table, are
+strictly isolated by machine (another machine can never read or register
+against an event it does not own), survive application restarts, and neither
+endpoint ever writes or modifies events, evidence, hash chains, or causal
+links.
+
 ## Bounded causal traces
 
 `GET /machines/{machine_id}/authorization-decision-events/{event_id}/causal-trace`

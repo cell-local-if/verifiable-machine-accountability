@@ -123,6 +123,33 @@ class AuthorizationDecisionEvidence(Base):
     created_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
+class AuthorizationDecisionIncident(Base):
+    __tablename__ = "authorization_decision_incidents"
+    __table_args__ = (
+        UniqueConstraint(
+            "event_id",
+            "incident_type",
+            "summary",
+            name="uq_incident_event_type_summary",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        index=True,
+    )
+    incident_type: Mapped[str] = mapped_column(String, nullable=False)
+    summary: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="open")
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class AuthorizationDecisionCausalLink(Base):
     __tablename__ = "authorization_decision_causal_links"
     __table_args__ = (
