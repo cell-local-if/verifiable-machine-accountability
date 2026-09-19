@@ -871,3 +871,162 @@ def get_authorization_decision_event_causal_trace(
             TracedEventOut(event_id=event.id, depth=depth) for event, depth in traced
         ],
     )
+
+
+# Strict RFC3339 UTC shape matching the stored created_at format: full
+# date-time with a literal "T" and a "Z" designator (optional fraction).
+_RFC3339_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z")
+
+
+def parse_utc_rfc3339(value: str) -> datetime | None:
+    """Parse a strict UTC RFC3339 timestamp ending in ``Z``; None if invalid."""
+    if not _RFC3339_UTC_RE.fullmatch(value):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+class ComplianceExportParams(BaseModel):
+    from_created_at: str
+    to_created_at: str
+    from_dt: datetime
+    to_dt: datetime
+
+
+def validate_compliance_export_params(
+    from_created_at: Annotated[str | None, Query()] = None,
+    to_created_at: Annotated[str | None, Query()] = None,
+) -> ComplianceExportParams:
+    """Validate the compliance-export time range before any machine lookup.
+
+    Both bounds are required, must be UTC RFC3339 timestamps ending in ``Z``,
+    and ``from_created_at`` must not be later than ``to_created_at``. Any
+    violation raises 422 before the handler touches the database.
+    """
+    errors: list[dict[str, object]] = []
+
+    from_dt: datetime | None = None
+    if from_created_at is None:
+        errors.append(
+            {"type": "missing", "loc": ["query", "from_created_at"],
+             "msg": "Field required", "input": None}
+        )
+    else:
+        from_dt = parse_utc_rfc3339(from_created_at)
+        if from_dt is None:
+            errors.append(
+                {
+                    "type": "datetime_parsing",
+                    "loc": ["query", "from_created_at"],
+                    "msg": "Input should be a valid UTC RFC3339 datetime ending in 'Z'",
+                    "input": from_created_at,
+                }
+            )
+
+    to_dt: datetime | None = None
+    if to_created_at is None:
+        errors.append(
+            {"type": "missing", "loc": ["query", "to_created_at"],
+             "msg": "Field required", "input": None}
+        )
+    else:
+        to_dt = parse_utc_rfc3339(to_created_at)
+        if to_dt is None:
+            errors.append(
+                {
+                    "type": "datetime_parsing",
+                    "loc": ["query", "to_created_at"],
+                    "msg": "Input should be a valid UTC RFC3339 datetime ending in 'Z'",
+                    "input": to_created_at,
+                }
+            )
+
+    if not errors and from_dt > to_dt:  # type: ignore[operator]
+        errors.append(
+            {
+                "type": "value_error",
+                "loc": ["query", "from_created_at"],
+                "msg": "from_created_at must not be later than to_created_at",
+                "input": from_created_at,
+            }
+        )
+
+    if errors:
+        raise RequestValidationError(errors)
+    return ComplianceExportParams(
+        from_created_at=from_created_at,  # type: ignore[arg-type]
+        to_created_at=to_created_at,  # type: ignore[arg-type]
+        from_dt=from_dt,  # type: ignore[arg-type]
+        to_dt=to_dt,  # type: ignore[arg-type]
+    )
+
+
+class ComplianceExportOut(BaseModel):
+    machine_id: str
+    from_created_at: str
+    to_created_at: str
+    events: list[AuthorizationDecisionEventOut]
+    causal_links: list[CausalLinkOut]
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/compliance-export",
+    response_model=ComplianceExportOut,
+)
+def export_authorization_decision_events_compliance(
+    machine_id: str,
+    params: Annotated[ComplianceExportParams, Depends(validate_compliance_export_params)],
+    session: SessionDep,
+):
+    """Read-only compliance export of one machine's decision events and links.
+
+    Events are those whose created_at falls in the closed
+    [from_created_at, to_created_at] range; causal links are the machine's
+    links whose cause and effect events are both in that event set. Issues no
+    writes, so repeated exports over the same data are identical.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    all_events = session.scalars(
+        select(AuthorizationDecisionEvent).where(
+            AuthorizationDecisionEvent.machine_id == machine_id
+        )
+    ).all()
+    # Compare parsed instants rather than raw strings: stored timestamps may
+    # omit the fractional part when it is zero, which would misorder a plain
+    # lexicographic comparison.
+    events = sorted(
+        (
+            event
+            for event in all_events
+            if (created := parse_utc_rfc3339(event.created_at)) is not None
+            and params.from_dt <= created <= params.to_dt
+        ),
+        key=lambda event: (event.created_at, event.id),
+    )
+    event_ids = {event.id for event in events}
+
+    links = session.scalars(
+        select(AuthorizationDecisionCausalLink)
+        .where(
+            AuthorizationDecisionCausalLink.machine_id == machine_id,
+            AuthorizationDecisionCausalLink.cause_event_id.in_(event_ids),
+            AuthorizationDecisionCausalLink.effect_event_id.in_(event_ids),
+        )
+        .order_by(
+            AuthorizationDecisionCausalLink.created_at,
+            AuthorizationDecisionCausalLink.id,
+        )
+    ).all()
+
+    return ComplianceExportOut(
+        machine_id=machine_id,
+        from_created_at=params.from_created_at,
+        to_created_at=params.to_created_at,
+        events=[decision_event_to_out(event) for event in events],
+        causal_links=[causal_link_to_out(link) for link in links],
+    )
