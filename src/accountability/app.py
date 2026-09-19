@@ -15,12 +15,13 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import chain, rotation_chain
+from . import chain, incident_status, rotation_chain
 from .db import (
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
     AuthorizationDecisionEvidence,
     AuthorizationDecisionIncident,
+    AuthorizationDecisionIncidentStatusHistory,
     Base,
     BehaviorDeclaration,
     KeyRotationEvent,
@@ -972,6 +973,122 @@ def list_incidents(machine_id: str, event_id: str, session: SessionDep):
         )
     ).all()
     return [incident_to_out(record) for record in records]
+
+
+class IncidentStatusUpdate(BaseModel):
+    status: Literal["acknowledged", "resolved"]
+
+
+class IncidentStatusHistoryOut(BaseModel):
+    id: str
+    machine_id: str
+    event_id: str
+    incident_id: str
+    from_status: str
+    to_status: str
+    created_at: str
+
+
+def incident_status_history_to_out(
+    record: AuthorizationDecisionIncidentStatusHistory,
+) -> IncidentStatusHistoryOut:
+    return IncidentStatusHistoryOut(
+        id=record.id,
+        machine_id=record.machine_id,
+        event_id=record.event_id,
+        incident_id=record.incident_id,
+        from_status=record.from_status,
+        to_status=record.to_status,
+        created_at=record.created_at,
+    )
+
+
+def get_machine_event_incident(
+    session: Session, machine_id: str, event_id: str, incident_id: str
+) -> AuthorizationDecisionIncident | None:
+    return session.scalar(
+        select(AuthorizationDecisionIncident).where(
+            AuthorizationDecisionIncident.id == incident_id,
+            AuthorizationDecisionIncident.machine_id == machine_id,
+            AuthorizationDecisionIncident.event_id == event_id,
+        )
+    )
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}"
+    "/incidents/{incident_id}/status",
+    response_model=IncidentOut,
+)
+def transition_incident_status(
+    machine_id: str,
+    event_id: str,
+    incident_id: str,
+    body: IncidentStatusUpdate,
+    session: SessionDep,
+):
+    """Move one incident forward along open -> acknowledged -> resolved.
+
+    Body validation runs before any path lookup, so a missing, non-string, or
+    out-of-vocabulary ``status`` is a 422 even when the machine, event, or
+    incident does not exist. The status update and the immutable history
+    record commit in one locked write transaction: a disallowed transition is
+    a 409 that writes nothing, and no existing record is ever rewritten.
+    """
+    engine = session.get_bind()
+    # Return the read connection before opening the locked write transaction,
+    # so concurrent transitions never hold two pool connections at once.
+    session.close()
+    result = incident_status.transition_status(
+        engine,
+        machine_id=machine_id,
+        event_id=event_id,
+        incident_id=incident_id,
+        new_status=body.status,
+    )
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "invalid_status_transition":
+        return error_response(409, "invalid_status_transition")
+    return IncidentOut(**result["incident"])
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}"
+    "/incidents/{incident_id}/status-history",
+    response_model=list[IncidentStatusHistoryOut],
+)
+def list_incident_status_history(
+    machine_id: str,
+    event_id: str,
+    incident_id: str,
+    session: SessionDep,
+):
+    """Read-only audit trail of one incident's status transitions.
+
+    Returns every history record of the path incident in (created_at, id)
+    order; an incident with no transitions yields ``[]``. The query only
+    reads: it never writes or modifies incidents, history, events, evidence,
+    chains, or causal links.
+    """
+    incident = get_machine_event_incident(session, machine_id, event_id, incident_id)
+    if incident is None:
+        return error_response(404, "not_found")
+
+    records = session.scalars(
+        select(AuthorizationDecisionIncidentStatusHistory)
+        .where(
+            AuthorizationDecisionIncidentStatusHistory.machine_id == machine_id,
+            AuthorizationDecisionIncidentStatusHistory.event_id == event_id,
+            AuthorizationDecisionIncidentStatusHistory.incident_id == incident_id,
+        )
+        .order_by(
+            AuthorizationDecisionIncidentStatusHistory.created_at,
+            AuthorizationDecisionIncidentStatusHistory.id,
+        )
+    ).all()
+    return [incident_status_history_to_out(record) for record in records]
 
 
 # Evidence fingerprints are checked exactly as stored: 64 characters drawn

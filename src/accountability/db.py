@@ -150,6 +150,30 @@ class AuthorizationDecisionIncident(Base):
     created_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
+class AuthorizationDecisionIncidentStatusHistory(Base):
+    __tablename__ = "authorization_decision_incident_status_history"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        index=True,
+    )
+    incident_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_incidents.id"),
+        nullable=False,
+        index=True,
+    )
+    from_status: Mapped[str] = mapped_column(String, nullable=False)
+    to_status: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class AuthorizationDecisionCausalLink(Base):
     __tablename__ = "authorization_decision_causal_links"
     __table_args__ = (
