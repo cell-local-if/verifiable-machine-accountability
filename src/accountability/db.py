@@ -80,6 +80,31 @@ class AuthorizationDecisionEvent(Base):
     chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class AuthorizationDecisionEvidence(Base):
+    __tablename__ = "authorization_decision_evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "event_id",
+            "content_hash",
+            name="uq_evidence_event_content_hash",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        index=True,
+    )
+    evidence_type: Mapped[str] = mapped_column(String, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class AuthorizationDecisionCausalLink(Base):
     __tablename__ = "authorization_decision_causal_links"
     __table_args__ = (

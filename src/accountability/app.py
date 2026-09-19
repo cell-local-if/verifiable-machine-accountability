@@ -19,6 +19,7 @@ from . import chain
 from .db import (
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
+    AuthorizationDecisionEvidence,
     Base,
     BehaviorDeclaration,
     Machine,
@@ -451,6 +452,97 @@ def list_authorization_decision_events(machine_id: str, session: SessionDep):
         )
     ).all()
     return [decision_event_to_out(e) for e in events]
+
+
+# Exactly 64 lowercase hexadecimal characters. The case is preserved as
+# received (no normalization), so an uppercase hash fails validation.
+ContentHashStr = Annotated[
+    str, StringConstraints(pattern=r"^[0-9a-f]{64}$")
+]
+
+
+class EvidenceCreate(BaseModel):
+    evidence_type: NonEmptyStr
+    content_hash: ContentHashStr
+
+
+class EvidenceOut(BaseModel):
+    id: str
+    machine_id: str
+    event_id: str
+    evidence_type: str
+    content_hash: str
+    created_at: str
+
+
+def evidence_to_out(evidence: AuthorizationDecisionEvidence) -> EvidenceOut:
+    return EvidenceOut(
+        id=evidence.id,
+        machine_id=evidence.machine_id,
+        event_id=evidence.event_id,
+        evidence_type=evidence.evidence_type,
+        content_hash=evidence.content_hash,
+        created_at=evidence.created_at,
+    )
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/evidence",
+    status_code=201,
+    response_model=EvidenceOut,
+)
+def create_authorization_decision_event_evidence(
+    machine_id: str,
+    event_id: str,
+    body: EvidenceCreate,
+    session: SessionDep,
+):
+    event = get_machine_event(session, machine_id, event_id)
+    if event is None:
+        return error_response(404, "not_found")
+
+    evidence = AuthorizationDecisionEvidence(
+        id=str(uuid.uuid4()),
+        machine_id=machine_id,
+        event_id=event_id,
+        evidence_type=body.evidence_type,
+        content_hash=body.content_hash,
+        created_at=utc_now_iso(),
+    )
+    session.add(evidence)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        if get_machine_event(session, machine_id, event_id) is None:
+            return error_response(404, "not_found")
+        return error_response(409, "duplicate_evidence")
+    return evidence_to_out(evidence)
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/evidence",
+    response_model=list[EvidenceOut],
+)
+def list_authorization_decision_event_evidence(
+    machine_id: str, event_id: str, session: SessionDep
+):
+    event = get_machine_event(session, machine_id, event_id)
+    if event is None:
+        return error_response(404, "not_found")
+
+    evidence_rows = session.scalars(
+        select(AuthorizationDecisionEvidence)
+        .where(
+            AuthorizationDecisionEvidence.machine_id == machine_id,
+            AuthorizationDecisionEvidence.event_id == event_id,
+        )
+        .order_by(
+            AuthorizationDecisionEvidence.created_at,
+            AuthorizationDecisionEvidence.id,
+        )
+    ).all()
+    return [evidence_to_out(row) for row in evidence_rows]
 
 
 # RFC 3339 date-time expressed in UTC with a literal ``Z`` suffix. Fractional
