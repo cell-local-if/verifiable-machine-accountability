@@ -39,3 +39,23 @@ class BehaviorDeclaration(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class PolicyRule(Base):
+    __tablename__ = "policy_rules"
+    __table_args__ = (
+        UniqueConstraint(
+            "action_type",
+            "resource_pattern",
+            "priority",
+            name="uq_policy_rule_action_resource_priority",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    action_type: Mapped[str] = mapped_column(String, nullable=False)
+    resource_pattern: Mapped[str] = mapped_column(String, nullable=False)
+    effect: Mapped[str] = mapped_column(String, nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[str] = mapped_column(String, nullable=False)

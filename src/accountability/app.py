@@ -1,18 +1,19 @@
 import os
+import re
 import uuid
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, StrictBool, StringConstraints
+from pydantic import BaseModel, Field, StrictBool, StrictInt, StringConstraints
 from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .db import Base, BehaviorDeclaration, Machine
+from .db import Base, BehaviorDeclaration, Machine, PolicyRule
 
 DEFAULT_DATABASE_URL = "sqlite:///./accountability.db"
 
@@ -247,3 +248,105 @@ def list_behavior_declarations(machine_id: str, session: SessionDep):
         .order_by(BehaviorDeclaration.created_at, BehaviorDeclaration.id)
     ).all()
     return [declaration_to_out(d) for d in declarations]
+
+
+class PolicyRuleCreate(BaseModel):
+    action_type: NonEmptyStr
+    resource_pattern: NonEmptyStr
+    effect: Literal["allow", "deny"]
+    priority: Annotated[StrictInt, Field(ge=0)]
+
+
+class PolicyRuleOut(BaseModel):
+    id: str
+    action_type: str
+    resource_pattern: str
+    effect: str
+    priority: int
+    created_at: str
+    updated_at: str
+
+
+def policy_rule_to_out(rule: PolicyRule) -> PolicyRuleOut:
+    return PolicyRuleOut(
+        id=rule.id,
+        action_type=rule.action_type,
+        resource_pattern=rule.resource_pattern,
+        effect=rule.effect,
+        priority=rule.priority,
+        created_at=rule.created_at,
+        updated_at=rule.updated_at,
+    )
+
+
+@app.post("/policy-rules", status_code=201, response_model=PolicyRuleOut)
+def create_policy_rule(body: PolicyRuleCreate, session: SessionDep):
+    now = utc_now_iso()
+    rule = PolicyRule(
+        id=str(uuid.uuid4()),
+        action_type=body.action_type,
+        resource_pattern=body.resource_pattern,
+        effect=body.effect,
+        priority=body.priority,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(rule)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return error_response(409, "duplicate_policy_rule")
+    return policy_rule_to_out(rule)
+
+
+class AuthorizationEvaluationCreate(BaseModel):
+    action_type: NonEmptyStr
+    resource: NonEmptyStr
+
+
+class AuthorizationEvaluationOut(BaseModel):
+    allowed: bool
+    reason: str
+
+
+def pattern_matches(pattern: str, value: str) -> bool:
+    regex = ".*".join(re.escape(part) for part in pattern.split("*"))
+    return re.fullmatch(regex, value, re.DOTALL) is not None
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-evaluations",
+    response_model=AuthorizationEvaluationOut,
+)
+def evaluate_authorization(
+    machine_id: str, body: AuthorizationEvaluationCreate, session: SessionDep
+):
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    declarations = session.scalars(
+        select(BehaviorDeclaration).where(
+            BehaviorDeclaration.machine_id == machine_id,
+            BehaviorDeclaration.action_type == body.action_type,
+            BehaviorDeclaration.enabled.is_(True),
+        )
+    ).all()
+    if not any(pattern_matches(d.resource_pattern, body.resource) for d in declarations):
+        return AuthorizationEvaluationOut(
+            allowed=False, reason="no_enabled_declaration"
+        )
+
+    rules = session.scalars(
+        select(PolicyRule).where(PolicyRule.action_type == body.action_type)
+    ).all()
+    matching = [r for r in rules if pattern_matches(r.resource_pattern, body.resource)]
+    if not matching:
+        return AuthorizationEvaluationOut(allowed=False, reason="no_matching_policy")
+
+    lowest = min(r.priority for r in matching)
+    decisive = [r for r in matching if r.priority == lowest]
+    if any(r.effect == "deny" for r in decisive):
+        return AuthorizationEvaluationOut(allowed=False, reason="denied_by_policy")
+    return AuthorizationEvaluationOut(allowed=True, reason="allowed_by_policy")
