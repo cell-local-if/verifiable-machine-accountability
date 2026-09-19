@@ -26,4 +26,4 @@ packages = ["src/accountability"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
+pythonpath = ["src"]
