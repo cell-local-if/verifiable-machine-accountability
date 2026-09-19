@@ -955,6 +955,64 @@ def check_evidence_integrity(machine_id: str, session: SessionDep):
     )
 
 
+class EvidenceComplianceExportOut(BaseModel):
+    machine_id: str
+    from_created_at: str
+    to_created_at: str
+    evidence: list[EvidenceOut]
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/evidence/compliance-export",
+    response_model=EvidenceComplianceExportOut,
+)
+def export_evidence_compliance(
+    machine_id: str,
+    params: Annotated[ComplianceExportParams, Depends(validate_compliance_export_params)],
+    session: SessionDep,
+):
+    """Read-only compliance export of one machine's evidence over a time window.
+
+    Includes every evidence record owned by the path machine whose
+    ``created_at`` falls within the inclusive bounds, in ``(created_at, id)``
+    order, with exactly the fields of the evidence list endpoint. Records are
+    exported exactly as stored: a damaged or foreign ``event_id`` never causes
+    a record to be rewritten, filtered out, or repaired. The endpoint only
+    issues reads and never returns another machine's evidence.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    # Load in the same (created_at, id) order as the list endpoint, then apply
+    # the closed window to parsed instants: a stored exact-second ISO stamp
+    # (no fractional part) would not compare correctly lexicographically
+    # against a bound carrying a fractional part.
+    machine_evidence = session.scalars(
+        select(AuthorizationDecisionEvidence)
+        .where(AuthorizationDecisionEvidence.machine_id == machine_id)
+        .order_by(
+            AuthorizationDecisionEvidence.created_at,
+            AuthorizationDecisionEvidence.id,
+        )
+    ).all()
+    records = [
+        record
+        for record in machine_evidence
+        if window_start <= parse_utc_z_datetime(record.created_at) <= window_end
+    ]
+
+    return EvidenceComplianceExportOut(
+        machine_id=machine_id,
+        from_created_at=params.from_created_at,
+        to_created_at=params.to_created_at,
+        evidence=[evidence_to_out(record) for record in records],
+    )
+
+
 class ComplianceExportOut(BaseModel):
     machine_id: str
     from_created_at: str

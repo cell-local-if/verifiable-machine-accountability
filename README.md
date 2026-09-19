@@ -156,4 +156,33 @@ machine's events or links, produces identical output for identical data and
 parameters on repeat calls, and reads data persisted across application
 restarts.
 
+## Read-only evidence compliance export
+
+`GET /machines/{machine_id}/authorization-decision-events/evidence/compliance-export`
+returns a deterministic, read-only compliance slice of one machine's evidence
+records. Both query parameters are required and validated before the machine
+is looked up, so a missing, malformed, or inverted parameter returns `422`
+even when the machine does not exist:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; offset forms such as `+00:00` are rejected);
+  `from_created_at` must not be later than `to_created_at` (equal bounds are
+  allowed).
+
+After validation, a missing machine returns `404 {"error":{"code":"not_found"}}`.
+
+The response is `{machine_id, from_created_at, to_created_at, evidence}`.
+`evidence` contains only the machine's evidence records whose `created_at`
+falls inside the closed interval `[from_created_at, to_created_at]`. Each item
+has exactly the same fields as the evidence list endpoint, ordered by
+`created_at`, then `id`, and the array is empty (never omitted) when the
+window contains nothing. Records are exported exactly as stored: a record
+whose `event_id` is damaged or points at another machine's event is included
+verbatim, never rewritten, filtered out, or repaired.
+
+The endpoint issues no writes, repairs, or deletions, never returns another
+machine's evidence, produces identical output for identical data and
+parameters on repeat calls, and reads data persisted across application
+restarts.
+
 
