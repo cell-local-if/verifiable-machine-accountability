@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StringConstraints
 from sqlalchemy import create_engine, event, select, update
@@ -604,3 +604,84 @@ def list_causal_links(machine_id: str, cause_event_id: str, session: SessionDep)
         )
     ).all()
     return [causal_link_to_out(link) for link in links]
+
+
+class CausalTraceEventOut(BaseModel):
+    event_id: str
+    depth: int
+
+
+class CausalTraceOut(BaseModel):
+    event_id: str
+    direction: str
+    max_depth: int
+    events: list[CausalTraceEventOut]
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/causal-trace",
+    response_model=CausalTraceOut,
+)
+def get_causal_trace(
+    machine_id: str,
+    event_id: str,
+    session: SessionDep,
+    direction: Annotated[Literal["downstream", "upstream"], Query()],
+    max_depth: Annotated[int, Query(ge=1, le=20)],
+):
+    start_event = get_machine_event(session, machine_id, event_id)
+    if start_event is None:
+        return error_response(404, "not_found")
+
+    events = {
+        event.id: event
+        for event in session.scalars(
+            select(AuthorizationDecisionEvent).where(
+                AuthorizationDecisionEvent.machine_id == machine_id
+            )
+        ).all()
+    }
+    links = session.scalars(
+        select(AuthorizationDecisionCausalLink).where(
+            AuthorizationDecisionCausalLink.machine_id == machine_id
+        )
+    ).all()
+
+    adjacency: dict[str, list[str]] = {}
+    for link in links:
+        if direction == "downstream":
+            source, target = link.cause_event_id, link.effect_event_id
+        else:
+            source, target = link.effect_event_id, link.cause_event_id
+        adjacency.setdefault(source, []).append(target)
+
+    # Breadth-first walk so the first time an event is reached is its minimum
+    # depth; the visited set keeps the walk terminating even if the stored
+    # links ever form a cycle.
+    min_depth: dict[str, int] = {}
+    frontier = [event_id]
+    depth = 0
+    while frontier and depth < max_depth:
+        depth += 1
+        next_frontier: list[str] = []
+        for current in frontier:
+            for nxt in adjacency.get(current, []):
+                if nxt == event_id or nxt in min_depth or nxt not in events:
+                    continue
+                min_depth[nxt] = depth
+                next_frontier.append(nxt)
+        frontier = next_frontier
+
+    reachable = sorted(
+        min_depth.items(),
+        key=lambda item: (item[1], events[item[0]].created_at, item[0]),
+    )
+    return CausalTraceOut(
+        event_id=event_id,
+        direction=direction,
+        max_depth=max_depth,
+        events=[
+            CausalTraceEventOut(event_id=reachable_id, depth=reachable_depth)
+            for reachable_id, reachable_depth in reachable
+        ],
+    )
