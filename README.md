@@ -66,4 +66,37 @@ machine, ignores links whose target event no longer exists, terminates even
 when links form a cycle, and returns an empty array when nothing is
 reachable. The query never writes or modifies any record.
 
+## Read-only compliance export
+
+`GET /machines/{machine_id}/authorization-decision-events/compliance-export`
+returns a deterministic, read-only compliance slice for one machine. Both
+query parameters are required and validated before the machine is looked up,
+so a missing, malformed, or inverted parameter returns `422` even when the
+machine does not exist:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; offset forms such as `+00:00` are rejected);
+  `from_created_at` must not be later than `to_created_at` (equal bounds are
+  allowed).
+
+After validation, a missing machine returns `404 {"error":{"code":"not_found"}}`.
+
+The response is `{machine_id, from_created_at, to_created_at, events,
+causal_links}`:
+
+- `events` contains only the machine's authorization decision events whose
+  `created_at` falls inside the closed interval `[from_created_at,
+  to_created_at]`. Each item has exactly the same fields as the event list
+  endpoint, ordered by `created_at`, then `id`.
+- `causal_links` contains only the machine's causal links whose
+  `cause_event_id` and `effect_event_id` both refer to exported events. Each
+  item has exactly the same fields as the causal-link list endpoint, ordered by
+  `created_at`, then `id`.
+- Either array is empty (never omitted) when the window contains nothing.
+
+The endpoint issues no writes, repairs, or deletions, never returns another
+machine's events or links, produces identical output for identical data and
+parameters on repeat calls, and reads data persisted across application
+restarts.
+
 

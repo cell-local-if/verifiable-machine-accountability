@@ -453,6 +453,84 @@ def list_authorization_decision_events(machine_id: str, session: SessionDep):
     return [decision_event_to_out(e) for e in events]
 
 
+# RFC 3339 date-time expressed in UTC with a literal ``Z`` suffix. Fractional
+# seconds are optional; offset forms (``+00:00``) and a missing suffix are
+# rejected. The calendar/time fields are range-checked by ``datetime``.
+_RFC3339_Z_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
+)
+
+
+class ComplianceExportParams(BaseModel):
+    from_created_at: str
+    to_created_at: str
+
+
+def parse_utc_z_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(value[:-1] + "+00:00")
+
+
+def _datetime_error(field_name: str, raw: str) -> dict[str, object]:
+    return {
+        "type": "value_error",
+        "loc": ["query", field_name],
+        "msg": "Input should be an RFC 3339 date-time in UTC ending with 'Z'",
+        "input": raw,
+    }
+
+
+def validate_compliance_export_params(
+    from_created_at: Annotated[str | None, Query()] = None,
+    to_created_at: Annotated[str | None, Query()] = None,
+) -> ComplianceExportParams:
+    """Validate the compliance-export query string before any machine lookup.
+
+    Both bounds are required UTC RFC 3339 date-times ending in ``Z``, and the
+    lower bound must not be after the upper bound. Any missing, malformed, or
+    inverted value raises a 422 before the database is consulted, so an
+    invalid export against a non-existent machine still reports 422 rather
+    than 404.
+    """
+    errors: list[dict[str, object]] = []
+    parsed: dict[str, datetime] = {}
+
+    for field_name, raw in (
+        ("from_created_at", from_created_at),
+        ("to_created_at", to_created_at),
+    ):
+        if raw is None:
+            errors.append(
+                {"type": "missing", "loc": ["query", field_name],
+                 "msg": "Field required", "input": None}
+            )
+        elif not _RFC3339_Z_DATETIME_RE.fullmatch(raw):
+            errors.append(_datetime_error(field_name, raw))
+        else:
+            try:
+                parsed[field_name] = parse_utc_z_datetime(raw)
+            except ValueError:
+                # Regex passed but the calendar/time values are out of range
+                # (e.g. month 13, day 30 in February, hour 24).
+                errors.append(_datetime_error(field_name, raw))
+
+    if not errors and parsed["from_created_at"] > parsed["to_created_at"]:
+        errors.append(
+            {
+                "type": "value_error",
+                "loc": ["query", "from_created_at"],
+                "msg": "from_created_at must not be later than to_created_at",
+                "input": from_created_at,
+            }
+        )
+
+    if errors:
+        raise RequestValidationError(errors)
+    return ComplianceExportParams(
+        from_created_at=from_created_at,  # type: ignore[arg-type]
+        to_created_at=to_created_at,  # type: ignore[arg-type]
+    )
+
+
 class IntegrityOut(BaseModel):
     valid: bool
     checked_count: int
@@ -606,6 +684,81 @@ def list_causal_links(machine_id: str, cause_event_id: str, session: SessionDep)
         )
     ).all()
     return [causal_link_to_out(link) for link in links]
+
+
+class ComplianceExportOut(BaseModel):
+    machine_id: str
+    from_created_at: str
+    to_created_at: str
+    events: list[AuthorizationDecisionEventOut]
+    causal_links: list[CausalLinkOut]
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/compliance-export",
+    response_model=ComplianceExportOut,
+)
+def export_authorization_decision_events(
+    machine_id: str,
+    params: Annotated[ComplianceExportParams, Depends(validate_compliance_export_params)],
+    session: SessionDep,
+):
+    """Read-only compliance export for one machine over a closed time window.
+
+    Includes the machine's authorization decision events whose ``created_at``
+    falls within the inclusive bounds and the machine's causal links whose two
+    endpoints are both among the exported events. The endpoint only issues
+    reads: it never writes, repairs, or deletes records, and never returns data
+    owned by another machine.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    # Load in the same (created_at, id) order as the list endpoint, then apply
+    # the closed window to parsed instants: a stored exact-second ISO stamp
+    # (no fractional part) would not compare correctly lexicographically
+    # against a bound carrying a fractional part.
+    machine_events = session.scalars(
+        select(AuthorizationDecisionEvent)
+        .where(AuthorizationDecisionEvent.machine_id == machine_id)
+        .order_by(
+            AuthorizationDecisionEvent.created_at, AuthorizationDecisionEvent.id
+        )
+    ).all()
+    events = [
+        event
+        for event in machine_events
+        if window_start <= parse_utc_z_datetime(event.created_at) <= window_end
+    ]
+    event_id_set = {event.id for event in events}
+
+    if event_id_set:
+        links = session.scalars(
+            select(AuthorizationDecisionCausalLink)
+            .where(
+                AuthorizationDecisionCausalLink.machine_id == machine_id,
+                AuthorizationDecisionCausalLink.cause_event_id.in_(event_id_set),
+                AuthorizationDecisionCausalLink.effect_event_id.in_(event_id_set),
+            )
+            .order_by(
+                AuthorizationDecisionCausalLink.created_at,
+                AuthorizationDecisionCausalLink.id,
+            )
+        ).all()
+    else:
+        links = []
+
+    return ComplianceExportOut(
+        machine_id=machine_id,
+        from_created_at=params.from_created_at,
+        to_created_at=params.to_created_at,
+        events=[decision_event_to_out(event) for event in events],
+        causal_links=[causal_link_to_out(link) for link in links],
+    )
 
 
 class CausalLinkIntegrityOut(BaseModel):
