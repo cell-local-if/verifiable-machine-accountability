@@ -1,12 +1,14 @@
 import os
 import re
 import uuid
+from collections import deque
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StringConstraints
 from sqlalchemy import create_engine, event, select, update
@@ -604,3 +606,191 @@ def list_causal_links(machine_id: str, cause_event_id: str, session: SessionDep)
         )
     ).all()
     return [causal_link_to_out(link) for link in links]
+
+
+_INTEGER_QUERY_RE = re.compile(r"-?\d+")
+
+
+class CausalTraceParams(BaseModel):
+    direction: Literal["downstream", "upstream"]
+    max_depth: int
+
+
+def validate_causal_trace_params(
+    direction: Annotated[str | None, Query()] = None,
+    max_depth: Annotated[str | None, Query()] = None,
+) -> CausalTraceParams:
+    """Validate the causal-trace query string before any event lookup.
+
+    Query parameters arrive as strings, so integer-ness is checked explicitly
+    against the raw value: decimal forms such as ``3.0`` and the literals
+    ``true``/``false`` are rejected instead of being coerced, and the value
+    must lie in 1..20.
+    """
+    errors: list[dict[str, object]] = []
+
+    if direction is None:
+        errors.append(
+            {"type": "missing", "loc": ["query", "direction"],
+             "msg": "Field required", "input": None}
+        )
+    elif direction not in ("downstream", "upstream"):
+        errors.append(
+            {
+                "type": "literal_error",
+                "loc": ["query", "direction"],
+                "msg": "Input should be 'downstream' or 'upstream'",
+                "input": direction,
+                "ctx": {"expected": "'downstream' or 'upstream'"},
+            }
+        )
+
+    depth_value: int | None = None
+    if max_depth is None:
+        errors.append(
+            {"type": "missing", "loc": ["query", "max_depth"],
+             "msg": "Field required", "input": None}
+        )
+    elif not _INTEGER_QUERY_RE.fullmatch(max_depth):
+        errors.append(
+            {"type": "int_parsing", "loc": ["query", "max_depth"],
+             "msg": "Input should be a valid integer", "input": max_depth}
+        )
+    else:
+        depth_value = int(max_depth)
+        if depth_value < 1:
+            errors.append(
+                {
+                    "type": "greater_than_equal",
+                    "loc": ["query", "max_depth"],
+                    "msg": "Input should be greater than or equal to 1",
+                    "input": max_depth,
+                    "ctx": {"ge": 1},
+                }
+            )
+        elif depth_value > 20:
+            errors.append(
+                {
+                    "type": "less_than_equal",
+                    "loc": ["query", "max_depth"],
+                    "msg": "Input should be less than or equal to 20",
+                    "input": max_depth,
+                    "ctx": {"le": 20},
+                }
+            )
+
+    if errors:
+        raise RequestValidationError(errors)
+    return CausalTraceParams(direction=direction, max_depth=depth_value)  # type: ignore[arg-type]
+
+
+class TracedEventOut(BaseModel):
+    event_id: str
+    depth: int
+
+
+class CausalTraceOut(BaseModel):
+    event_id: str
+    direction: str
+    max_depth: int
+    events: list[TracedEventOut]
+
+
+def trace_causal_events(
+    session: Session,
+    machine_id: str,
+    start_event_id: str,
+    direction: str,
+    max_depth: int,
+) -> list[tuple[AuthorizationDecisionEvent, int]]:
+    """Bounded breadth-first walk over one machine's causal links.
+
+    ``downstream`` follows existing ``cause_event_id -> effect_event_id``
+    edges; ``upstream`` reverses them. Only links belonging to the machine are
+    loaded and only targets that still exist as events of the machine are
+    followed, so the walk never crosses machines or enters dangling targets.
+    BFS plus a visited set seeded with the start makes the first encounter the
+    shortest distance and guarantees termination when links form a ring.
+    """
+    links = session.scalars(
+        select(AuthorizationDecisionCausalLink).where(
+            AuthorizationDecisionCausalLink.machine_id == machine_id
+        )
+    ).all()
+
+    existing_event_ids = set(
+        session.scalars(
+            select(AuthorizationDecisionEvent.id).where(
+                AuthorizationDecisionEvent.machine_id == machine_id
+            )
+        ).all()
+    )
+
+    adjacency: dict[str, list[str]] = {}
+    for link in links:
+        if direction == "downstream":
+            adjacency.setdefault(link.cause_event_id, []).append(link.effect_event_id)
+        else:
+            adjacency.setdefault(link.effect_event_id, []).append(link.cause_event_id)
+
+    distances = {start_event_id: 0}
+    queue: deque[tuple[str, int]] = deque([(start_event_id, 0)])
+    while queue:
+        current, depth = queue.popleft()
+        if depth >= max_depth:
+            continue
+        for neighbor in adjacency.get(current, []):
+            if neighbor in distances:
+                continue
+            # Skip link endpoints that do not resolve to an event of this
+            # machine (missing target or one outside the machine boundary).
+            if neighbor not in existing_event_ids:
+                continue
+            distances[neighbor] = depth + 1
+            queue.append((neighbor, depth + 1))
+
+    distances.pop(start_event_id, None)
+    if not distances:
+        return []
+
+    events = session.scalars(
+        select(AuthorizationDecisionEvent).where(
+            AuthorizationDecisionEvent.machine_id == machine_id,
+            AuthorizationDecisionEvent.id.in_(distances),
+        )
+    ).all()
+    ordered = sorted(
+        events, key=lambda event: (distances[event.id], event.created_at, event.id)
+    )
+    return [(event, distances[event.id]) for event in ordered]
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/causal-trace",
+    response_model=CausalTraceOut,
+)
+def get_authorization_decision_event_causal_trace(
+    machine_id: str,
+    event_id: str,
+    params: Annotated[CausalTraceParams, Depends(validate_causal_trace_params)],
+    session: SessionDep,
+):
+    start_event = get_machine_event(session, machine_id, event_id)
+    if start_event is None:
+        return error_response(404, "not_found")
+
+    traced = trace_causal_events(
+        session,
+        machine_id=machine_id,
+        start_event_id=event_id,
+        direction=params.direction,
+        max_depth=params.max_depth,
+    )
+    return CausalTraceOut(
+        event_id=event_id,
+        direction=params.direction,
+        max_depth=params.max_depth,
+        events=[
+            TracedEventOut(event_id=event.id, depth=depth) for event, depth in traced
+        ],
+    )

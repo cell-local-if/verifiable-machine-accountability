@@ -42,3 +42,28 @@ otherwise it reports `false`, the total count, and the first event whose
 content hash, link, or chain hash does not verify. A missing machine returns
 `404 not_found`.
 
+## Bounded causal traces
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/causal-trace`
+runs a read-only, bounded trace over the causal links created via the
+causal-links endpoints. Both query parameters are required and validated
+before any lookup, so any missing or invalid parameter returns `422`:
+
+- `direction` — exactly `downstream` (existing `cause_event_id` to
+  `effect_event_id`) or `upstream` (the reverse);
+- `max_depth` — an integer from `1` to `20`. Boolean strings (`true`,
+  `false`) and non-integer forms (`1.5`, `3.0`) are rejected.
+
+After validation, the start event must exist and belong to `machine_id`;
+otherwise the endpoint returns `404 {"error":{"code":"not_found"}}`.
+
+The response is `{event_id, direction, max_depth, events}`. Each entry in
+`events` is `{event_id, depth}` for an event reachable within `max_depth`
+edges: the start event is never included, an event reachable by several paths
+appears once at its smallest depth, and entries are ordered by `depth`
+ascending, then by event `created_at` and `id`. The traversal stays inside the
+machine, ignores links whose target event no longer exists, terminates even
+when links form a cycle, and returns an empty array when nothing is
+reachable. The query never writes or modifies any record.
+
+
