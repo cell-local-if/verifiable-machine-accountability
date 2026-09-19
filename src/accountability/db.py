@@ -41,6 +41,20 @@ class BehaviorDeclaration(Base):
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
+class AuthorizationDecisionEvent(Base):
+    __tablename__ = "authorization_decision_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    action_type: Mapped[str] = mapped_column(String, nullable=False)
+    resource: Mapped[str] = mapped_column(String, nullable=False)
+    allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class PolicyRule(Base):
     __tablename__ = "policy_rules"
     __table_args__ = (
