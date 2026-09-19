@@ -27,7 +27,7 @@ from typing import Any
 from sqlalchemy import Connection, Engine, inspect, text
 from sqlalchemy.exc import OperationalError
 
-from .db import AuthorizationDecisionEvent
+from .db import AuthorizationDecisionEvent, KeyRotationEvent
 
 _HASH_LEN = 64
 _MAX_LOCK_ATTEMPTS = 20
@@ -354,6 +354,252 @@ def verify_chain(session, machine_id: str) -> tuple[bool, int, str | None]:
         ):
             return False, len(rows), mapping["id"]
         previous_event_id = mapping["id"]
+        previous_chain_hash = chain_hash
+
+    return True, len(rows), None
+
+
+# --- Key rotation event chain -------------------------------------------------
+#
+# Each machine's key rotation events form a per-machine, tamper-evident hash
+# chain with the same construction as the authorization decision event chain
+# above: ordered by (created_at, id), ``content_hash`` over the record's own
+# fields, ``chain_hash`` over ``<previous chain_hash>:<content_hash>`` with the
+# empty string as the first previous hash, and ``previous_rotation_id``
+# linking each record to its predecessor (``None`` for the first).
+
+_ROTATION_TABLE = KeyRotationEvent.__table__
+_ROTATION_CONTENT_COLUMNS = (
+    "id",
+    "machine_id",
+    "old_public_key",
+    "new_public_key",
+    "version",
+    "created_at",
+)
+
+
+def compute_rotation_content_hash(
+    *,
+    id: str,
+    machine_id: str,
+    old_public_key: str,
+    new_public_key: str,
+    version: int,
+    created_at: str,
+) -> str:
+    document = json.dumps(
+        {
+            "id": id,
+            "machine_id": machine_id,
+            "old_public_key": old_public_key,
+            "new_public_key": new_public_key,
+            "version": version,
+            "created_at": created_at,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(document.encode("utf-8")).hexdigest()
+
+
+def migrate_rotation_schema(engine: Engine) -> None:
+    """Add chain columns to key_rotation_events on pre-existing databases."""
+    inspector = inspect(engine)
+    existing = {
+        column["name"] for column in inspector.get_columns(_ROTATION_TABLE.name)
+    }
+    additions = {
+        "previous_rotation_id": "VARCHAR(36)",
+        "content_hash": f"VARCHAR({_HASH_LEN})",
+        "chain_hash": f"VARCHAR({_HASH_LEN})",
+    }
+    with engine.begin() as conn:
+        for name, column_type in additions.items():
+            if name not in existing:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {_ROTATION_TABLE.name} "
+                        f"ADD COLUMN {name} {column_type}"
+                    )
+                )
+
+
+def _load_rotations(conn_or_session, machine_id: str | None = None) -> list[Any]:
+    statement = _ROTATION_TABLE.select()
+    if machine_id is not None:
+        statement = statement.where(_ROTATION_TABLE.c.machine_id == machine_id)
+    statement = statement.order_by(
+        _ROTATION_TABLE.c.created_at, _ROTATION_TABLE.c.id
+    )
+    return list(conn_or_session.execute(statement))
+
+
+def _recompute_rotation_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    updates: list[dict[str, Any]] = []
+    previous_rotation_id: str | None = None
+    previous_chain_hash = ""
+    for row in rows:
+        mapping = row._mapping
+        content_hash = compute_rotation_content_hash(
+            **{key: mapping[key] for key in _ROTATION_CONTENT_COLUMNS}
+        )
+        chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+        if (
+            mapping["previous_rotation_id"] != previous_rotation_id
+            or mapping["content_hash"] != content_hash
+            or mapping["chain_hash"] != chain_hash
+        ):
+            updates.append(
+                {
+                    "id": mapping["id"],
+                    "previous_rotation_id": previous_rotation_id,
+                    "content_hash": content_hash,
+                    "chain_hash": chain_hash,
+                }
+            )
+        previous_rotation_id = mapping["id"]
+        previous_chain_hash = chain_hash
+    return updates
+
+
+def _rotations_incomplete(rows: list[Any]) -> bool:
+    # previous_rotation_id is NULL on the first record, so completeness is
+    # determined by the two hashes being present everywhere.
+    return any(
+        row._mapping["content_hash"] is None or row._mapping["chain_hash"] is None
+        for row in rows
+    )
+
+
+def backfill_rotation_chains(engine: Engine) -> None:
+    """Fill missing chain data on rotations written before the chain feature.
+
+    Processing is per machine in (created_at, id) order. The recomputation is
+    deterministic, so a restart over an already complete database issues no
+    writes. Each machine is handled inside a locked transaction so a
+    concurrent writer can neither interleave with the backfill nor fork.
+    """
+    with engine.connect() as conn:
+        machine_ids = [
+            row[0]
+            for row in conn.execute(
+                text(
+                    f"SELECT DISTINCT machine_id FROM {_ROTATION_TABLE.name} "
+                    "ORDER BY machine_id"
+                )
+            )
+        ]
+
+    for machine_id in machine_ids:
+        def _work(conn: Connection, machine_id=machine_id) -> None:
+            rows = _load_rotations(conn, machine_id)
+            if rows and _rotations_incomplete(rows):
+                for values in _recompute_rotation_rows(rows):
+                    rotation_id = values.pop("id")
+                    conn.execute(
+                        _ROTATION_TABLE.update()
+                        .where(_ROTATION_TABLE.c.id == rotation_id)
+                        .values(**values)
+                    )
+
+        _run_with_lock_retry(engine, _work)
+
+
+def rotation_chain_fields(
+    session,
+    *,
+    machine_id: str,
+    old_public_key: str,
+    new_public_key: str,
+    version: int,
+) -> dict[str, Any]:
+    """Mint the chain link for a new rotation inside the caller's transaction.
+
+    The caller must already hold the write serialization point for this
+    machine (the guarded machine-version update), so the tail read here
+    cannot race a concurrent rotation. The returned id and created_at are
+    guaranteed to sort strictly after the current tail in (created_at, id)
+    order, matching the order used by backfill and verification.
+    """
+    rows = _load_rotations(session, machine_id)
+
+    # Normally the startup backfill leaves every row complete. If any row is
+    # missing chain data (e.g. an external writer), rebuild the whole machine
+    # chain before appending so the new link has a sound tail.
+    if _rotations_incomplete(rows):
+        for values in _recompute_rotation_rows(rows):
+            rotation_id = values.pop("id")
+            session.execute(
+                _ROTATION_TABLE.update()
+                .where(_ROTATION_TABLE.c.id == rotation_id)
+                .values(**values)
+            )
+        rows = _load_rotations(session, machine_id)
+
+    tail = rows[-1] if rows else None
+
+    # Regenerate (rarely) until the new key sorts strictly after the tail.
+    created_at = _utc_now_iso()
+    rotation_id = str(uuid.uuid4())
+    if tail is not None:
+        tail_created_at = tail._mapping["created_at"]
+        tail_id = tail._mapping["id"]
+        if created_at < tail_created_at:
+            created_at = tail_created_at
+        while created_at == tail_created_at and rotation_id <= tail_id:
+            rotation_id = str(uuid.uuid4())
+
+    if tail is None:
+        previous_rotation_id = None
+        previous_chain_hash = ""
+    else:
+        previous_rotation_id = tail._mapping["id"]
+        previous_chain_hash = tail._mapping["chain_hash"]
+
+    content_hash = compute_rotation_content_hash(
+        id=rotation_id,
+        machine_id=machine_id,
+        old_public_key=old_public_key,
+        new_public_key=new_public_key,
+        version=version,
+        created_at=created_at,
+    )
+    chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+    return {
+        "id": rotation_id,
+        "created_at": created_at,
+        "previous_rotation_id": previous_rotation_id,
+        "content_hash": content_hash,
+        "chain_hash": chain_hash,
+    }
+
+
+def verify_rotation_chain(session, machine_id: str) -> tuple[bool, int, str | None]:
+    """Verify a machine's rotation chain in (created_at, id) order.
+
+    Returns ``(valid, checked_count, broken_rotation_id)``. The first record
+    whose recomputed content hash, previous-rotation link, or chain hash
+    differs from the stored values is reported; an empty chain is valid.
+    """
+    rows = _load_rotations(session, machine_id)
+
+    previous_rotation_id: str | None = None
+    previous_chain_hash = ""
+    for row in rows:
+        mapping = row._mapping
+        content_hash = compute_rotation_content_hash(
+            **{key: mapping[key] for key in _ROTATION_CONTENT_COLUMNS}
+        )
+        chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+        if (
+            mapping["content_hash"] != content_hash
+            or mapping["previous_rotation_id"] != previous_rotation_id
+            or mapping["chain_hash"] != chain_hash
+        ):
+            return False, len(rows), mapping["id"]
+        previous_rotation_id = mapping["id"]
         previous_chain_hash = chain_hash
 
     return True, len(rows), None

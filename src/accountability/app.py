@@ -62,6 +62,8 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
     chain.migrate_schema(engine)
     chain.backfill_chains(engine)
+    chain.migrate_rotation_schema(engine)
+    chain.backfill_rotation_chains(engine)
     app.state.engine = engine
     yield
     engine.dispose()
@@ -214,15 +216,28 @@ def rotate_key(machine_id: str, body: RotateKeyRequest, session: SessionDep):
 
     # Record the rotation in the same transaction as the key update, so a
     # successful rotation always leaves exactly one audit record and a failed
-    # one leaves none.
+    # one leaves none. The guarded machine update above holds this machine's
+    # write serialization point, so the chain tail read inside
+    # rotation_chain_fields cannot race a concurrent rotation: concurrent
+    # appenders can neither lose events, fork, nor break the per-machine chain.
+    chain_fields = chain.rotation_chain_fields(
+        session,
+        machine_id=machine_id,
+        old_public_key=old_public_key,
+        new_public_key=body.public_key,
+        version=body.expected_version + 1,
+    )
     session.add(
         KeyRotationEvent(
-            id=str(uuid.uuid4()),
+            id=chain_fields["id"],
             machine_id=machine_id,
             old_public_key=old_public_key,
             new_public_key=body.public_key,
             version=body.expected_version + 1,
-            created_at=now,
+            created_at=chain_fields["created_at"],
+            previous_rotation_id=chain_fields["previous_rotation_id"],
+            content_hash=chain_fields["content_hash"],
+            chain_hash=chain_fields["chain_hash"],
         )
     )
     session.commit()
@@ -237,6 +252,9 @@ class KeyRotationEventOut(BaseModel):
     new_public_key: str
     version: int
     created_at: str
+    previous_rotation_id: str | None
+    content_hash: str
+    chain_hash: str
 
 
 def key_rotation_event_to_out(event: KeyRotationEvent) -> KeyRotationEventOut:
@@ -247,6 +265,9 @@ def key_rotation_event_to_out(event: KeyRotationEvent) -> KeyRotationEventOut:
         new_public_key=event.new_public_key,
         version=event.version,
         created_at=event.created_at,
+        previous_rotation_id=event.previous_rotation_id,
+        content_hash=event.content_hash,
+        chain_hash=event.chain_hash,
     )
 
 
@@ -272,6 +293,39 @@ def list_key_rotation_events(machine_id: str, session: SessionDep):
         .order_by(KeyRotationEvent.created_at, KeyRotationEvent.id)
     ).all()
     return [key_rotation_event_to_out(event) for event in events]
+
+
+class KeyRotationIntegrityOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_rotation_id: str | None
+
+
+@app.get(
+    "/machines/{machine_id}/key-rotation-events/integrity",
+    response_model=KeyRotationIntegrityOut,
+)
+def check_key_rotation_event_integrity(machine_id: str, session: SessionDep):
+    """Read-only verification of one machine's key rotation hash chain.
+
+    Returns ``{valid, checked_count, broken_rotation_id}``: an empty or fully
+    sound chain reports ``true``, the machine's total rotation count, and
+    ``null``; otherwise the first record whose content hash, previous-rotation
+    link, or chain hash does not verify is reported. Only the path machine's
+    records are examined, and the query never writes, repairs, or deletes.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    valid, checked_count, broken_rotation_id = chain.verify_rotation_chain(
+        session, machine_id
+    )
+    return KeyRotationIntegrityOut(
+        valid=valid,
+        checked_count=checked_count,
+        broken_rotation_id=broken_rotation_id,
+    )
 
 
 @app.post(
