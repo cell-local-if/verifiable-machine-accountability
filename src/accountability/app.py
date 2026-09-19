@@ -13,7 +13,13 @@ from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .db import Base, BehaviorDeclaration, Machine, PolicyRule
+from .db import (
+    AuthorizationDecisionEvent,
+    Base,
+    BehaviorDeclaration,
+    Machine,
+    PolicyRule,
+)
 
 DEFAULT_DATABASE_URL = "sqlite:///./accountability.db"
 
@@ -315,6 +321,35 @@ def pattern_matches(pattern: str, value: str) -> bool:
     return re.fullmatch(regex, value, re.DOTALL) is not None
 
 
+def compute_authorization_decision(
+    session: Session, machine_id: str, action_type: str, resource: str
+) -> AuthorizationEvaluationOut:
+    declarations = session.scalars(
+        select(BehaviorDeclaration).where(
+            BehaviorDeclaration.machine_id == machine_id,
+            BehaviorDeclaration.action_type == action_type,
+            BehaviorDeclaration.enabled.is_(True),
+        )
+    ).all()
+    if not any(pattern_matches(d.resource_pattern, resource) for d in declarations):
+        return AuthorizationEvaluationOut(
+            allowed=False, reason="no_enabled_declaration"
+        )
+
+    rules = session.scalars(
+        select(PolicyRule).where(PolicyRule.action_type == action_type)
+    ).all()
+    matching = [r for r in rules if pattern_matches(r.resource_pattern, resource)]
+    if not matching:
+        return AuthorizationEvaluationOut(allowed=False, reason="no_matching_policy")
+
+    lowest = min(r.priority for r in matching)
+    decisive = [r for r in matching if r.priority == lowest]
+    if any(r.effect == "deny" for r in decisive):
+        return AuthorizationEvaluationOut(allowed=False, reason="denied_by_policy")
+    return AuthorizationEvaluationOut(allowed=True, reason="allowed_by_policy")
+
+
 @app.post(
     "/machines/{machine_id}/authorization-evaluations",
     response_model=AuthorizationEvaluationOut,
@@ -326,27 +361,77 @@ def evaluate_authorization(
     if machine is None:
         return error_response(404, "not_found")
 
-    declarations = session.scalars(
-        select(BehaviorDeclaration).where(
-            BehaviorDeclaration.machine_id == machine_id,
-            BehaviorDeclaration.action_type == body.action_type,
-            BehaviorDeclaration.enabled.is_(True),
+    return compute_authorization_decision(
+        session, machine_id, body.action_type, body.resource
+    )
+
+
+class AuthorizationDecisionEventOut(BaseModel):
+    id: str
+    machine_id: str
+    action_type: str
+    resource: str
+    allowed: bool
+    reason: str
+    created_at: str
+
+
+def decision_event_to_out(event: AuthorizationDecisionEvent) -> AuthorizationDecisionEventOut:
+    return AuthorizationDecisionEventOut(
+        id=event.id,
+        machine_id=event.machine_id,
+        action_type=event.action_type,
+        resource=event.resource,
+        allowed=event.allowed,
+        reason=event.reason,
+        created_at=event.created_at,
+    )
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-decision-events",
+    status_code=201,
+    response_model=AuthorizationDecisionEventOut,
+)
+def create_authorization_decision_event(
+    machine_id: str, body: AuthorizationEvaluationCreate, session: SessionDep
+):
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    decision = compute_authorization_decision(
+        session, machine_id, body.action_type, body.resource
+    )
+    event = AuthorizationDecisionEvent(
+        id=str(uuid.uuid4()),
+        machine_id=machine_id,
+        action_type=body.action_type,
+        resource=body.resource,
+        allowed=decision.allowed,
+        reason=decision.reason,
+        created_at=utc_now_iso(),
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+    return decision_event_to_out(event)
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events",
+    response_model=list[AuthorizationDecisionEventOut],
+)
+def list_authorization_decision_events(machine_id: str, session: SessionDep):
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    events = session.scalars(
+        select(AuthorizationDecisionEvent)
+        .where(AuthorizationDecisionEvent.machine_id == machine_id)
+        .order_by(
+            AuthorizationDecisionEvent.created_at, AuthorizationDecisionEvent.id
         )
     ).all()
-    if not any(pattern_matches(d.resource_pattern, body.resource) for d in declarations):
-        return AuthorizationEvaluationOut(
-            allowed=False, reason="no_enabled_declaration"
-        )
-
-    rules = session.scalars(
-        select(PolicyRule).where(PolicyRule.action_type == body.action_type)
-    ).all()
-    matching = [r for r in rules if pattern_matches(r.resource_pattern, body.resource)]
-    if not matching:
-        return AuthorizationEvaluationOut(allowed=False, reason="no_matching_policy")
-
-    lowest = min(r.priority for r in matching)
-    decisive = [r for r in matching if r.priority == lowest]
-    if any(r.effect == "deny" for r in decisive):
-        return AuthorizationEvaluationOut(allowed=False, reason="denied_by_policy")
-    return AuthorizationEvaluationOut(allowed=True, reason="allowed_by_policy")
+    return [decision_event_to_out(e) for e in events]
