@@ -18,6 +18,7 @@ from .db import (
     AuthorizationDecisionEvent,
     Base,
     BehaviorDeclaration,
+    CausalLink,
     Machine,
     PolicyRule,
 )
@@ -471,3 +472,131 @@ def check_authorization_decision_event_integrity(machine_id: str, session: Sessi
         checked_count=checked_count,
         broken_event_id=broken_event_id,
     )
+
+
+class CausalLinkCreate(BaseModel):
+    effect_event_id: NonEmptyStr
+
+
+class CausalLinkOut(BaseModel):
+    id: str
+    machine_id: str
+    cause_event_id: str
+    effect_event_id: str
+    created_at: str
+
+
+def causal_link_to_out(link: CausalLink) -> CausalLinkOut:
+    return CausalLinkOut(
+        id=link.id,
+        machine_id=link.machine_id,
+        cause_event_id=link.cause_event_id,
+        effect_event_id=link.effect_event_id,
+        created_at=link.created_at,
+    )
+
+
+def get_machine_event(
+    session: Session, machine_id: str, event_id: str
+) -> AuthorizationDecisionEvent | None:
+    event = session.get(AuthorizationDecisionEvent, event_id)
+    if event is None or event.machine_id != machine_id:
+        return None
+    return event
+
+
+def creates_cycle(
+    session: Session, machine_id: str, cause_event_id: str, effect_event_id: str
+) -> bool:
+    """Whether adding ``cause -> effect`` would close a directed cycle.
+
+    That happens exactly when the effect event can already reach the cause
+    event through existing links of the same machine.
+    """
+    links = session.scalars(
+        select(CausalLink).where(CausalLink.machine_id == machine_id)
+    ).all()
+    adjacency: dict[str, list[str]] = {}
+    for link in links:
+        adjacency.setdefault(link.cause_event_id, []).append(link.effect_event_id)
+
+    stack = [effect_event_id]
+    seen: set[str] = set()
+    while stack:
+        node = stack.pop()
+        if node == cause_event_id:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(adjacency.get(node, ()))
+    return False
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-decision-events/{cause_event_id}/causal-links",
+    status_code=201,
+    response_model=CausalLinkOut,
+)
+def create_causal_link(
+    machine_id: str,
+    cause_event_id: str,
+    body: CausalLinkCreate,
+    session: SessionDep,
+):
+    cause = get_machine_event(session, machine_id, cause_event_id)
+    if cause is None:
+        return error_response(404, "not_found")
+    effect = get_machine_event(session, machine_id, body.effect_event_id)
+    if effect is None:
+        return error_response(404, "not_found")
+    if cause_event_id == body.effect_event_id:
+        return error_response(422, "self_causal_link")
+
+    existing = session.scalars(
+        select(CausalLink).where(
+            CausalLink.machine_id == machine_id,
+            CausalLink.cause_event_id == cause_event_id,
+            CausalLink.effect_event_id == body.effect_event_id,
+        )
+    ).first()
+    if existing is not None:
+        return error_response(409, "duplicate_causal_link")
+
+    if creates_cycle(session, machine_id, cause_event_id, body.effect_event_id):
+        return error_response(409, "causal_cycle")
+
+    link = CausalLink(
+        id=str(uuid.uuid4()),
+        machine_id=machine_id,
+        cause_event_id=cause_event_id,
+        effect_event_id=body.effect_event_id,
+        created_at=utc_now_iso(),
+    )
+    session.add(link)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return error_response(409, "duplicate_causal_link")
+    return causal_link_to_out(link)
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{cause_event_id}/causal-links",
+    response_model=list[CausalLinkOut],
+)
+def list_causal_links(machine_id: str, cause_event_id: str, session: SessionDep):
+    cause = get_machine_event(session, machine_id, cause_event_id)
+    if cause is None:
+        return error_response(404, "not_found")
+
+    links = session.scalars(
+        select(CausalLink)
+        .where(
+            CausalLink.machine_id == machine_id,
+            CausalLink.cause_event_id == cause_event_id,
+        )
+        .order_by(CausalLink.created_at, CausalLink.id)
+    ).all()
+    return [causal_link_to_out(link) for link in links]

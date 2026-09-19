@@ -78,3 +78,33 @@ class AuthorizationDecisionEvent(Base):
     previous_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class CausalLink(Base):
+    __tablename__ = "causal_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "machine_id",
+            "cause_event_id",
+            "effect_event_id",
+            name="uq_causal_link_machine_cause_effect",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    cause_event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        index=True,
+    )
+    effect_event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[str] = mapped_column(String, nullable=False)

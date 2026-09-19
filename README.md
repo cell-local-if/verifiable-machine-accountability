@@ -42,3 +42,22 @@ otherwise it reports `false`, the total count, and the first event whose
 content hash, link, or chain hash does not verify. A missing machine returns
 `404 not_found`.
 
+## Causal links between decision events
+
+`POST /machines/{machine_id}/authorization-decision-events/{cause_event_id}/causal-links`
+records a directed "cause led to effect" edge between two authorization
+decision events of the same machine. The body is `{"effect_event_id": "..."}`
+(a non-empty string after trimming whitespace; otherwise `422`). The path
+cause event and the body effect event must both exist and belong to the
+machine (`404 not_found` otherwise). A self-link is rejected with
+`422 self_causal_link`, an already existing edge in the same direction with
+`409 duplicate_causal_link`, and an edge that would close a directed cycle
+with `409 causal_cycle`; none of these failures writes anything. A successful
+create returns `201` with `{id, machine_id, cause_event_id, effect_event_id,
+created_at}` and never modifies either event or the hash chain.
+
+`GET` on the same path returns the links whose cause is the path event,
+ordered by `(created_at, id)` ascending (possibly empty); if the cause event
+does not exist on the machine it returns `404 not_found`. Links persist
+across restarts; the table is created automatically at startup.
+
