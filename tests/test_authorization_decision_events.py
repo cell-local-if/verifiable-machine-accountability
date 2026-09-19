@@ -232,6 +232,9 @@ def test_list_events_returns_events_for_machine_ordered_by_created_at_then_id(cl
             "allowed",
             "reason",
             "created_at",
+            "previous_event_id",
+            "content_hash",
+            "chain_hash",
         }
 
 

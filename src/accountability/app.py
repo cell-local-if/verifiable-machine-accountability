@@ -13,6 +13,7 @@ from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import chain
 from .db import (
     AuthorizationDecisionEvent,
     Base,
@@ -54,6 +55,8 @@ async def lifespan(app: FastAPI):
     database_url = os.environ.get("ACCOUNTABILITY_DATABASE_URL", DEFAULT_DATABASE_URL)
     engine = make_engine(database_url)
     Base.metadata.create_all(engine)
+    chain.migrate_schema(engine)
+    chain.backfill_chains(engine)
     app.state.engine = engine
     yield
     engine.dispose()
@@ -374,6 +377,9 @@ class AuthorizationDecisionEventOut(BaseModel):
     allowed: bool
     reason: str
     created_at: str
+    previous_event_id: str | None
+    content_hash: str
+    chain_hash: str
 
 
 def decision_event_to_out(event: AuthorizationDecisionEvent) -> AuthorizationDecisionEventOut:
@@ -385,6 +391,9 @@ def decision_event_to_out(event: AuthorizationDecisionEvent) -> AuthorizationDec
         allowed=event.allowed,
         reason=event.reason,
         created_at=event.created_at,
+        previous_event_id=event.previous_event_id,
+        content_hash=event.content_hash,
+        chain_hash=event.chain_hash,
     )
 
 
@@ -403,19 +412,23 @@ def create_authorization_decision_event(
     decision = compute_authorization_decision(
         session, machine_id, body.action_type, body.resource
     )
-    event = AuthorizationDecisionEvent(
-        id=str(uuid.uuid4()),
+    engine = session.get_bind()
+    # Commit and return the read connection before opening the locked write
+    # transaction, so concurrent writers never hold two pool connections at
+    # once. The decision is fully materialized above.
+    session.commit()
+    session.close()
+    # Read tail, mint the new link, and insert in one write transaction so
+    # concurrent appenders cannot lose events or fork the per-machine chain.
+    result = chain.append_event(
+        engine,
         machine_id=machine_id,
         action_type=body.action_type,
         resource=body.resource,
         allowed=decision.allowed,
         reason=decision.reason,
-        created_at=utc_now_iso(),
     )
-    session.add(event)
-    session.commit()
-    session.refresh(event)
-    return decision_event_to_out(event)
+    return AuthorizationDecisionEventOut(**result)
 
 
 @app.get(
@@ -435,3 +448,26 @@ def list_authorization_decision_events(machine_id: str, session: SessionDep):
         )
     ).all()
     return [decision_event_to_out(e) for e in events]
+
+
+class IntegrityOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_event_id: str | None
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/integrity",
+    response_model=IntegrityOut,
+)
+def check_authorization_decision_event_integrity(machine_id: str, session: SessionDep):
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    valid, checked_count, broken_event_id = chain.verify_chain(session, machine_id)
+    return IntegrityOut(
+        valid=valid,
+        checked_count=checked_count,
+        broken_event_id=broken_event_id,
+    )

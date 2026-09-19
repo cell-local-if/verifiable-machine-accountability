@@ -16,3 +16,29 @@ uvicorn accountability.app:app --reload
 
 The initial API exposes `GET /health`, which returns a JSON readiness result.
 
+## Authorization event integrity chain
+
+Each machine's authorization decision events form a per-machine, tamper-evident
+hash chain. Every event returned by the create and list endpoints carries:
+
+- `previous_event_id` — `null` for the machine's first event, otherwise the id
+  of the preceding event in `(created_at, id)` order;
+- `content_hash` — `SHA-256(UTF-8(compact key-sorted JSON of {id, machine_id,
+  action_type, resource, allowed, reason, created_at}))`;
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first event
+  and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))` thereafter.
+
+All hashes are 64-character lowercase hexadecimal strings. New events are
+appended to the chain tail inside a single write transaction, so concurrent
+writes cannot lose events, fork, or break the chain. On startup the service
+adds the new columns to pre-existing databases and backfills missing chain
+data in `(created_at, id)` order; the recomputation is deterministic, so
+restarting with an already complete database performs no writes.
+
+`GET /machines/{machine_id}/authorization-decision-events/integrity` verifies
+the chain read-only and returns `{valid, checked_count, broken_event_id}`:
+a complete or empty chain reports `true`, the total count, and `null`;
+otherwise it reports `false`, the total count, and the first event whose
+content hash, link, or chain hash does not verify. A missing machine returns
+`404 not_found`.
+

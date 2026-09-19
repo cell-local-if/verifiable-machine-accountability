@@ -73,3 +73,8 @@ class AuthorizationDecisionEvent(Base):
     allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     reason: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
+    # Per-machine hash chain. Nullable so databases created before the chain
+    # feature keep working; the startup migration backfills any missing values.
+    previous_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
