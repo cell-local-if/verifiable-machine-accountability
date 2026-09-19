@@ -608,6 +608,83 @@ def list_causal_links(machine_id: str, cause_event_id: str, session: SessionDep)
     return [causal_link_to_out(link) for link in links]
 
 
+class CausalLinkIntegrityOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_link_id: str | None
+
+
+def find_broken_causal_link(
+    session: Session, machine_id: str
+) -> tuple[int, str | None]:
+    """Scan one machine's causal links in (created_at, id) order.
+
+    Returns ``(total_count, broken_link_id)``. Each link is broken when its
+    cause or effect does not resolve to an event of the path machine (missing
+    or owned by another machine) or when both endpoints are the same event.
+    Links that pass are added to a running edge set, and a link whose
+    cause -> effect edge would close a directed cycle among the edges scanned
+    so far is reported as broken. Read-only: issues no writes.
+    """
+    links = session.scalars(
+        select(AuthorizationDecisionCausalLink)
+        .where(AuthorizationDecisionCausalLink.machine_id == machine_id)
+        .order_by(
+            AuthorizationDecisionCausalLink.created_at,
+            AuthorizationDecisionCausalLink.id,
+        )
+    ).all()
+
+    machine_event_ids = set(
+        session.scalars(
+            select(AuthorizationDecisionEvent.id).where(
+                AuthorizationDecisionEvent.machine_id == machine_id
+            )
+        ).all()
+    )
+
+    adjacency: dict[str, list[str]] = {}
+    for link in links:
+        if (
+            link.cause_event_id == link.effect_event_id
+            or link.cause_event_id not in machine_event_ids
+            or link.effect_event_id not in machine_event_ids
+        ):
+            return len(links), link.id
+        # Follow already-scanned cause -> effect edges from the new effect;
+        # reaching the new cause means this edge closes a directed cycle.
+        visited = {link.effect_event_id}
+        stack = [link.effect_event_id]
+        while stack:
+            current = stack.pop()
+            if current == link.cause_event_id:
+                return len(links), link.id
+            for nxt in adjacency.get(current, []):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    stack.append(nxt)
+        adjacency.setdefault(link.cause_event_id, []).append(link.effect_event_id)
+
+    return len(links), None
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/causal-links/integrity",
+    response_model=CausalLinkIntegrityOut,
+)
+def check_causal_link_integrity(machine_id: str, session: SessionDep):
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    checked_count, broken_link_id = find_broken_causal_link(session, machine_id)
+    return CausalLinkIntegrityOut(
+        valid=broken_link_id is None,
+        checked_count=checked_count,
+        broken_link_id=broken_link_id,
+    )
+
+
 _INTEGER_QUERY_RE = re.compile(r"-?\d+")
 
 
