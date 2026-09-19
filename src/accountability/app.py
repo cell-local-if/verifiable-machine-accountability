@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from . import chain
 from .db import (
+    AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
     Base,
     BehaviorDeclaration,
@@ -471,3 +472,135 @@ def check_authorization_decision_event_integrity(machine_id: str, session: Sessi
         checked_count=checked_count,
         broken_event_id=broken_event_id,
     )
+
+
+class CausalLinkCreate(BaseModel):
+    effect_event_id: NonEmptyStr
+
+
+class CausalLinkOut(BaseModel):
+    id: str
+    machine_id: str
+    cause_event_id: str
+    effect_event_id: str
+    created_at: str
+
+
+def causal_link_to_out(link: AuthorizationDecisionCausalLink) -> CausalLinkOut:
+    return CausalLinkOut(
+        id=link.id,
+        machine_id=link.machine_id,
+        cause_event_id=link.cause_event_id,
+        effect_event_id=link.effect_event_id,
+        created_at=link.created_at,
+    )
+
+
+def get_machine_event(
+    session: Session, machine_id: str, event_id: str
+) -> AuthorizationDecisionEvent | None:
+    return session.scalar(
+        select(AuthorizationDecisionEvent).where(
+            AuthorizationDecisionEvent.id == event_id,
+            AuthorizationDecisionEvent.machine_id == machine_id,
+        )
+    )
+
+
+def introduces_cycle(
+    session: Session, machine_id: str, cause_event_id: str, effect_event_id: str
+) -> bool:
+    """Whether a new cause -> effect edge would close a directed cycle.
+
+    Follows existing cause -> effect edges from the proposed effect; reaching
+    the proposed cause means the new edge closes a loop.
+    """
+    links = session.scalars(
+        select(AuthorizationDecisionCausalLink).where(
+            AuthorizationDecisionCausalLink.machine_id == machine_id
+        )
+    ).all()
+    adjacency: dict[str, list[str]] = {}
+    for link in links:
+        adjacency.setdefault(link.cause_event_id, []).append(link.effect_event_id)
+
+    visited = {effect_event_id}
+    stack = [effect_event_id]
+    while stack:
+        current = stack.pop()
+        if current == cause_event_id:
+            return True
+        for nxt in adjacency.get(current, []):
+            if nxt not in visited:
+                visited.add(nxt)
+                stack.append(nxt)
+    return False
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-decision-events/{cause_event_id}/causal-links",
+    status_code=201,
+    response_model=CausalLinkOut,
+)
+def create_causal_link(
+    machine_id: str,
+    cause_event_id: str,
+    body: CausalLinkCreate,
+    session: SessionDep,
+):
+    cause_event = get_machine_event(session, machine_id, cause_event_id)
+    effect_event = get_machine_event(session, machine_id, body.effect_event_id)
+    if cause_event is None or effect_event is None:
+        return error_response(404, "not_found")
+    if cause_event_id == body.effect_event_id:
+        return error_response(422, "self_causal_link")
+
+    existing = session.scalar(
+        select(AuthorizationDecisionCausalLink).where(
+            AuthorizationDecisionCausalLink.machine_id == machine_id,
+            AuthorizationDecisionCausalLink.cause_event_id == cause_event_id,
+            AuthorizationDecisionCausalLink.effect_event_id == body.effect_event_id,
+        )
+    )
+    if existing is not None:
+        return error_response(409, "duplicate_causal_link")
+    if introduces_cycle(session, machine_id, cause_event_id, body.effect_event_id):
+        return error_response(409, "causal_cycle")
+
+    link = AuthorizationDecisionCausalLink(
+        id=str(uuid.uuid4()),
+        machine_id=machine_id,
+        cause_event_id=cause_event_id,
+        effect_event_id=body.effect_event_id,
+        created_at=utc_now_iso(),
+    )
+    session.add(link)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return error_response(409, "duplicate_causal_link")
+    return causal_link_to_out(link)
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{cause_event_id}/causal-links",
+    response_model=list[CausalLinkOut],
+)
+def list_causal_links(machine_id: str, cause_event_id: str, session: SessionDep):
+    cause_event = get_machine_event(session, machine_id, cause_event_id)
+    if cause_event is None:
+        return error_response(404, "not_found")
+
+    links = session.scalars(
+        select(AuthorizationDecisionCausalLink)
+        .where(
+            AuthorizationDecisionCausalLink.machine_id == machine_id,
+            AuthorizationDecisionCausalLink.cause_event_id == cause_event_id,
+        )
+        .order_by(
+            AuthorizationDecisionCausalLink.created_at,
+            AuthorizationDecisionCausalLink.id,
+        )
+    ).all()
+    return [causal_link_to_out(link) for link in links]
