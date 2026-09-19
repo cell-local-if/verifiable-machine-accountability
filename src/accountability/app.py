@@ -19,6 +19,7 @@ from . import chain
 from .db import (
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
+    AuthorizationDecisionEvidence,
     Base,
     BehaviorDeclaration,
     Machine,
@@ -684,6 +685,110 @@ def list_causal_links(machine_id: str, cause_event_id: str, session: SessionDep)
         )
     ).all()
     return [causal_link_to_out(link) for link in links]
+
+
+# A SHA-256-style fingerprint: exactly 64 lowercase hexadecimal characters.
+# The pattern anchors the full string and admits no uppercase, so the stored
+# value is compared and persisted exactly as supplied, never case-folded.
+LowerHexHash = Annotated[
+    str, StringConstraints(pattern=r"^[0-9a-f]{64}$")
+]
+
+
+class EvidenceCreate(BaseModel):
+    evidence_type: NonEmptyStr
+    content_hash: LowerHexHash
+
+
+class EvidenceOut(BaseModel):
+    id: str
+    machine_id: str
+    event_id: str
+    evidence_type: str
+    content_hash: str
+    created_at: str
+
+
+def evidence_to_out(record: AuthorizationDecisionEvidence) -> EvidenceOut:
+    return EvidenceOut(
+        id=record.id,
+        machine_id=record.machine_id,
+        event_id=record.event_id,
+        evidence_type=record.evidence_type,
+        content_hash=record.content_hash,
+        created_at=record.created_at,
+    )
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/evidence",
+    status_code=201,
+    response_model=EvidenceOut,
+)
+def create_evidence(
+    machine_id: str,
+    event_id: str,
+    body: EvidenceCreate,
+    session: SessionDep,
+):
+    """Attach one immutable evidence fingerprint to a decision event.
+
+    Body validation runs before any path lookup, so a malformed payload is a
+    422 even when the machine or event does not exist. The write touches only
+    the evidence table: the event, its hash chain, and causal links are never
+    modified.
+    """
+    event = get_machine_event(session, machine_id, event_id)
+    if event is None:
+        return error_response(404, "not_found")
+
+    existing = session.scalar(
+        select(AuthorizationDecisionEvidence).where(
+            AuthorizationDecisionEvidence.event_id == event_id,
+            AuthorizationDecisionEvidence.content_hash == body.content_hash,
+        )
+    )
+    if existing is not None:
+        return error_response(409, "duplicate_evidence")
+
+    record = AuthorizationDecisionEvidence(
+        id=str(uuid.uuid4()),
+        machine_id=machine_id,
+        event_id=event_id,
+        evidence_type=body.evidence_type,
+        content_hash=body.content_hash,
+        created_at=utc_now_iso(),
+    )
+    session.add(record)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return error_response(409, "duplicate_evidence")
+    return evidence_to_out(record)
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/evidence",
+    response_model=list[EvidenceOut],
+)
+def list_evidence(machine_id: str, event_id: str, session: SessionDep):
+    event = get_machine_event(session, machine_id, event_id)
+    if event is None:
+        return error_response(404, "not_found")
+
+    records = session.scalars(
+        select(AuthorizationDecisionEvidence)
+        .where(
+            AuthorizationDecisionEvidence.machine_id == machine_id,
+            AuthorizationDecisionEvidence.event_id == event_id,
+        )
+        .order_by(
+            AuthorizationDecisionEvidence.created_at,
+            AuthorizationDecisionEvidence.id,
+        )
+    ).all()
+    return [evidence_to_out(record) for record in records]
 
 
 class ComplianceExportOut(BaseModel):
