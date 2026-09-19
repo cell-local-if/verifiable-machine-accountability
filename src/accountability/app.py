@@ -22,6 +22,7 @@ from .db import (
     AuthorizationDecisionEvidence,
     Base,
     BehaviorDeclaration,
+    KeyRotationEvent,
     Machine,
     PolicyRule,
 )
@@ -183,6 +184,26 @@ def get_machine(machine_id: str, session: SessionDep):
     return to_out(machine)
 
 
+class KeyRotationEventOut(BaseModel):
+    id: str
+    machine_id: str
+    old_public_key: str
+    new_public_key: str
+    version: int
+    created_at: str
+
+
+def key_rotation_event_to_out(event: KeyRotationEvent) -> KeyRotationEventOut:
+    return KeyRotationEventOut(
+        id=event.id,
+        machine_id=event.machine_id,
+        old_public_key=event.old_public_key,
+        new_public_key=event.new_public_key,
+        version=event.version,
+        created_at=event.created_at,
+    )
+
+
 @app.post("/machines/{machine_id}/rotate-key", response_model=MachineOut)
 def rotate_key(machine_id: str, body: RotateKeyRequest, session: SessionDep):
     machine = session.get(Machine, machine_id)
@@ -193,6 +214,10 @@ def rotate_key(machine_id: str, body: RotateKeyRequest, session: SessionDep):
     if body.expected_version != machine.version:
         return error_response(409, "version_conflict")
 
+    # Capture the stored key before the atomic update overwrites it; the
+    # rotation record must reflect the value actually replaced.
+    old_public_key = machine.public_key
+    new_version = body.expected_version + 1
     now = utc_now_iso()
     result = session.execute(
         update(Machine)
@@ -208,9 +233,46 @@ def rotate_key(machine_id: str, body: RotateKeyRequest, session: SessionDep):
             return error_response(422, "same_public_key")
         return error_response(409, "version_conflict")
 
+    # The rotation record commits in the same transaction as the key update,
+    # so a successful rotation always leaves exactly one audit record and a
+    # failed one leaves none.
+    session.add(
+        KeyRotationEvent(
+            id=str(uuid.uuid4()),
+            machine_id=machine_id,
+            old_public_key=old_public_key,
+            new_public_key=body.public_key,
+            version=new_version,
+            created_at=now,
+        )
+    )
     session.commit()
     session.refresh(machine)
     return to_out(machine)
+
+
+@app.get(
+    "/machines/{machine_id}/key-rotation-events",
+    response_model=list[KeyRotationEventOut],
+)
+def list_key_rotation_events(machine_id: str, session: SessionDep):
+    """Read-only audit history of one machine's key rotations.
+
+    Returns every rotation record owned by the path machine in
+    (created_at, id) order; a machine with no rotations yields ``[]``. The
+    query only reads: it never writes or rewrites machines, events, evidence,
+    chains, or causal links.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    events = session.scalars(
+        select(KeyRotationEvent)
+        .where(KeyRotationEvent.machine_id == machine_id)
+        .order_by(KeyRotationEvent.created_at, KeyRotationEvent.id)
+    ).all()
+    return [key_rotation_event_to_out(event) for event in events]
 
 
 @app.post(

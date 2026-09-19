@@ -19,6 +19,20 @@ class Machine(Base):
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
+class KeyRotationEvent(Base):
+    __tablename__ = "key_rotation_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    old_public_key: Mapped[str] = mapped_column(String, nullable=False)
+    new_public_key: Mapped[str] = mapped_column(String, nullable=False)
+    # The machine version after the rotation was applied.
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class BehaviorDeclaration(Base):
     __tablename__ = "behavior_declarations"
     __table_args__ = (
