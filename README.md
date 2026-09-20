@@ -193,6 +193,45 @@ incident can never read them), survive application restarts, and neither
 endpoint ever writes or modifies incidents, events, evidence, hash chains, or
 causal links.
 
+## Per-incident responsibility-assignment integrity chain
+
+Each incident's responsibility assignments form their own per-incident,
+tamper-evident hash chain, following the same rules as the authorization
+event integrity chain. Every assignment returned by the create and list
+endpoints carries:
+
+- `previous_assignment_id` — `null` for the incident's first assignment,
+  otherwise the id of the preceding assignment in `(created_at, id)` order;
+- `content_hash` — `SHA-256(UTF-8(compact key-sorted JSON of {id, machine_id,
+  event_id, incident_id, party, role, created_at}))`;
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first
+  assignment and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))`
+  thereafter.
+
+All hashes are 64-character lowercase hexadecimal strings. Chains are
+independent per incident, so two incidents (of the same or different
+machines) never share a link. Path validation, the duplicate check, and the
+chain append happen inside a single write transaction, so concurrent
+assignments cannot lose records, fork, or break the chain; that transaction
+only ever writes the assignments table and never modifies the incident, its
+event, evidence, or the existing event/rotation chains. On startup the
+service adds the new columns to pre-existing databases and backfills missing
+chain data per incident in `(created_at, id)` order; the recomputation is
+deterministic, so restarting with an already complete database performs no
+writes.
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/incidents/{incident_id}/responsibility-assignments/integrity`
+verifies one incident's chain read-only and returns
+`{valid, checked_count, broken_assignment_id}`. The machine, event, and
+incident must all exist and belong to one another; a missing one or an
+ownership mismatch returns `404 {"error":{"code":"not_found"}}`. Otherwise an
+empty or complete chain reports `true`, the incident's total assignment
+count, and `null`; a damaged chain reports `false`, the total count, and the
+first assignment whose content hash, link, or chain hash does not verify. The
+check never writes, repairs, or deletes, is stable across repeat calls and
+restarts, and only examines the path incident's assignments, so damage under
+another incident or machine never fails this audit.
+
 ## Read-only incident lifecycle and responsibility-closure audit
 
 `GET /machines/{machine_id}/authorization-decision-events/incidents/integrity`
