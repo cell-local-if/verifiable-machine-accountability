@@ -1202,6 +1202,147 @@ def list_responsibility_assignments(
     return [responsibility_assignment_to_out(record) for record in records]
 
 
+class IncidentIntegrityOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_incident_id: str | None
+
+
+# The exact (from_status, to_status) history each incident status must have,
+# compared against the incident's history records in (created_at, id) order.
+_EXPECTED_INCIDENT_HISTORIES: dict[str, list[tuple[str, str]]] = {
+    "open": [],
+    "acknowledged": [("open", "acknowledged")],
+    "resolved": [("open", "acknowledged"), ("acknowledged", "resolved")],
+}
+
+
+def find_broken_incident(
+    session: Session, machine_id: str
+) -> tuple[int, str | None]:
+    """Scan one machine's incidents in (created_at, id) order.
+
+    Returns ``(total_count, broken_incident_id)``. An incident is broken when:
+
+    * its ``event_id`` does not resolve to an existing authorization decision
+      event owned by the path machine;
+    * its ``status`` is not one of ``open``/``acknowledged``/``resolved``, or
+      its status-transition history (in ``created_at``, ``id`` order) is not
+      exactly the sequence that status requires — no records for ``open``,
+      only ``open -> acknowledged`` for ``acknowledged``, and those two steps
+      for ``resolved`` — or any history record's ``machine_id``, ``event_id``,
+      or ``incident_id`` does not match the incident;
+    * any of its responsibility assignments has a ``machine_id``, ``event_id``,
+      or ``incident_id`` that does not match the incident, a ``party`` or
+      ``role`` that is empty after trimming surrounding whitespace, or a
+      trimmed ``(party, role)`` combination already seen on the incident;
+    * it is ``resolved`` but has no valid responsibility assignment.
+
+    History and assignment rows are selected by ``incident_id`` alone so a
+    tampered ownership field is detected rather than filtered away. Read-only:
+    the scan issues no writes and never repairs or deletes a bad value.
+    """
+    records = session.scalars(
+        select(AuthorizationDecisionIncident)
+        .where(AuthorizationDecisionIncident.machine_id == machine_id)
+        .order_by(
+            AuthorizationDecisionIncident.created_at,
+            AuthorizationDecisionIncident.id,
+        )
+    ).all()
+
+    machine_event_ids = set(
+        session.scalars(
+            select(AuthorizationDecisionEvent.id).where(
+                AuthorizationDecisionEvent.machine_id == machine_id
+            )
+        ).all()
+    )
+
+    for record in records:
+        if record.event_id not in machine_event_ids:
+            return len(records), record.id
+
+        expected_history = _EXPECTED_INCIDENT_HISTORIES.get(record.status)
+        if expected_history is None:
+            return len(records), record.id
+        history = session.scalars(
+            select(IncidentStatusEvent)
+            .where(IncidentStatusEvent.incident_id == record.id)
+            .order_by(IncidentStatusEvent.created_at, IncidentStatusEvent.id)
+        ).all()
+        if len(history) != len(expected_history) or any(
+            entry.machine_id != machine_id
+            or entry.event_id != record.event_id
+            or entry.incident_id != record.id
+            or (entry.from_status, entry.to_status) != step
+            for entry, step in zip(history, expected_history)
+        ):
+            return len(records), record.id
+
+        assignments = session.scalars(
+            select(IncidentResponsibilityAssignment)
+            .where(IncidentResponsibilityAssignment.incident_id == record.id)
+            .order_by(
+                IncidentResponsibilityAssignment.created_at,
+                IncidentResponsibilityAssignment.id,
+            )
+        ).all()
+        seen_pairs: set[tuple[str, str]] = set()
+        assignments_broken = False
+        for assignment in assignments:
+            if (
+                assignment.machine_id != machine_id
+                or assignment.event_id != record.event_id
+                or assignment.incident_id != record.id
+                or not isinstance(assignment.party, str)
+                or not assignment.party.strip()
+                or not isinstance(assignment.role, str)
+                or not assignment.role.strip()
+            ):
+                assignments_broken = True
+                break
+            pair = (assignment.party.strip(), assignment.role.strip())
+            if pair in seen_pairs:
+                assignments_broken = True
+                break
+            seen_pairs.add(pair)
+        if assignments_broken:
+            return len(records), record.id
+        if record.status == "resolved" and not seen_pairs:
+            return len(records), record.id
+
+    return len(records), None
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/incidents/integrity",
+    response_model=IncidentIntegrityOut,
+)
+def check_incident_integrity(machine_id: str, session: SessionDep):
+    """Read-only lifecycle and responsibility audit of one machine's incidents.
+
+    Returns ``{valid, checked_count, broken_incident_id}``: no incidents or all
+    sound incidents report ``true``, the machine's total incident count, and
+    ``null``; otherwise the first incident (in ``created_at``, ``id`` order)
+    failing the event-reference, status-history, or responsibility-assignment
+    checks is reported. Only incidents owned by the path machine are examined,
+    so another machine's damaged records can never fail this machine's audit.
+    The query never writes, repairs, or deletes incidents, history, or
+    assignments.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    checked_count, broken_incident_id = find_broken_incident(session, machine_id)
+    return IncidentIntegrityOut(
+        valid=broken_incident_id is None,
+        checked_count=checked_count,
+        broken_incident_id=broken_incident_id,
+    )
+
+
 # Evidence fingerprints are checked exactly as stored: 64 characters drawn
 # only from lowercase hexadecimal. The pattern never case-folds, so an
 # uppercase fingerprint fails verification instead of being normalized away.
