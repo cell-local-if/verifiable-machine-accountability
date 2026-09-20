@@ -23,6 +23,7 @@ from .db import (
     AuthorizationDecisionIncident,
     Base,
     BehaviorDeclaration,
+    IncidentResponsibilityAssignment,
     IncidentStatusEvent,
     KeyRotationEvent,
     Machine,
@@ -1072,6 +1073,133 @@ def list_incident_status_history(
 
     records = incidents.list_status_history(session, machine_id, event_id, incident_id)
     return [incident_status_event_to_out(record) for record in records]
+
+
+class ResponsibilityAssignmentCreate(BaseModel):
+    party: NonEmptyStr
+    role: NonEmptyStr
+
+
+class ResponsibilityAssignmentOut(BaseModel):
+    id: str
+    machine_id: str
+    event_id: str
+    incident_id: str
+    party: str
+    role: str
+    created_at: str
+
+
+def responsibility_assignment_to_out(
+    record: IncidentResponsibilityAssignment,
+) -> ResponsibilityAssignmentOut:
+    return ResponsibilityAssignmentOut(
+        id=record.id,
+        machine_id=record.machine_id,
+        event_id=record.event_id,
+        incident_id=record.incident_id,
+        party=record.party,
+        role=record.role,
+        created_at=record.created_at,
+    )
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/incidents/"
+    "{incident_id}/responsibility-assignments",
+    status_code=201,
+    response_model=ResponsibilityAssignmentOut,
+)
+def create_responsibility_assignment(
+    machine_id: str,
+    event_id: str,
+    incident_id: str,
+    body: ResponsibilityAssignmentCreate,
+    session: SessionDep,
+):
+    """Assign one responsibility (party, role) to a registered incident.
+
+    Body validation runs before any path lookup, so a missing, non-string, or
+    blank-after-trimming ``party`` or ``role`` is a 422 even when the machine,
+    event, or incident does not exist. A missing machine, event, or incident,
+    or an ownership mismatch, is a 404. Repeating an existing
+    ``(party, role)`` pair on the same incident returns 409
+    ``duplicate_assignment`` and writes nothing. The write touches only the
+    assignments table: incidents, events, evidence, chains, and links are
+    never modified.
+    """
+    incident = incidents.get_machine_event_incident(
+        session, machine_id, event_id, incident_id
+    )
+    if incident is None:
+        return error_response(404, "not_found")
+
+    existing = session.scalar(
+        select(IncidentResponsibilityAssignment).where(
+            IncidentResponsibilityAssignment.incident_id == incident_id,
+            IncidentResponsibilityAssignment.party == body.party,
+            IncidentResponsibilityAssignment.role == body.role,
+        )
+    )
+    if existing is not None:
+        return error_response(409, "duplicate_assignment")
+
+    record = IncidentResponsibilityAssignment(
+        id=str(uuid.uuid4()),
+        machine_id=machine_id,
+        event_id=event_id,
+        incident_id=incident_id,
+        party=body.party,
+        role=body.role,
+        created_at=utc_now_iso(),
+    )
+    session.add(record)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return error_response(409, "duplicate_assignment")
+    return responsibility_assignment_to_out(record)
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/incidents/"
+    "{incident_id}/responsibility-assignments",
+    response_model=list[ResponsibilityAssignmentOut],
+)
+def list_responsibility_assignments(
+    machine_id: str,
+    event_id: str,
+    incident_id: str,
+    session: SessionDep,
+):
+    """Read-only list of one incident's responsibility assignments.
+
+    The machine, event, and incident must all exist and belong together; a
+    missing one or an ownership mismatch returns 404 ``not_found``. Entries
+    are returned in ``created_at``, then ``id`` order (``[]`` for an incident
+    with no assignments). The query only reads: assignments are never updated
+    or deleted, and no other table is touched.
+    """
+    incident = incidents.get_machine_event_incident(
+        session, machine_id, event_id, incident_id
+    )
+    if incident is None:
+        return error_response(404, "not_found")
+
+    records = session.scalars(
+        select(IncidentResponsibilityAssignment)
+        .where(
+            IncidentResponsibilityAssignment.machine_id == machine_id,
+            IncidentResponsibilityAssignment.event_id == event_id,
+            IncidentResponsibilityAssignment.incident_id == incident_id,
+        )
+        .order_by(
+            IncidentResponsibilityAssignment.created_at,
+            IncidentResponsibilityAssignment.id,
+        )
+    ).all()
+    return [responsibility_assignment_to_out(record) for record in records]
 
 
 # Evidence fingerprints are checked exactly as stored: 64 characters drawn
