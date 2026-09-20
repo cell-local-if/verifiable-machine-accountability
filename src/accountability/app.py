@@ -1202,6 +1202,141 @@ def list_responsibility_assignments(
     return [responsibility_assignment_to_out(record) for record in records]
 
 
+class IncidentIntegrityOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_incident_id: str | None
+
+
+# The exact status-history sequences that match an incident's current status.
+# History is ordered by (created_at, id); each pair is (from_status, to_status).
+_EXPECTED_INCIDENT_HISTORY = {
+    "open": [],
+    "acknowledged": [("open", "acknowledged")],
+    "resolved": [("open", "acknowledged"), ("acknowledged", "resolved")],
+}
+
+
+def find_broken_incident(
+    session: Session, machine_id: str
+) -> tuple[int, str | None]:
+    """Audit one machine's incidents for lifecycle and responsibility closure.
+
+    Returns ``(total_count, broken_incident_id)``. Incidents are scanned in
+    ``(created_at, id)`` order. An incident is broken when:
+
+    * its ``event_id`` does not resolve to an existing decision event owned by
+      the path machine;
+    * its status history does not exactly match the status: ``open`` has no
+      history, ``acknowledged`` has exactly ``open -> acknowledged``, and
+      ``resolved`` has that edge followed by ``acknowledged -> resolved``;
+    * a history record's ``machine_id``, ``event_id``, or ``incident_id`` does
+      not match the incident;
+    * a responsibility record's ownership triple does not match, its ``party``
+      or ``role`` is empty after trimming surrounding whitespace, or its
+      trimmed ``(party, role)`` pair duplicates another record;
+    * a ``resolved`` incident has no valid responsibility record (the
+      responsibility closure is open).
+
+    Read-only: it issues no writes and never normalizes, repairs, or deletes a
+    bad value.
+    """
+    incidents = session.scalars(
+        select(AuthorizationDecisionIncident)
+        .where(AuthorizationDecisionIncident.machine_id == machine_id)
+        .order_by(
+            AuthorizationDecisionIncident.created_at,
+            AuthorizationDecisionIncident.id,
+        )
+    ).all()
+
+    machine_event_ids = set(
+        session.scalars(
+            select(AuthorizationDecisionEvent.id).where(
+                AuthorizationDecisionEvent.machine_id == machine_id
+            )
+        ).all()
+    )
+
+    for incident in incidents:
+        if incident.event_id not in machine_event_ids:
+            return len(incidents), incident.id
+
+        history = session.scalars(
+            select(IncidentStatusEvent)
+            .where(IncidentStatusEvent.incident_id == incident.id)
+            .order_by(IncidentStatusEvent.created_at, IncidentStatusEvent.id)
+        ).all()
+        expected_edges = _EXPECTED_INCIDENT_HISTORY.get(incident.status)
+        edges = [(entry.from_status, entry.to_status) for entry in history]
+        if expected_edges is None or edges != expected_edges or any(
+            entry.machine_id != machine_id
+            or entry.event_id != incident.event_id
+            or entry.incident_id != incident.id
+            for entry in history
+        ):
+            return len(incidents), incident.id
+
+        assignments = session.scalars(
+            select(IncidentResponsibilityAssignment)
+            .where(IncidentResponsibilityAssignment.incident_id == incident.id)
+            .order_by(
+                IncidentResponsibilityAssignment.created_at,
+                IncidentResponsibilityAssignment.id,
+            )
+        ).all()
+        valid_pairs: set[tuple[str, str]] = set()
+        for assignment in assignments:
+            party = assignment.party.strip() if isinstance(assignment.party, str) else ""
+            role = assignment.role.strip() if isinstance(assignment.role, str) else ""
+            if (
+                assignment.machine_id != machine_id
+                or assignment.event_id != incident.event_id
+                or assignment.incident_id != incident.id
+                or not party
+                or not role
+            ):
+                return len(incidents), incident.id
+            if (party, role) in valid_pairs:
+                return len(incidents), incident.id
+            valid_pairs.add((party, role))
+
+        # The responsibility closure is complete only once a resolved incident
+        # has at least one sound (party, role) attribution.
+        if incident.status == "resolved" and not valid_pairs:
+            return len(incidents), incident.id
+
+    return len(incidents), None
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/incidents/integrity",
+    response_model=IncidentIntegrityOut,
+)
+def check_incident_integrity(machine_id: str, session: SessionDep):
+    """Read-only lifecycle and responsibility-closure audit of one machine's
+    registered incidents.
+
+    Returns ``{valid, checked_count, broken_incident_id}``: no incidents or all
+    sound incidents report ``true``, the machine's total incident count, and
+    ``null``; otherwise the first incident failing the event-reference,
+    status-history, ownership, non-blank/unique party-role, or
+    resolved-has-responsibility check is reported. Only incidents owned by the
+    path machine are examined, and the query never writes, repairs, or deletes.
+    A missing machine returns ``404 not_found``.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    checked_count, broken_incident_id = find_broken_incident(session, machine_id)
+    return IncidentIntegrityOut(
+        valid=broken_incident_id is None,
+        checked_count=checked_count,
+        broken_incident_id=broken_incident_id,
+    )
+
+
 # Evidence fingerprints are checked exactly as stored: 64 characters drawn
 # only from lowercase hexadecimal. The pattern never case-folds, so an
 # uppercase fingerprint fails verification instead of being normalized away.

@@ -193,6 +193,40 @@ incident can never read them), survive application restarts, and neither
 endpoint ever writes or modifies incidents, events, evidence, hash chains, or
 causal links.
 
+## Read-only incident lifecycle and responsibility-closure audit
+
+`GET /machines/{machine_id}/authorization-decision-events/incidents/integrity`
+audits every registered incident owned by one machine, in `(created_at, id)`
+order, and returns `{valid, checked_count, broken_incident_id}`. A missing
+machine returns `404 {"error":{"code":"not_found"}}`; a machine with no
+incidents returns `200` with `true`, `0`, and `null`.
+
+An incident passes only when:
+
+- its `event_id` resolves to an existing authorization decision event that
+  belongs to the same machine (missing or foreign-owned events fail);
+- its `status` and its status history, ordered by `(created_at, id)`, correspond
+  exactly: `open` has no history, `acknowledged` has exactly
+  `open -> acknowledged`, and `resolved` has that edge followed by
+  `acknowledged -> resolved`; every history record's `machine_id`, `event_id`,
+  and `incident_id` must also match the incident;
+- every responsibility assignment's `machine_id`, `event_id`, and
+  `incident_id` matches the incident, its `party` and `role` each stay
+  non-empty after trimming surrounding whitespace, and no two records share the
+  same trimmed `(party, role)` pair;
+- a `resolved` incident has at least one sound responsibility assignment
+  (the responsibility closure is complete). Open and acknowledged incidents
+  require none.
+
+The first failing incident sets `valid` to `false` and `broken_incident_id` to
+its id; `checked_count` is always the machine's total incident count, and
+`broken_incident_id` is `null` when every incident passes. Only the path
+machine's incidents are checked, so damage under another machine never fails
+this audit. The query is strictly read-only — it never writes, repairs,
+deletes, or normalizes incidents, history, assignments, events, evidence, hash
+chains, or causal links — gives identical results on repeat calls against
+unchanged data, and audits data persisted across application restarts.
+
 ## Bounded causal traces
 
 `GET /machines/{machine_id}/authorization-decision-events/{event_id}/causal-trace`
