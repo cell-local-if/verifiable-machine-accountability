@@ -1337,6 +1337,65 @@ def check_incident_integrity(machine_id: str, session: SessionDep):
     )
 
 
+class IncidentComplianceExportOut(BaseModel):
+    machine_id: str
+    from_created_at: str
+    to_created_at: str
+    incidents: list[IncidentOut]
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/incidents/compliance-export",
+    response_model=IncidentComplianceExportOut,
+)
+def export_incidents_compliance(
+    machine_id: str,
+    params: Annotated[ComplianceExportParams, Depends(validate_compliance_export_params)],
+    session: SessionDep,
+):
+    """Read-only compliance export of one machine's incidents over a time window.
+
+    Includes every incident owned by the path machine whose ``created_at``
+    falls within the inclusive bounds, in ``(created_at, id)`` order, with
+    exactly the fields of the incident list endpoint. Incidents are exported
+    exactly as stored: a damaged, missing, or foreign referenced event, status
+    history, or responsibility record never causes an incident to be rewritten,
+    filtered out, or repaired. The endpoint only issues reads and never returns
+    another machine's incidents.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    # Load in the same (created_at, id) order as the list endpoint, then apply
+    # the closed window to parsed instants: a stored exact-second ISO stamp
+    # (no fractional part) would not compare correctly lexicographically
+    # against a bound carrying a fractional part.
+    machine_incidents = session.scalars(
+        select(AuthorizationDecisionIncident)
+        .where(AuthorizationDecisionIncident.machine_id == machine_id)
+        .order_by(
+            AuthorizationDecisionIncident.created_at,
+            AuthorizationDecisionIncident.id,
+        )
+    ).all()
+    records = [
+        record
+        for record in machine_incidents
+        if window_start <= parse_utc_z_datetime(record.created_at) <= window_end
+    ]
+
+    return IncidentComplianceExportOut(
+        machine_id=machine_id,
+        from_created_at=params.from_created_at,
+        to_created_at=params.to_created_at,
+        incidents=[incident_to_out(record) for record in records],
+    )
+
+
 # Evidence fingerprints are checked exactly as stored: 64 characters drawn
 # only from lowercase hexadecimal. The pattern never case-folds, so an
 # uppercase fingerprint fails verification instead of being normalized away.
