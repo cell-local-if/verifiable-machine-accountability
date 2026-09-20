@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import chain, incidents, rotation_chain
+from . import assignment_chain, chain, incidents, rotation_chain
 from .db import (
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
@@ -67,6 +67,8 @@ async def lifespan(app: FastAPI):
     chain.backfill_chains(engine)
     rotation_chain.migrate_schema(engine)
     rotation_chain.backfill_chains(engine)
+    assignment_chain.migrate_schema(engine)
+    assignment_chain.backfill_chains(engine)
     app.state.engine = engine
     yield
     engine.dispose()
@@ -1088,6 +1090,9 @@ class ResponsibilityAssignmentOut(BaseModel):
     party: str
     role: str
     created_at: str
+    previous_assignment_id: str | None
+    content_hash: str
+    chain_hash: str
 
 
 def responsibility_assignment_to_out(
@@ -1101,6 +1106,9 @@ def responsibility_assignment_to_out(
         party=record.party,
         role=record.role,
         created_at=record.created_at,
+        previous_assignment_id=record.previous_assignment_id,
+        content_hash=record.content_hash,
+        chain_hash=record.chain_hash,
     )
 
 
@@ -1124,41 +1132,30 @@ def create_responsibility_assignment(
     incident does not exist. A missing machine, event, or incident, or an
     ownership mismatch, is a 404. Assigning the same ``party`` and ``role`` to
     the same incident twice returns 409 ``duplicate_assignment`` and writes
-    nothing. The write touches only the responsibility-assignments table: the
-    incident, event, evidence, hash chain, and causal links are never modified.
+    nothing. The new record is appended to the machine's assignment hash
+    chain: the duplicate check, tail read, and insert commit in a single
+    locked write transaction, so concurrent creators cannot lose records,
+    fork the chain, or break a link. The incident, event, evidence, decision
+    chain, and causal links are never modified.
     """
-    incident = incidents.get_machine_event_incident(
-        session, machine_id, event_id, incident_id
-    )
-    if incident is None:
-        return error_response(404, "not_found")
-
-    existing = session.scalar(
-        select(IncidentResponsibilityAssignment).where(
-            IncidentResponsibilityAssignment.incident_id == incident_id,
-            IncidentResponsibilityAssignment.party == body.party,
-            IncidentResponsibilityAssignment.role == body.role,
-        )
-    )
-    if existing is not None:
-        return error_response(409, "duplicate_assignment")
-
-    record = IncidentResponsibilityAssignment(
-        id=str(uuid.uuid4()),
+    engine = session.get_bind()
+    # Release the read connection before opening the locked write transaction,
+    # matching the other chain appenders: concurrent creators never hold two
+    # pool connections at once.
+    session.close()
+    result = assignment_chain.append_assignment(
+        engine,
         machine_id=machine_id,
         event_id=event_id,
         incident_id=incident_id,
         party=body.party,
         role=body.role,
-        created_at=utc_now_iso(),
     )
-    session.add(record)
-    try:
-        session.commit()
-    except IntegrityError:
-        session.rollback()
+    if result["status"] == "not_found":
+        return error_response(404, "not_found")
+    if result["status"] == "duplicate_assignment":
         return error_response(409, "duplicate_assignment")
-    return responsibility_assignment_to_out(record)
+    return ResponsibilityAssignmentOut(**result["assignment"])
 
 
 @app.get(
@@ -1200,6 +1197,40 @@ def list_responsibility_assignments(
         )
     ).all()
     return [responsibility_assignment_to_out(record) for record in records]
+
+
+class ResponsibilityAssignmentIntegrityOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_assignment_id: str | None
+
+
+@app.get(
+    "/machines/{machine_id}/responsibility-assignments/integrity",
+    response_model=ResponsibilityAssignmentIntegrityOut,
+)
+def check_responsibility_assignment_integrity(machine_id: str, session: SessionDep):
+    """Read-only verification of one machine's responsibility-assignment chain.
+
+    Returns ``{valid, checked_count, broken_assignment_id}``: an empty or
+    fully sound chain reports ``true``, the machine's total assignment count,
+    and ``null``; otherwise the first record whose content hash,
+    previous-assignment link, or chain hash does not verify is reported. Only
+    the path machine's records are examined, and the query never writes,
+    repairs, or deletes, so repeated calls and restarts return stable results.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    valid, checked_count, broken_assignment_id = assignment_chain.verify_chain(
+        session, machine_id
+    )
+    return ResponsibilityAssignmentIntegrityOut(
+        valid=valid,
+        checked_count=checked_count,
+        broken_assignment_id=broken_assignment_id,
+    )
 
 
 class IncidentIntegrityOut(BaseModel):
