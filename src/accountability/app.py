@@ -1233,6 +1233,66 @@ def check_responsibility_assignment_integrity(machine_id: str, session: SessionD
     )
 
 
+class ResponsibilityAssignmentComplianceExportOut(BaseModel):
+    machine_id: str
+    from_created_at: str
+    to_created_at: str
+    assignments: list[ResponsibilityAssignmentOut]
+
+
+@app.get(
+    "/machines/{machine_id}/responsibility-assignments/compliance-export",
+    response_model=ResponsibilityAssignmentComplianceExportOut,
+)
+def export_responsibility_assignments_compliance(
+    machine_id: str,
+    params: Annotated[ComplianceExportParams, Depends(validate_compliance_export_params)],
+    session: SessionDep,
+):
+    """Read-only compliance export of one machine's responsibility assignments
+    over a time window.
+
+    Includes every assignment owned by the path machine whose ``created_at``
+    falls within the inclusive bounds, in ``(created_at, id)`` order, with
+    exactly the fields of the assignment list endpoint. Records are exported
+    exactly as stored: a missing, foreign, or damaged event or incident
+    reference, field value, or chain link never causes a record to be
+    rewritten, filtered out, or repaired. The endpoint only issues reads and
+    never returns another machine's assignments.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    # Load in the same (created_at, id) order as the list endpoint, then apply
+    # the closed window to parsed instants: a stored exact-second ISO stamp
+    # (no fractional part) would not compare correctly lexicographically
+    # against a bound carrying a fractional part.
+    machine_assignments = session.scalars(
+        select(IncidentResponsibilityAssignment)
+        .where(IncidentResponsibilityAssignment.machine_id == machine_id)
+        .order_by(
+            IncidentResponsibilityAssignment.created_at,
+            IncidentResponsibilityAssignment.id,
+        )
+    ).all()
+    records = [
+        record
+        for record in machine_assignments
+        if window_start <= parse_utc_z_datetime(record.created_at) <= window_end
+    ]
+
+    return ResponsibilityAssignmentComplianceExportOut(
+        machine_id=machine_id,
+        from_created_at=params.from_created_at,
+        to_created_at=params.to_created_at,
+        assignments=[responsibility_assignment_to_out(record) for record in records],
+    )
+
+
 class IncidentIntegrityOut(BaseModel):
     valid: bool
     checked_count: int
