@@ -164,6 +164,35 @@ hash chains, or causal links. History is strictly isolated to its own incident
 (another incident, event, or machine can never read it) and persists across
 application restarts.
 
+## Incident responsibility assignments
+
+`POST /machines/{machine_id}/authorization-decision-events/{event_id}/incidents/{incident_id}/responsibility-assignments`
+attributes responsibility for one registered incident to a party in a role.
+The body requires:
+
+- `party`, `role` — strings that stay non-empty after trimming surrounding
+  whitespace; missing, non-string, or blank values return `422`. Body
+  validation runs before any path lookup, so a malformed payload is `422`
+  even when the machine, event, or incident does not exist.
+
+After validation, the machine, event, and incident must all exist and belong
+to one another; a missing one or an ownership mismatch returns
+`404 {"error":{"code":"not_found"}}`. Success returns `201` with
+`{id, machine_id, event_id, incident_id, party, role, created_at}`: a fresh
+UUID `id` and `created_at` a UTC RFC 3339 date-time ending in `Z`. The trimmed
+`party` and `role` are stored as supplied. Assigning the same `party` and
+`role` to the same incident twice returns
+`409 {"error":{"code":"duplicate_assignment"}}` and writes nothing; the same
+pair is allowed on a different incident.
+
+`GET` on the same path returns the incident's assignments in `created_at`,
+then `id` order (`[]` when none), with the same fields as the create response
+and the same `404 not_found` semantics. Assignments live in their own table,
+are strictly isolated by machine and incident (another machine, event, or
+incident can never read them), survive application restarts, and neither
+endpoint ever writes or modifies incidents, events, evidence, hash chains, or
+causal links.
+
 ## Bounded causal traces
 
 `GET /machines/{machine_id}/authorization-decision-events/{event_id}/causal-trace`

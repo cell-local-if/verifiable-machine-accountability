@@ -180,6 +180,46 @@ class IncidentStatusEvent(Base):
     created_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
+class IncidentResponsibilityAssignment(Base):
+    """Responsibility attribution for one registered incident.
+
+    A ``(party, role)`` pair can be assigned to a given incident at most once;
+    the same pair on another incident is a distinct assignment. Rows live in
+    their own table and never modify incidents, events, evidence, chains, or
+    links.
+    """
+
+    __tablename__ = "incident_responsibility_assignments"
+    __table_args__ = (
+        UniqueConstraint(
+            "incident_id",
+            "party",
+            "role",
+            name="uq_responsibility_assignment_incident_party_role",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        index=True,
+    )
+    incident_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_incidents.id"),
+        nullable=False,
+        index=True,
+    )
+    party: Mapped[str] = mapped_column(String, nullable=False)
+    role: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class AuthorizationDecisionCausalLink(Base):
     __tablename__ = "authorization_decision_causal_links"
     __table_args__ = (
