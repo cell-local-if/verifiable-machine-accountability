@@ -90,6 +90,9 @@ def test_create_assignment_returns_201_with_full_record(client, incident):
         "party",
         "role",
         "created_at",
+        "previous_assignment_id",
+        "content_hash",
+        "chain_hash",
     }
     assert UUID_RE.match(body["id"])
     assert body["machine_id"] == machine_id
@@ -307,6 +310,9 @@ def test_list_assignments_returns_records_ordered_by_created_at_then_id(
             "party",
             "role",
             "created_at",
+            "previous_assignment_id",
+            "content_hash",
+            "chain_hash",
         }
 
 

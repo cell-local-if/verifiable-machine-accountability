@@ -193,6 +193,39 @@ incident can never read them), survive application restarts, and neither
 endpoint ever writes or modifies incidents, events, evidence, hash chains, or
 causal links.
 
+## Responsibility assignment integrity chain
+
+Each incident's responsibility assignments form a per-incident, tamper-evident
+hash chain, following the same rules as the authorization event integrity
+chain. Every record returned by the assignment create and list endpoints
+carries:
+
+- `previous_assignment_id` — `null` for the incident's first assignment,
+  otherwise the id of the preceding assignment in `(created_at, id)` order;
+- `content_hash` — `SHA-256(UTF-8(compact key-sorted JSON of {id, machine_id,
+  event_id, incident_id, party, role, created_at}))`;
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first
+  assignment and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))`
+  thereafter.
+
+All hashes are 64-character lowercase hexadecimal strings. New assignments are
+appended to their incident's chain tail inside a single write transaction, so
+concurrent creates cannot lose records, fork, or break the chain, and never
+modify incidents, events, evidence, other chains, or causal links. On startup
+the service adds the new columns to pre-existing databases and backfills
+missing chain data per incident in `(created_at, id)` order; the recomputation
+is deterministic, so restarting with an already complete database performs no
+writes.
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/incidents/{incident_id}/responsibility-assignments/integrity`
+verifies the chain read-only and returns `{valid, checked_count,
+broken_assignment_id}`: a complete or empty chain reports `true`, the total
+count, and `null`; otherwise it reports `false`, the total count, and the
+first assignment whose content hash, link, or chain hash does not verify. The
+check is stable across repeat calls and restarts and only examines the path
+incident's records. A missing machine, event, or incident, or an ownership
+mismatch, returns `404 not_found`.
+
 ## Read-only incident lifecycle and responsibility-closure audit
 
 `GET /machines/{machine_id}/authorization-decision-events/incidents/integrity`
