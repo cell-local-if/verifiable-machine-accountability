@@ -314,3 +314,34 @@ parameters on repeat calls, and reads data persisted across application
 restarts.
 
 
+
+## Read-only incident status history compliance export
+
+`GET /machines/{machine_id}/incident-status-events/compliance-export`
+returns a deterministic, read-only, machine-level compliance slice of one
+machine's incident status transition history. Both query parameters are
+required and validated before the machine is looked up, so a missing,
+malformed, or inverted parameter returns `422` even when the machine does not
+exist:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; offset forms such as `+00:00` are rejected);
+  `from_created_at` must not be later than `to_created_at` (equal bounds are
+  allowed).
+
+After validation, a missing machine returns `404 {"error":{"code":"not_found"}}`.
+
+The response is `{machine_id, from_created_at, to_created_at, status_history}`.
+`status_history` contains only status events owned by the path machine whose
+`created_at` falls inside the closed interval `[from_created_at, to_created_at]`,
+aggregated across all of the machine's incidents. Each item has exactly
+`{id, machine_id, event_id, incident_id, from_status, to_status, created_at}`,
+ordered by `created_at`, then `id`, and the array is empty (never omitted)
+when the window contains nothing.
+
+Records are exported exactly as stored: a missing or foreign-owned incident or
+event reference, or a corrupt status edge, is included verbatim — never
+rewritten, filtered out, or repaired. The endpoint issues no writes, repairs,
+or deletions, never returns another machine's status history, produces
+identical output for identical data and parameters on repeat calls, and reads
+data persisted across application restarts.
