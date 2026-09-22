@@ -619,6 +619,62 @@ def validate_compliance_export_params(
     )
 
 
+class KeyRotationComplianceExportOut(BaseModel):
+    machine_id: str
+    from_created_at: str
+    to_created_at: str
+    rotations: list[KeyRotationEventOut]
+
+
+@app.get(
+    "/machines/{machine_id}/key-rotation-events/compliance-export",
+    response_model=KeyRotationComplianceExportOut,
+)
+def export_key_rotation_events_compliance(
+    machine_id: str,
+    params: Annotated[ComplianceExportParams, Depends(validate_compliance_export_params)],
+    session: SessionDep,
+):
+    """Read-only compliance export of one machine's key rotations over a window.
+
+    Includes every rotation record owned by the path machine whose
+    ``created_at`` falls within the inclusive bounds, in ``(created_at, id)``
+    order, with exactly the fields of the key-rotation-events list endpoint.
+    Records are exported exactly as stored: a damaged current machine public
+    key or a corrupt previous-rotation link, content hash, or chain hash never
+    causes a record to be rewritten, filtered out, or repaired. The endpoint
+    only issues reads and never returns another machine's rotations.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    # Load in the same (created_at, id) order as the list endpoint, then apply
+    # the closed window to parsed instants: a stored exact-second ISO stamp
+    # (no fractional part) would not compare correctly lexicographically
+    # against a bound carrying a fractional part.
+    machine_events = session.scalars(
+        select(KeyRotationEvent)
+        .where(KeyRotationEvent.machine_id == machine_id)
+        .order_by(KeyRotationEvent.created_at, KeyRotationEvent.id)
+    ).all()
+    records = [
+        event
+        for event in machine_events
+        if window_start <= parse_utc_z_datetime(event.created_at) <= window_end
+    ]
+
+    return KeyRotationComplianceExportOut(
+        machine_id=machine_id,
+        from_created_at=params.from_created_at,
+        to_created_at=params.to_created_at,
+        rotations=[key_rotation_event_to_out(record) for record in records],
+    )
+
+
 class IntegrityOut(BaseModel):
     valid: bool
     checked_count: int
