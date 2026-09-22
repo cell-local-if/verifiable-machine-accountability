@@ -16,6 +16,36 @@ uvicorn accountability.app:app --reload
 
 The initial API exposes `GET /health`, which returns a JSON readiness result.
 
+## Machine start/stop control
+
+Each machine carries a persistent `status` of `"active"` (the default for new
+machines) or `"suspended"`. `POST /machines/{machine_id}/status` changes it;
+the body must be an object containing `{"status": "..."}` where `status` is
+exactly `"active"` or `"suspended"`. A missing, non-string, or otherwise
+invalid `status` (or a non-object body) returns `422` before the machine is
+looked up, so the same malformed request is `422` even for a non-existent
+machine. A missing machine returns `404 {"error":{"code":"not_found"}}`.
+Requesting the machine's current status returns
+`409 {"error":{"code":"invalid_status_transition"}}` and writes nothing.
+
+On success the machine's `status` and `updated_at` are updated atomically;
+`version`, `public_key`, `created_at`, and every other record are left
+unchanged, and the complete machine object is returned with `200`. The read,
+transition check, and write run in one locked write transaction, so concurrent
+requests for the same target state have at most one success (the rest get
+`409`). The status is stored on the machine row and therefore survives
+restarts.
+
+While a machine is `suspended`, both `POST /machines/{machine_id}/
+authorization-evaluations` and `POST /machines/{machine_id}/authorization-
+decision-events` return `{"allowed": false, "reason": "machine_suspended"}`
+without reading behavior declarations or policy rules, so their contents cannot
+affect the verdict. Decision-event creation still persists the denial exactly
+like any other decision and appends it to the machine's event hash chain, and
+all other machine, key rotation, declaration, policy, event, and audit
+interfaces are unchanged. After the machine is restored to `active`, normal
+evaluation rules apply again; events recorded earlier are never modified.
+
 ## Authorization event integrity chain
 
 Each machine's authorization decision events form a per-machine, tamper-evident
