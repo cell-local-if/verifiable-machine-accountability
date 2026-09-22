@@ -251,6 +251,21 @@ machine, ignores links whose target event no longer exists, terminates even
 when links form a cycle, and returns an empty array when nothing is
 reachable. The query never writes or modifies any record.
 
+## Read-only global policy rule listing
+
+`GET /policy-rules` returns every global policy rule, or `[]` when none exist.
+Each item contains exactly the persisted `{id, action_type, resource_pattern,
+effect, priority, created_at, updated_at}` values, with no normalization or
+repair of stored values. Rules are ordered by the actual UTC instant of
+`created_at`, then by `id` ascending: because ISO-8601 text ordering is not
+chronological across the fractional-second boundary (`...:00.5Z` sorts before
+`...:00Z` as text since `.` precedes `Z`), stamps are parsed to UTC instants
+first, so an exact-second record sorts before any fractional record of the same
+second. The endpoint is strictly read-only — it never writes, updates, deletes,
+normalizes, or repairs a rule — takes no part in authorization evaluation,
+returns identical results on repeat calls against unchanged data, and reads
+rules persisted across application restarts.
+
 ## Read-only compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/compliance-export`

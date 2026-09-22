@@ -345,6 +345,35 @@ def test_rotations_ordered_by_created_at_then_id(client):
     ]
 
 
+def test_same_second_exact_second_sorts_before_fractional_seconds(client):
+    # As text, "...:00.5Z" sorts *before* "...:00Z" ('.' < 'Z'), so a naive
+    # lexicographic order inverts the true order within one second. The export
+    # must order by the actual UTC instant: the exact-second record first, then
+    # fractional records earliest fraction first.
+    machine_id = create_machine(client)
+    insert_rotation_row(client, machine_id, rid(20), "2026-03-01T00:00:00.900000Z")
+    insert_rotation_row(client, machine_id, rid(10), "2026-03-01T00:00:00.500000Z")
+    insert_rotation_row(client, machine_id, rid(1), "2026-03-01T00:00:00Z")
+
+    response = client.get(export_url(machine_id, T0, T1))
+
+    assert [r["id"] for r in response.json()["rotations"]] == [
+        rid(1),
+        rid(10),
+        rid(20),
+    ]
+
+
+def test_equal_instant_tie_breaks_by_id_with_fractional_stamps(client):
+    machine_id = create_machine(client)
+    insert_rotation_row(client, machine_id, rid(21), "2026-03-01T00:00:00.250000Z")
+    insert_rotation_row(client, machine_id, rid(20), "2026-03-01T00:00:00.250000Z")
+
+    response = client.get(export_url(machine_id, T0, T1))
+
+    assert [r["id"] for r in response.json()["rotations"]] == [rid(20), rid(21)]
+
+
 def test_export_items_have_exactly_the_list_endpoint_fields(client):
     machine_id = create_machine(client)
     rotate(client, machine_id, "key-2", 1)

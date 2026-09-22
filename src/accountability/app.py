@@ -400,6 +400,26 @@ def create_policy_rule(body: PolicyRuleCreate, session: SessionDep):
     return policy_rule_to_out(rule)
 
 
+@app.get("/policy-rules", response_model=list[PolicyRuleOut])
+def list_policy_rules(session: SessionDep):
+    """Read-only listing of every global policy rule.
+
+    Returns all rules ordered by the actual UTC instant of ``created_at``,
+    then by ``id``; a table with no rules yields ``[]``. Each item carries
+    exactly the persisted ``{id, action_type, resource_pattern, effect,
+    priority, created_at, updated_at}`` values, with no normalization or
+    repair. ISO-8601 text ordering is not chronological once fractional
+    seconds are present (``...:00.5Z`` sorts before ``...:00Z`` because ``.``
+    precedes ``Z``), so stamps are parsed to UTC instants before the id
+    tie-break. The query only reads: it never writes, updates, deletes,
+    normalizes, or repairs a rule, and it never participates in authorization
+    evaluation, so repeated calls are stable and rules remain queryable across
+    restarts.
+    """
+    rules = session.scalars(select(PolicyRule)).all()
+    return [policy_rule_to_out(rule) for rule in order_by_created_at_instant(rules)]
+
+
 class AuthorizationEvaluationCreate(BaseModel):
     action_type: NonEmptyStr
     resource: NonEmptyStr
@@ -558,6 +578,22 @@ def parse_utc_z_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value[:-1] + "+00:00")
 
 
+def order_by_created_at_instant(records: list) -> list:
+    """Order persisted rows by the actual UTC instant of ``created_at``.
+
+    Text ordering of ISO-8601 stamps is not chronological across the
+    fractional-second boundary: within one second ``...:00.5Z`` precedes
+    ``...:00Z`` lexicographically (``.`` < ``Z``) even though the instant is
+    later. Parsing first makes an exact-second stamp sort before any
+    fractional stamp of the same second; rows that share an instant break
+    ties by ``id`` ascending.
+    """
+    return sorted(
+        records,
+        key=lambda record: (parse_utc_z_datetime(record.created_at), record.id),
+    )
+
+
 def _datetime_error(field_name: str, raw: str) -> dict[str, object]:
     return {
         "type": "value_error",
@@ -652,20 +688,22 @@ def export_key_rotation_events_compliance(
     window_start = parse_utc_z_datetime(params.from_created_at)
     window_end = parse_utc_z_datetime(params.to_created_at)
 
-    # Load in the same (created_at, id) order as the list endpoint, then apply
-    # the closed window to parsed instants: a stored exact-second ISO stamp
-    # (no fractional part) would not compare correctly lexicographically
-    # against a bound carrying a fractional part.
+    # Load the machine's rotations, order them by the actual UTC instant of
+    # ``created_at`` (then id), and apply the closed window to parsed instants.
+    # Neither step is safe lexicographically: within one second an exact-second
+    # ISO stamp (no fractional part) sorts *before* a fractional stamp as text
+    # (``.`` precedes ``Z``), so ordering by the stored string would put
+    # ``...:00.5Z`` ahead of ``...:00Z``; parsing both the bounds and each
+    # stamp compares true instants.
     machine_rotations = session.scalars(
-        select(KeyRotationEvent)
-        .where(KeyRotationEvent.machine_id == machine_id)
-        .order_by(KeyRotationEvent.created_at, KeyRotationEvent.id)
+        select(KeyRotationEvent).where(KeyRotationEvent.machine_id == machine_id)
     ).all()
-    records = [
+    in_window = [
         record
         for record in machine_rotations
         if window_start <= parse_utc_z_datetime(record.created_at) <= window_end
     ]
+    records = order_by_created_at_instant(in_window)
 
     return KeyRotationComplianceExportOut(
         machine_id=machine_id,
