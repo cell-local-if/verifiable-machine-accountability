@@ -42,6 +42,33 @@ otherwise it reports `false`, the total count, and the first event whose
 content hash, link, or chain hash does not verify. A missing machine returns
 `404 not_found`.
 
+## Machine suspension and reactivation
+
+A machine is persistently either `active` (the status assigned at creation) or
+`suspended`. `POST /machines/{machine_id}/status` with body
+`{"status": "active"}` or `{"status": "suspended"}` changes it. The body must
+be an object carrying a string `status` whose value is exactly `active` or
+`suspended`; a missing body, non-object body, missing or non-string `status`,
+or any other value returns `422` before the machine is looked up (so the same
+payload against a non-existent machine is still `422`). A missing machine
+returns `404 {"error":{"code":"not_found"}}`. Requesting the machine's current
+status returns `409 {"error":{"code":"invalid_status_transition"}}` and writes
+nothing, so concurrent requests for the same target status have at most one
+success: the lookup, same-status check, and update run in one locked write
+transaction. On success only `status` and `updated_at` change — `version`,
+`public_key`, `created_at`, and every other record are untouched — and the
+full updated machine object is returned with `200`. The status is stored in
+the machines table and survives restarts.
+
+While a machine is `suspended`, both
+`POST /machines/{machine_id}/authorization-evaluations` and
+`POST /machines/{machine_id}/authorization-decision-events` return
+`{"allowed": false, "reason": "machine_suspended"}` without consulting its
+behavior declarations or the policy rules. Decision-event requests still
+persist one event under the usual rules, linked into the machine's event hash
+chain. After reactivation the normal declaration/policy evaluation resumes;
+events recorded earlier (including while suspended) keep their stored result.
+
 ## Key rotation integrity chain
 
 Each machine's key rotation history forms its own per-machine, tamper-evident

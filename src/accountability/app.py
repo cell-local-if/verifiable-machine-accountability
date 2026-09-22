@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import assignment_chain, chain, incidents, rotation_chain
+from . import assignment_chain, chain, incidents, machines, rotation_chain
 from .db import (
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
@@ -107,6 +107,13 @@ class MachineCreate(BaseModel):
 class RotateKeyRequest(BaseModel):
     public_key: NonEmptyStr
     expected_version: int
+
+
+class MachineStatusUpdate(BaseModel):
+    # Literal validation runs before the handler, so a missing body field, a
+    # non-object body, a non-string value, or any string other than
+    # "active"/"suspended" is a 422 before the machine is ever looked up.
+    status: Literal["active", "suspended"]
 
 
 class MachineOut(BaseModel):
@@ -214,6 +221,40 @@ def rotate_key(machine_id: str, body: RotateKeyRequest, session: SessionDep):
         return error_response(422, "same_public_key")
     if status == "version_conflict":
         return error_response(409, "version_conflict")
+    return MachineOut(**result["machine"])
+
+
+@app.post("/machines/{machine_id}/status", response_model=MachineOut)
+def update_machine_status(
+    machine_id: str, body: MachineStatusUpdate, session: SessionDep
+):
+    """Persistently suspend or reactivate one machine.
+
+    Body validation runs before any machine lookup, so a missing body, a
+    non-object body, a missing or non-string ``status``, or any value other
+    than ``active``/``suspended`` is a 422 even when the machine does not
+    exist. A missing machine is a 404 ``not_found``. Requesting the machine's
+    current status returns 409 ``invalid_status_transition`` and writes
+    nothing, so concurrent requests for the same target status have at most
+    one success. On success only ``status`` and ``updated_at`` are atomically
+    updated; ``version``, ``public_key``, ``created_at``, and every other
+    record are unchanged, and the full updated machine is returned with 200.
+    The status is stored in the machines table and survives restarts.
+    """
+    engine = session.get_bind()
+    # Release the read connection before opening the locked write transaction,
+    # matching the chain appenders: concurrent updates never hold two pool
+    # connections at once.
+    session.close()
+    result = machines.change_machine_status(
+        engine,
+        machine_id=machine_id,
+        to_status=body.status,
+    )
+    if result["status"] == "not_found":
+        return error_response(404, "not_found")
+    if result["status"] == "invalid_status_transition":
+        return error_response(409, "invalid_status_transition")
     return MachineOut(**result["machine"])
 
 
@@ -475,6 +516,14 @@ def evaluate_authorization(
     if machine is None:
         return error_response(404, "not_found")
 
+    # A suspended machine is denied before any declaration or policy lookup,
+    # so its stored behavior declarations and policy rules can never produce
+    # an allow (or any other reason) while suspended.
+    if machine.status == "suspended":
+        return AuthorizationEvaluationOut(
+            allowed=False, reason="machine_suspended"
+        )
+
     return compute_authorization_decision(
         session, machine_id, body.action_type, body.resource
     )
@@ -520,9 +569,18 @@ def create_authorization_decision_event(
     if machine is None:
         return error_response(404, "not_found")
 
-    decision = compute_authorization_decision(
-        session, machine_id, body.action_type, body.resource
-    )
+    # A suspended machine is denied without reading its declarations or any
+    # policy rule. The decision is still recorded below under the same
+    # persistence and hash-chain rules as every other decision, so the
+    # suspension leaves a complete audit trail.
+    if machine.status == "suspended":
+        decision = AuthorizationEvaluationOut(
+            allowed=False, reason="machine_suspended"
+        )
+    else:
+        decision = compute_authorization_decision(
+            session, machine_id, body.action_type, body.resource
+        )
     engine = session.get_bind()
     # Commit and return the read connection before opening the locked write
     # transaction, so concurrent writers never hold two pool connections at
