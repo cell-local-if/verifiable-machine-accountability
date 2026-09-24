@@ -277,7 +277,10 @@ class WriteTransactionDiagnostic(Base):
     * ``flags`` — ``[]`` or a JSON array listing ``lock_wait`` and ``retry``
       in the order actually experienced (a lock wait and its retries collapse
       into this one record);
-    * ``status`` — the terminal machine status observed for the attempt;
+    * ``status`` — the transaction's terminal outcome: ``committed`` or
+      ``rolled_back`` (empty while the attempt is still in flight);
+    * ``machine_status`` — the machine's ``active``/``suspended`` state
+      observed for the attempt, kept apart from the transaction outcome;
     * ``event`` — the created event id for ``op = "event"`` commits, else
       ``null``;
     * ``count`` — the machine's decision-event count after the attempt.
@@ -292,7 +295,13 @@ class WriteTransactionDiagnostic(Base):
     phase: Mapped[str] = mapped_column(String(32), nullable=False)
     fail: Mapped[str] = mapped_column(String(16), nullable=False)
     flags: Mapped[str] = mapped_column(String, nullable=False, default="[]")
+    # Terminal transaction outcome: "committed" or "rolled_back" ("" while the
+    # attempt marker is still in its transient "started" phase).
     status: Mapped[str] = mapped_column(String, nullable=False)
+    # The machine's active/suspended state observed for the attempt, stored
+    # apart from the transaction terminal outcome ("" when no machine state
+    # was observed, e.g. the machine did not exist).
+    machine_status: Mapped[str] = mapped_column(String, nullable=False, default="")
     event: Mapped[str | None] = mapped_column(String(36), nullable=True)
     count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Snapshot of the machine's event hash-chain audit at the attempt's

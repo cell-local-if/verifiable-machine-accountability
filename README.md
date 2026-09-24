@@ -136,7 +136,11 @@ current authorization-event integrity audit in the existing
 - `flags` — `[]`, or the actually-experienced `lock_wait` and `retry` flags
   in that order. A lock wait and its retries collapse into this one record;
   a rollback is never recorded as a partial/fragmented entry;
-- `status` — the machine's terminal status for the attempt;
+- `status` — the transaction's terminal outcome: exactly `committed` or
+  `rolled_back`;
+- `machine_status` — the machine's `active`/`suspended` state observed for
+  the attempt, kept apart from the transaction terminal outcome (`""` when
+  no machine state was observed, e.g. the machine did not exist);
 - `event` — the created decision-event id for a committed `event` attempt,
   otherwise `null`;
 - `count` — the machine's decision-event count at the terminal state (the
@@ -482,3 +486,55 @@ rewritten, filtered out, or repaired. The endpoint issues no writes, repairs,
 or deletions, never returns another machine's status history, produces
 identical output for identical data and parameters on repeat calls, and reads
 data persisted across application restarts.
+
+## Read-only machine-level accountability compliance export
+
+`GET /machines/{machine_id}/accountability/compliance-export` returns a
+deterministic, read-only, machine-level closed-loop compliance slice: the five
+accountability record groups — decision events, evidence, incidents, incident
+status history, and responsibility assignments — plus the causal links between
+the exported events, in one response. Exactly two query parameters are
+accepted and both are validated before the machine is looked up, so an invalid
+query against a non-existent machine is still `422`:
+
+- `from_created_at`, `to_created_at` — required UTC RFC 3339 date-times
+  ending in `Z` (fractional seconds optional; offset forms such as `+00:00`,
+  a missing suffix, surrounding whitespace, and out-of-range calendar/time
+  values are rejected); `from_created_at` must not be later than
+  `to_created_at` (equal bounds are allowed). A missing, blank, malformed,
+  offset, or inverted bound returns `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns `422 {"error":{"code":"invalid_query"}}`
+  without reading any machine data.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}` — never a partial slice.
+
+The response is `{machine_id, from_created_at, to_created_at, events,
+causal_links, evidence, incidents, status_history, assignments}` with the
+bounds echoed verbatim:
+
+- `events` — the machine's authorization decision events in the closed
+  window, each with the same fields as the event list endpoint (the
+  authorization result and the integrity-chain fields included);
+- `causal_links` — the machine's causal links whose `cause_event_id` and
+  `effect_event_id` are both among the exported events;
+- `evidence` — the machine's evidence records in the window, each with the
+  original fingerprint;
+- `incidents` — the machine's registered incidents in the window, each with
+  its registered content and current lifecycle status;
+- `status_history` — the machine's incident status transition records in the
+  window, each with the from/to status of the transition;
+- `assignments` — the machine's responsibility assignments in the window,
+  each with party, role, and the chain fields.
+
+Every group is ordered by the actual UTC instant of `created_at`, then by
+`id` (an exact-second record sorts before any fractional-second record of
+the same second), and is empty (never omitted) when the window contains
+nothing. Records are exported exactly as stored: a missing, foreign, or
+damaged referenced object, field value, fingerprint, or chain link never
+causes a record to be rewritten, filtered out, or repaired.
+
+The endpoint issues no writes, repairs, recomputations, or deletions of the
+machine or any accountability record, never returns another machine's data,
+produces byte-identical output for identical data and parameters on repeat
+calls, and reads data persisted across application restarts.

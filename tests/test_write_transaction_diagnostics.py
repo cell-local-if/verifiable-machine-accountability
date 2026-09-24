@@ -1,12 +1,13 @@
 """Tests for the read-only joint-write transaction diagnostics.
 
 Covers `GET /machines/{machine_id}/diag`: one diagnostic per status-change
-or decision-event attempt, terminal commit/rollback records with stable
-failure categories and ordered lock-wait/retry flags, closed-UTC-window
-filtering in `(at, tid)` order, the `bad_time` / `invalid_query` /
-`not_found` outcomes, strict read-only stability, per-machine isolation, the
-per-record and top-level event-chain checks, and crash-residual recovery by
-evidence across a restart.
+or decision-event attempt, terminal committed/rolled_back records (with the
+machine's active/suspended state carried separately as `machine_status`)
+with stable failure categories and ordered lock-wait/retry flags,
+closed-UTC-window filtering in `(at, tid)` order, the `bad_time` /
+`invalid_query` / `not_found` outcomes, strict read-only stability,
+per-machine isolation, the per-record and top-level event-chain checks, and
+crash-residual recovery by evidence across a restart.
 """
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -84,6 +85,7 @@ RECORD_KEYS = {
     "fail",
     "flags",
     "status",
+    "machine_status",
     "event",
     "count",
     "check",
@@ -127,7 +129,10 @@ def test_committed_event_attempt_record(client):
     assert record["phase"] == "started-commit"
     assert record["fail"] == "none"
     assert record["flags"] == []
-    assert record["status"] == "active"
+    # ``status`` is the transaction terminal outcome; the machine state is
+    # carried separately in ``machine_status``.
+    assert record["status"] == "committed"
+    assert record["machine_status"] == "active"
     assert record["event"] == event["id"]
     assert record["count"] == 1
     assert record["at"].endswith("Z")
@@ -153,7 +158,8 @@ def test_committed_change_attempt_record(client):
     assert record["phase"] == "started-commit"
     assert record["fail"] == "none"
     assert record["flags"] == []
-    assert record["status"] == "suspended"
+    assert record["status"] == "committed"
+    assert record["machine_status"] == "suspended"
     # A status change creates no event: event is null and count stays 0.
     assert record["event"] is None
     assert record["count"] == 0
@@ -182,8 +188,9 @@ def test_same_target_status_loser_is_rollback_race(client):
     assert loser_record["phase"] == "started-rollback"
     assert loser_record["fail"] == "race"
     assert loser_record["op"] == "change"
+    assert loser_record["status"] == "rolled_back"
+    assert loser_record["machine_status"] == "suspended"
     assert loser_record["event"] is None
-    assert loser_record["status"] == "suspended"
 
 
 def test_missing_machine_event_and_change_attempts_are_rollback_other(client):
@@ -205,7 +212,7 @@ def test_missing_machine_event_and_change_attempts_are_rollback_other(client):
         rows = list(
             conn.execute(
                 text(
-                    "SELECT op, phase, fail, status, event, count "
+                    "SELECT op, phase, fail, status, machine_status, event, count "
                     "FROM write_transaction_diagnostics ORDER BY at, id"
                 )
             )
@@ -214,7 +221,8 @@ def test_missing_machine_event_and_change_attempts_are_rollback_other(client):
     for row in rows:
         assert row.phase == "started-rollback"
         assert row.fail == "other"
-        assert row.status == ""
+        assert row.status == "rolled_back"
+        assert row.machine_status == ""
         assert row.event is None
         assert row.count == 0
 
@@ -563,23 +571,25 @@ def test_same_target_concurrency_has_one_commit_and_complete_diagnostics(client)
 # --- crash recovery across a restart -----------------------------------------
 
 
-def _insert_started_marker(client, *, tid, machine_id, op, started_at, status="active"):
+def _insert_started_marker(
+    client, *, tid, machine_id, op, started_at, machine_status="active"
+):
     with client.app.state.engine.begin() as conn:
         conn.execute(
             text(
                 "INSERT INTO write_transaction_diagnostics "
-                "(id, machine_id, op, at, phase, fail, flags, status, event, "
-                " count, check_valid, check_checked_count, check_broken_event_id, "
-                " started_at) "
+                "(id, machine_id, op, at, phase, fail, flags, status, "
+                " machine_status, event, count, check_valid, "
+                " check_checked_count, check_broken_event_id, started_at) "
                 "VALUES (:id, :machine_id, :op, :started_at, 'started', 'none', "
-                " '[]', :status, NULL, 0, 1, 0, NULL, :started_at)"
+                " '[]', '', :machine_status, NULL, 0, 1, 0, NULL, :started_at)"
             ),
             {
                 "id": tid,
                 "machine_id": machine_id,
                 "op": op,
                 "started_at": started_at,
-                "status": status,
+                "machine_status": machine_status,
             },
         )
 
@@ -621,6 +631,8 @@ def test_crash_residual_event_committed_is_recovered_from_evidence(client):
     assert recovered["phase"] == "started-commit"
     assert recovered["fail"] == "none"
     assert recovered["op"] == "event"
+    assert recovered["status"] == "committed"
+    assert recovered["machine_status"] == "active"
     assert recovered["event"] == event_id
     assert recovered["count"] == 1
     assert recovered["at"].endswith("Z")
@@ -660,6 +672,7 @@ def test_crash_residual_without_effect_is_recovered_as_rollback(
     ):
         assert by_tid[tid]["phase"] == "started-rollback"
         assert by_tid[tid]["fail"] == "other"
+        assert by_tid[tid]["status"] == "rolled_back"
         assert by_tid[tid]["event"] is None
         assert by_tid[tid]["flags"] == []
 
@@ -678,7 +691,7 @@ def test_crash_residual_committed_change_is_recovered(client):
         machine_id=machine_id,
         op="change",
         started_at="2000-01-01T00:00:00Z",
-        status="suspended",
+        machine_status="suspended",
     )
 
     with TestClient(app) as restarted:
@@ -690,7 +703,8 @@ def test_crash_residual_committed_change_is_recovered(client):
     assert recovered["phase"] == "started-commit"
     assert recovered["fail"] == "none"
     assert recovered["op"] == "change"
-    assert recovered["status"] == "suspended"
+    assert recovered["status"] == "committed"
+    assert recovered["machine_status"] == "suspended"
     assert recovered["event"] is None
 
 
@@ -746,10 +760,12 @@ def test_two_residual_event_markers_share_one_committed_event(client):
     loser = by_tid["77777777-7777-7777-7777-777777777777"]
     assert claimant["phase"] == "started-commit"
     assert claimant["fail"] == "none"
+    assert claimant["status"] == "committed"
     assert claimant["event"] == event_id
     assert claimant["count"] == 1
     assert loser["phase"] == "started-rollback"
     assert loser["fail"] == "other"
+    assert loser["status"] == "rolled_back"
     assert loser["event"] is None
     # The one committed event is attributed exactly once.
     assert sum(1 for r in body["records"] if r["event"] == event_id) == 1
@@ -780,6 +796,7 @@ def test_residual_cannot_reclaim_event_already_attributed(client):
     residual = by_tid["88888888-8888-8888-8888-888888888888"]
     assert residual["phase"] == "started-rollback"
     assert residual["fail"] == "other"
+    assert residual["status"] == "rolled_back"
     assert residual["event"] is None
     assert sum(1 for r in body["records"] if r["event"] == live_event_id) == 1
 
@@ -819,3 +836,87 @@ def test_empty_database_serves_diagnostics(tmp_path, monkeypatch):
             "broken_event_id": None,
         }
         assert fresh.get("/health").json() == {"status": "ok"}
+
+
+def test_legacy_rows_are_translated_to_terminal_status_semantics(
+    tmp_path, monkeypatch
+):
+    """Databases written before the status correction stored the machine's
+    active/suspended state in ``status`` and had no ``machine_status``
+    column. Startup migrates the schema and translates those rows once:
+    the machine state moves to ``machine_status`` and ``status`` becomes
+    the committed/rolled_back transaction outcome.
+    """
+    db_url = f"sqlite:///{tmp_path / 'legacy.db'}"
+    monkeypatch.setenv("ACCOUNTABILITY_DATABASE_URL", db_url)
+
+    # Build a legacy-shape database: the diagnostics table without the
+    # machine_status column, with finalized rows carrying the machine state
+    # in ``status``.
+    from sqlalchemy import create_engine, text as sql_text
+
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "CREATE TABLE write_transaction_diagnostics ("
+                " id VARCHAR(36) PRIMARY KEY, machine_id VARCHAR(36) NOT NULL,"
+                " op VARCHAR(16) NOT NULL, at VARCHAR NOT NULL,"
+                " phase VARCHAR(32) NOT NULL, fail VARCHAR(16) NOT NULL,"
+                " flags VARCHAR NOT NULL, status VARCHAR NOT NULL,"
+                " event VARCHAR(36), count INTEGER NOT NULL,"
+                " check_valid BOOLEAN NOT NULL, check_checked_count INTEGER NOT NULL,"
+                " check_broken_event_id VARCHAR(36), started_at VARCHAR NOT NULL)"
+            )
+        )
+        conn.execute(
+            sql_text(
+                "INSERT INTO write_transaction_diagnostics "
+                "(id, machine_id, op, at, phase, fail, flags, status, event, "
+                " count, check_valid, check_checked_count, check_broken_event_id, "
+                " started_at) VALUES "
+                "('aaaaaaaa-0000-0000-0000-000000000001', 'm-1', 'event', "
+                " '2026-01-01T00:00:00Z', 'started-commit', 'none', '[]', "
+                " 'active', NULL, 1, 1, 1, NULL, '2026-01-01T00:00:00Z'),"
+                "('aaaaaaaa-0000-0000-0000-000000000002', 'm-1', 'change', "
+                " '2026-01-02T00:00:00Z', 'started-rollback', 'race', '[]', "
+                " 'suspended', NULL, 1, 1, 1, NULL, '2026-01-02T00:00:00Z')"
+            )
+        )
+    engine.dispose()
+
+    with TestClient(app) as client:
+        with client.app.state.engine.connect() as conn:
+            rows = {
+                row.id: row
+                for row in conn.execute(
+                    sql_text(
+                        "SELECT id, status, machine_status "
+                        "FROM write_transaction_diagnostics ORDER BY at, id"
+                    )
+                )
+            }
+    first = rows["aaaaaaaa-0000-0000-0000-000000000001"]
+    assert first.status == "committed"
+    assert first.machine_status == "active"
+    second = rows["aaaaaaaa-0000-0000-0000-000000000002"]
+    assert second.status == "rolled_back"
+    assert second.machine_status == "suspended"
+
+    # The migration is stable: a second startup changes nothing.
+    with TestClient(app) as again:
+        with again.app.state.engine.connect() as conn:
+            rerows = {
+                row.id: (row.status, row.machine_status)
+                for row in conn.execute(
+                    sql_text(
+                        "SELECT id, status, machine_status "
+                        "FROM write_transaction_diagnostics"
+                    )
+                )
+            }
+    assert rerows["aaaaaaaa-0000-0000-0000-000000000001"] == ("committed", "active")
+    assert rerows["aaaaaaaa-0000-0000-0000-000000000002"] == (
+        "rolled_back",
+        "suspended",
+    )

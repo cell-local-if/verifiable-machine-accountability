@@ -1898,6 +1898,183 @@ def export_authorization_decision_events(
     )
 
 
+class AccountabilityExportParams(BaseModel):
+    from_created_at: str
+    to_created_at: str
+
+
+def validate_accountability_export_params(
+    request: Request,
+) -> AccountabilityExportParams:
+    """Validate the accountability-export query string before any machine lookup.
+
+    Exactly two parameters are accepted: ``from_created_at`` and
+    ``to_created_at``, both required UTC RFC 3339 date-times ending in ``Z``
+    (fractional seconds optional; offset forms, surrounding whitespace, and
+    non-``Z`` suffixes are rejected), with ``from_created_at`` not later than
+    ``to_created_at`` (equal bounds allowed). Any other parameter name is a
+    422 ``invalid_query``; a missing, blank, malformed, or inverted bound is
+    a 422 ``bad_time``. Both checks run before the machine is looked up, so
+    an invalid query against a non-existent machine still reports 422 rather
+    than 404, and an ``invalid_query`` rejection never reads machine data.
+    """
+    allowed = {"from_created_at", "to_created_at"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    raw_from = request.query_params.get("from_created_at")
+    raw_to = request.query_params.get("to_created_at")
+
+    def _valid(value: str | None) -> bool:
+        if not value or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+            return False
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            return False
+        return True
+
+    if not _valid(raw_from) or not _valid(raw_to):
+        raise QueryError("bad_time")
+
+    if parse_utc_z_datetime(raw_from) > parse_utc_z_datetime(raw_to):
+        raise QueryError("bad_time")
+
+    return AccountabilityExportParams(
+        from_created_at=raw_from,  # type: ignore[arg-type]
+        to_created_at=raw_to,  # type: ignore[arg-type]
+    )
+
+
+class AccountabilityComplianceExportOut(BaseModel):
+    machine_id: str
+    from_created_at: str
+    to_created_at: str
+    events: list[AuthorizationDecisionEventOut]
+    causal_links: list[CausalLinkOut]
+    evidence: list[EvidenceOut]
+    incidents: list[IncidentOut]
+    status_history: list[IncidentStatusEventOut]
+    assignments: list[ResponsibilityAssignmentOut]
+
+
+@app.get(
+    "/machines/{machine_id}/accountability/compliance-export",
+    response_model=AccountabilityComplianceExportOut,
+)
+def export_accountability_compliance(
+    machine_id: str,
+    params: Annotated[
+        AccountabilityExportParams, Depends(validate_accountability_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only machine-level closed-loop compliance slice over a window.
+
+    Returns the machine's five accountability record groups — decision
+    ``events`` (with their authorization result and integrity-chain fields),
+    ``evidence`` (with the original fingerprint), ``incidents`` (with the
+    registered content and current lifecycle status), ``status_history``
+    (with the from/to status of every transition), and responsibility
+    ``assignments`` (with party, role, and chain fields) — plus the
+    ``causal_links`` whose two endpoints are both among the exported events.
+    Every record group contains exactly the machine-owned rows whose
+    ``created_at`` falls inside the inclusive bounds, ordered by the actual
+    UTC instant of ``created_at`` then ``id`` (an exact-second stamp sorts
+    before a fractional stamp of the same second); an empty group is ``[]``.
+
+    Records are exported exactly as stored: a missing, foreign, or damaged
+    referenced object, field value, fingerprint, or chain link never causes
+    a record to be rewritten, filtered out, or repaired. The endpoint only
+    issues reads: it never writes, normalizes, recomputes, or deletes the
+    machine or any accountability record, never returns another machine's
+    data, and identical data and parameters give byte-identical output.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    def in_window(created_at: str) -> bool:
+        # Compare parsed UTC instants, not ISO text: within one second an
+        # exact-second stamp ("...:00Z") sorts before a fractional stamp
+        # ("...:00.5Z") as text even though its instant is earlier.
+        return window_start <= parse_utc_z_datetime(created_at) <= window_end
+
+    machine_events = session.scalars(
+        select(AuthorizationDecisionEvent).where(
+            AuthorizationDecisionEvent.machine_id == machine_id
+        )
+    ).all()
+    events = order_by_created_at_instant(
+        [event for event in machine_events if in_window(event.created_at)]
+    )
+    event_id_set = {event.id for event in events}
+
+    if event_id_set:
+        machine_links = session.scalars(
+            select(AuthorizationDecisionCausalLink).where(
+                AuthorizationDecisionCausalLink.machine_id == machine_id,
+                AuthorizationDecisionCausalLink.cause_event_id.in_(event_id_set),
+                AuthorizationDecisionCausalLink.effect_event_id.in_(event_id_set),
+            )
+        ).all()
+    else:
+        machine_links = []
+    links = order_by_created_at_instant(machine_links)
+
+    machine_evidence = session.scalars(
+        select(AuthorizationDecisionEvidence).where(
+            AuthorizationDecisionEvidence.machine_id == machine_id
+        )
+    ).all()
+    evidence = order_by_created_at_instant(
+        [record for record in machine_evidence if in_window(record.created_at)]
+    )
+
+    machine_incidents = session.scalars(
+        select(AuthorizationDecisionIncident).where(
+            AuthorizationDecisionIncident.machine_id == machine_id
+        )
+    ).all()
+    incidents = order_by_created_at_instant(
+        [record for record in machine_incidents if in_window(record.created_at)]
+    )
+
+    machine_history = session.scalars(
+        select(IncidentStatusEvent).where(
+            IncidentStatusEvent.machine_id == machine_id
+        )
+    ).all()
+    status_history = order_by_created_at_instant(
+        [record for record in machine_history if in_window(record.created_at)]
+    )
+
+    machine_assignments = session.scalars(
+        select(IncidentResponsibilityAssignment).where(
+            IncidentResponsibilityAssignment.machine_id == machine_id
+        )
+    ).all()
+    assignments = order_by_created_at_instant(
+        [record for record in machine_assignments if in_window(record.created_at)]
+    )
+
+    return AccountabilityComplianceExportOut(
+        machine_id=machine_id,
+        from_created_at=params.from_created_at,
+        to_created_at=params.to_created_at,
+        events=[decision_event_to_out(event) for event in events],
+        causal_links=[causal_link_to_out(link) for link in links],
+        evidence=[evidence_to_out(record) for record in evidence],
+        incidents=[incident_to_out(record) for record in incidents],
+        status_history=[incident_status_event_to_out(record) for record in status_history],
+        assignments=[responsibility_assignment_to_out(record) for record in assignments],
+    )
+
+
 class CausalLinkIntegrityOut(BaseModel):
     valid: bool
     checked_count: int
@@ -2222,7 +2399,11 @@ class DiagRecordOut(BaseModel):
     op: str
     fail: str
     flags: list[str]
+    # The transaction terminal outcome: exactly "committed" or "rolled_back".
     status: str
+    # The machine's active/suspended state observed for the attempt, kept
+    # apart from the transaction outcome ("" when none was observed).
+    machine_status: str
     event: str | None
     count: int
     check: DiagCheckOut
@@ -2248,11 +2429,14 @@ def get_machine_diagnostics(
 
     Returns every finalized diagnostic in the closed UTC window, ordered by
     the actual UTC instant of ``at`` then ``tid``, plus a top-level ``check``
-    of the machine's current event hash chain. Each record carries its own
-    ``check`` snapshot in the event-integrity-audit shape. The query only
-    reads: it never writes, repairs, recomputes, or deletes a diagnostic or
-    any business record, and only the path machine's records are returned.
-    A missing machine returns ``404 not_found``.
+    of the machine's current event hash chain. Each record's ``status`` is
+    the transaction terminal outcome (``committed`` or ``rolled_back``); the
+    machine's ``active``/``suspended`` state is carried separately in
+    ``machine_status``. Each record carries its own ``check`` snapshot in the
+    event-integrity-audit shape. The query only reads: it never writes,
+    repairs, recomputes, or deletes a diagnostic or any business record, and
+    only the path machine's records are returned. A missing machine returns
+    ``404 not_found``.
     """
     machine = session.get(Machine, machine_id)
     if machine is None:
@@ -2274,6 +2458,7 @@ def get_machine_diagnostics(
                 fail=mapping["fail"],
                 flags=json.loads(mapping["flags"]),
                 status=mapping["status"],
+                machine_status=mapping["machine_status"],
                 event=mapping["event"],
                 count=mapping["count"],
                 check=DiagCheckOut(
