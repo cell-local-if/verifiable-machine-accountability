@@ -431,6 +431,49 @@ machine's events or links, produces identical output for identical data and
 parameters on repeat calls, and reads data persisted across application
 restarts.
 
+## Read-only causal-link compliance export
+
+`GET /machines/{machine_id}/authorization-decision-events/causal-links/compliance-export`
+returns a deterministic, read-only, machine-level compliance slice of causal
+links, keyed on each link's own creation time rather than on an event window.
+Both query parameters are required and validated before the machine is looked
+up, so a missing, malformed, or inverted parameter returns `422` even when the
+machine does not exist, and an invalid query never reads machine data:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); `from_created_at` must not be later than `to_created_at` (equal
+  bounds are allowed). A missing, blank, malformed, or inverted bound returns
+  `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`.
+- The path accepts `GET` only; other methods return `405`.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}`.
+
+The response is `{machine_id, from_created_at, to_created_at, causal_links}`;
+the bounds are echoed verbatim and `causal_links` is always present, an empty
+array when the window contains nothing. The array contains only links whose
+stored `machine_id` is the path machine and whose own `created_at` falls inside
+the closed interval `[from_created_at, to_created_at]` — independently of when
+either endpoint event was created and of whether the endpoint events fall in
+any event window. Each item has exactly the causal-link list endpoint fields
+`{id, machine_id, cause_event_id, effect_event_id, created_at}`, ordered by the
+actual UTC instant of `created_at` and then by id, so an exact-second link
+sorts before any fractional-second link of the same second.
+
+Links are exported exactly as stored: a cause or effect event that is missing,
+owned by another machine, duplicated, or otherwise damaged is included
+verbatim — the events table is never consulted and the link is never rewritten,
+filtered out, or repaired. Another machine's links can never enter the result.
+The endpoint issues no writes, repairs, deletions, recomputations, or
+normalizations, never creates causal links or performs cycle detection or path
+traversal, produces identical output for identical data and parameters on
+repeat calls, reads links persisted across application restarts, and needs no
+migration on an empty or old database (it adds no schema).
+
 ## Read-only evidence compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/evidence/compliance-export`

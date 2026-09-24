@@ -2019,6 +2019,77 @@ def check_causal_link_integrity(machine_id: str, session: SessionDep):
     )
 
 
+class CausalLinkComplianceExportOut(BaseModel):
+    machine_id: str
+    from_created_at: str
+    to_created_at: str
+    causal_links: list[CausalLinkOut]
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/causal-links/"
+    "compliance-export",
+    response_model=CausalLinkComplianceExportOut,
+)
+def export_causal_links_compliance(
+    machine_id: str,
+    params: Annotated[
+        ComplianceExportParams, Depends(validate_accountability_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only machine-level compliance slice of causal links over a window.
+
+    Unlike the event-window compliance export — whose ``causal_links`` require
+    both endpoint events to fall inside the exported event set — this slice is
+    keyed on each link's own ``created_at``: it includes every causal link
+    whose stored ``machine_id`` is the path machine and whose own
+    ``created_at`` falls within the closed interval
+    ``[from_created_at, to_created_at]``, independently of when either
+    endpoint event was created. Each item has exactly the fields of the
+    causal-link list endpoint (``id``, ``machine_id``, ``cause_event_id``,
+    ``effect_event_id``, ``created_at``), emitted exactly as stored: a cause or
+    effect event that is missing, owned by another machine, duplicated, or
+    otherwise damaged never causes a link to be rewritten, filtered out, or
+    repaired, and the events table is not consulted at all. Links are ordered
+    by the actual UTC instant of ``created_at`` and then by id, so an
+    exact-second link sorts before any fractional-second link of the same
+    second, and the array is present (and empty) even when the window contains
+    nothing. The query only issues reads — it never creates, updates, deletes,
+    repairs, recomputes, or normalizes a link or any other record — never
+    returns another machine's links, produces identical output for identical
+    data and parameters on repeat calls, and reads links persisted across
+    application restarts. An empty or old database needs no migration: the
+    endpoint adds no schema.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    # Membership is decided by the link's own machine_id and created_at only;
+    # the endpoint events are never looked up, so dangling or misowned
+    # endpoints export verbatim. Ordering parses stamps to UTC instants
+    # because an exact-second ISO stamp sorts before a fractional stamp of the
+    # same second only after parsing (lexicographically '.' precedes 'Z').
+    records = _machine_rows_in_window(
+        session,
+        AuthorizationDecisionCausalLink,
+        machine_id,
+        window_start,
+        window_end,
+    )
+
+    return CausalLinkComplianceExportOut(
+        machine_id=machine_id,
+        from_created_at=params.from_created_at,
+        to_created_at=params.to_created_at,
+        causal_links=[causal_link_to_out(record) for record in records],
+    )
+
+
 _INTEGER_QUERY_RE = re.compile(r"-?\d+")
 
 
