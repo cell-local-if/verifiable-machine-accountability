@@ -471,38 +471,21 @@ class AuthorizationEvaluationOut(BaseModel):
     reason: str
 
 
-def pattern_matches(pattern: str, value: str) -> bool:
-    regex = ".*".join(re.escape(part) for part in pattern.split("*"))
-    return re.fullmatch(regex, value, re.DOTALL) is not None
-
-
 def compute_authorization_decision(
     session: Session, machine_id: str, action_type: str, resource: str
 ) -> AuthorizationEvaluationOut:
-    declarations = session.scalars(
-        select(BehaviorDeclaration).where(
-            BehaviorDeclaration.machine_id == machine_id,
-            BehaviorDeclaration.action_type == action_type,
-            BehaviorDeclaration.enabled.is_(True),
-        )
-    ).all()
-    if not any(pattern_matches(d.resource_pattern, resource) for d in declarations):
-        return AuthorizationEvaluationOut(
-            allowed=False, reason="no_enabled_declaration"
-        )
-
-    rules = session.scalars(
-        select(PolicyRule).where(PolicyRule.action_type == action_type)
-    ).all()
-    matching = [r for r in rules if pattern_matches(r.resource_pattern, resource)]
-    if not matching:
-        return AuthorizationEvaluationOut(allowed=False, reason="no_matching_policy")
-
-    lowest = min(r.priority for r in matching)
-    decisive = [r for r in matching if r.priority == lowest]
-    if any(r.effect == "deny" for r in decisive):
-        return AuthorizationEvaluationOut(allowed=False, reason="denied_by_policy")
-    return AuthorizationEvaluationOut(allowed=True, reason="allowed_by_policy")
+    # Use the ORM session's current connection so the read joins its
+    # transaction; the actual decision logic is shared with the atomic
+    # decision-event writer and can never drift from it.
+    machine = session.get(Machine, machine_id)
+    allowed, reason = chain.decide_authorization(
+        session.connection(),
+        machine_id,
+        machine.status,
+        action_type,
+        resource,
+    )
+    return AuthorizationEvaluationOut(allowed=allowed, reason=reason)
 
 
 @app.post(
@@ -565,39 +548,32 @@ def decision_event_to_out(event: AuthorizationDecisionEvent) -> AuthorizationDec
 def create_authorization_decision_event(
     machine_id: str, body: AuthorizationEvaluationCreate, session: SessionDep
 ):
-    machine = session.get(Machine, machine_id)
-    if machine is None:
-        return error_response(404, "not_found")
+    """Decide one authorization request and persist its event as one write.
 
-    # A suspended machine is denied without reading its declarations or any
-    # policy rule. The decision is still recorded below under the same
-    # persistence and hash-chain rules as every other decision, so the
-    # suspension leaves a complete audit trail.
-    if machine.status == "suspended":
-        decision = AuthorizationEvaluationOut(
-            allowed=False, reason="machine_suspended"
-        )
-    else:
-        decision = compute_authorization_decision(
-            session, machine_id, body.action_type, body.resource
-        )
+    The machine lookup, the suspended-status check, the declaration/policy
+    decision, the hash-chain tail read, and the event insert commit in a single
+    locked write transaction. The same lock serializes machine status changes, so
+    a concurrent status change and decision event have one definite serial
+    order: a status change committed first forces the event decision to use the
+    new status, while an event committed first keeps the pre-change result and
+    no later status change can rewrite it. A missing machine is 404
+    ``not_found``; the event is still appended under the usual persistence and
+    hash-chain rules, including the machine_suspended denial.
+    """
     engine = session.get_bind()
-    # Commit and return the read connection before opening the locked write
-    # transaction, so concurrent writers never hold two pool connections at
-    # once. The decision is fully materialized above.
-    session.commit()
+    # Release the read connection before opening the locked write transaction,
+    # matching the other chain appenders: concurrent writers never hold two pool
+    # connections at once.
     session.close()
-    # Read tail, mint the new link, and insert in one write transaction so
-    # concurrent appenders cannot lose events or fork the per-machine chain.
-    result = chain.append_event(
+    result = chain.append_decision_event(
         engine,
         machine_id=machine_id,
         action_type=body.action_type,
         resource=body.resource,
-        allowed=decision.allowed,
-        reason=decision.reason,
     )
-    return AuthorizationDecisionEventOut(**result)
+    if result["status"] == "not_found":
+        return error_response(404, "not_found")
+    return AuthorizationDecisionEventOut(**result["event"])
 
 
 @app.get(

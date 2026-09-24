@@ -69,6 +69,19 @@ persist one event under the usual rules, linked into the machine's event hash
 chain. After reactivation the normal declaration/policy evaluation resumes;
 events recorded earlier (including while suspended) keep their stored result.
 
+A decision-event request is one indivisible authorization write: the machine
+lookup, suspended-status check, declaration/policy decision, event-chain tail
+read, and event insert commit together in a single locked write transaction —
+the same lock that serializes status changes. Consequently a status change and
+a decision event arriving concurrently have exactly one definite serial order
+and never a torn result. When the status change commits first, the event is
+decided against the new status (a suspension forces
+`allowed=false, reason="machine_suspended"`); when the event commits first, it
+keeps the pre-change authorization result and no later status change ever
+recomputes, rewrites, or reinterprets it. The two writers cannot lose an event,
+fork the chain, leave a broken link, or persist half-completed state or event
+records.
+
 ## Key rotation integrity chain
 
 Each machine's key rotation history forms its own per-machine, tamper-evident
