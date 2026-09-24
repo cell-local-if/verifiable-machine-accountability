@@ -596,6 +596,65 @@ reads records persisted across application restarts. `GET /health`, machine
 start/stop, authorization evaluation, the event chain, the existing exports,
 and the diagnostics error semantics are unchanged.
 
+## Read-only privacy-preserving responsibility export
+
+`GET /machines/{machine_id}/privacy-responsibility/compliance-export` returns a
+deterministic, read-only, machine-level compliance slice of one machine's
+responsibility assignments with the responsible party and role text removed.
+Only `GET` is accepted (other methods return `405`) and the caller supplies
+only the path machine id plus the two window bounds. Query validation runs
+before the machine is looked up and issues no machine-data access:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); `from_created_at` must not be later than `to_created_at` (equal
+  bounds are allowed). A missing, blank, malformed, or inverted bound returns
+  `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}` without reading machine data.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}` with no responsibility data.
+
+The response is `{machine_id, from_created_at, to_created_at,
+responsibility_assignments}`; the bounds are echoed verbatim and
+`responsibility_assignments` is always present, an empty array when the window
+contains nothing. The array contains only assignments whose stored
+`machine_id` is the path machine and whose own `created_at` falls inside the
+closed interval `[from_created_at, to_created_at]`, ordered by the actual UTC
+instant of `created_at` and then by id (an exact-second record sorts before
+any fractional-second record of the same second).
+
+Each item has the responsibility-assignment list-endpoint fields except that
+the `party` and `role` positions are replaced by `party_ref` and `role_ref`;
+the raw party and role text never appears in a response. The remaining fields
+— `id`, `machine_id`, `event_id`, `incident_id`, `created_at`, and the three
+chain fields `previous_assignment_id`, `content_hash`, `chain_hash` — are
+emitted exactly as stored. The refs are 64-character lowercase-hex SHA-256
+digests over UTF-8:
+
+- `party_ref` = `SHA-256("privacy:v1|party|" + machine_id + "|" + party)`
+- `role_ref` = `SHA-256("privacy:v1|role|" + machine_id + "|" + role)`
+
+where the stored value has surrounding whitespace removed before joining
+(interior whitespace is preserved). When a stored value is not a string or is
+empty after trimming, the corresponding ref is `null` and the record is still
+included. The versioned, machine-bound preimage separates parties from roles
+and across machines even when the underlying text is identical. No public
+keys, secrets, policy text, or identity material is returned.
+
+Records are exported exactly as stored: a damaged, missing, foreign-owned, or
+duplicated event/incident reference or chain value is never filtered out,
+repaired, recomputed, or rewritten, and another machine's assignments can
+never enter the result. The endpoint issues no writes, produces byte-identical
+output for identical data and parameters on repeat calls, reads records
+persisted across application restarts, and adds no schema, so an empty or old
+database needs no migration. Existing machine, event, evidence, incident,
+status-history, and responsibility-assignment creation/query semantics, the
+event hash chain, diagnostics terminal states, the integrity summary, and the
+existing compliance exports are unchanged.
+
 ## Read-only machine-level integrity summary
 
 `GET /machines/{machine_id}/integrity-summary` returns a deterministic,
