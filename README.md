@@ -595,3 +595,46 @@ byte-identical output for identical data and parameters on repeat calls, and
 reads records persisted across application restarts. `GET /health`, machine
 start/stop, authorization evaluation, the event chain, the existing exports,
 and the diagnostics error semantics are unchanged.
+
+## Read-only machine-level integrity summary
+
+`GET /machines/{machine_id}/integrity-summary` returns a deterministic,
+read-only aggregate of the four existing machine-level integrity audits in one
+response. The caller submits only the path machine id; the endpoint accepts no
+query parameters, and any extra parameter returns
+`422 {"error":{"code":"invalid_query"}}` before the machine is looked up, so an
+invalid query against a non-existent machine is still `422`. After validation,
+a missing machine returns `404 {"error":{"code":"not_found"}}` with no summary
+data. The path accepts `GET` only; other methods return `405`.
+
+The response is `{machine_id, valid, events, rotations, evidence, incidents}`:
+
+- `valid` — `true` only when all four blocks pass; the first anomaly found by
+  any block makes it `false`;
+- `events` — the authorization decision event chain audit in the existing
+  `{valid, checked_count, broken_event_id}` shape (content hash, previous-event
+  link, chain hash);
+- `rotations` — the key rotation chain audit in the existing
+  `{valid, checked_count, broken_rotation_id}` shape (raw rotation fields,
+  previous-rotation link, chain hash);
+- `evidence` — the evidence audit in the existing
+  `{valid, checked_count, broken_evidence_id}` shape (event ownership, evidence
+  type, exact lowercase-hex fingerprint, compared as stored with no case
+  folding);
+- `incidents` — the incident lifecycle and responsibility-closure audit in the
+  existing `{valid, checked_count, broken_incident_id}` shape (event ownership,
+  status history, responsibility closure), keeping the first incident id found.
+
+Each block runs its existing audit in that audit's stable
+`(created_at, id)` order and counts only records stored under the path machine
+name, so damaged records owned by another machine never affect the result. A
+machine with no records still returns the complete response: all four blocks
+report `checked_count` `0`, `valid` `true`, and a `null` broken id. The summary
+exposes only the existing integrity conclusions and audit ids — no privacy
+fields, policy text, or key content. The query is strictly read-only: it never
+creates, updates, deletes, repairs, recomputes, or normalizes a machine or any
+accountability record, produces identical results on repeat calls against
+unchanged data, and reads data persisted across application restarts. It adds
+no schema. `GET /health`, machine start/stop, authorization evaluation, the
+event chain, incident handling, and the existing compliance exports are
+unchanged.
