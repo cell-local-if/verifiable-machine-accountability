@@ -1,4 +1,5 @@
 import os
+import hashlib
 import json
 import re
 import uuid
@@ -1474,6 +1475,130 @@ def export_responsibility_assignments_compliance(
         from_created_at=params.from_created_at,
         to_created_at=params.to_created_at,
         assignments=[responsibility_assignment_to_out(record) for record in records],
+    )
+
+
+# --- read-only desensitized privacy responsibility compliance export --------
+
+
+def privacy_reference_digest(kind: str, machine_id: str, raw: object) -> str | None:
+    """Desensitizing digest for one responsibility chain field.
+
+    The three segments ``privacy:v1|<kind>``, the path machine id, and the
+    stored value with surrounding whitespace removed are joined directly (no
+    separator beyond the one inside the prefix) and hashed as UTF-8 with
+    SHA-256, yielding 64 lowercase hexadecimal characters. ``kind`` is
+    ``party`` or ``role``. When the stored value is not a string or is empty
+    after stripping surrounding whitespace, the digest is ``null`` so the raw
+    value is never emitted.
+    """
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    message = f"privacy:v1|{kind}{machine_id}{value}"
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+
+class PrivacyResponsibilityAssignmentOut(BaseModel):
+    id: str
+    machine_id: str
+    event_id: str
+    incident_id: str
+    created_at: str
+    previous_assignment_id: str | None
+    content_hash: str
+    chain_hash: str
+    party_ref: str | None
+    role_ref: str | None
+
+
+def privacy_responsibility_assignment_to_out(
+    record: IncidentResponsibilityAssignment,
+) -> PrivacyResponsibilityAssignmentOut:
+    # The raw party/role never leave the service: only their desensitizing
+    # digests are emitted. Every other field is emitted exactly as stored.
+    return PrivacyResponsibilityAssignmentOut(
+        id=record.id,
+        machine_id=record.machine_id,
+        event_id=record.event_id,
+        incident_id=record.incident_id,
+        created_at=record.created_at,
+        previous_assignment_id=record.previous_assignment_id,
+        content_hash=record.content_hash,
+        chain_hash=record.chain_hash,
+        party_ref=privacy_reference_digest("party", record.machine_id, record.party),
+        role_ref=privacy_reference_digest("role", record.machine_id, record.role),
+    )
+
+
+class PrivacyResponsibilityComplianceExportOut(BaseModel):
+    machine_id: str
+    from_created_at: str
+    to_created_at: str
+    responsibility_assignments: list[PrivacyResponsibilityAssignmentOut]
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/privacy-responsibility/"
+    "compliance-export",
+    response_model=PrivacyResponsibilityComplianceExportOut,
+)
+def export_privacy_responsibility_compliance(
+    machine_id: str,
+    params: Annotated[
+        ComplianceExportParams, Depends(validate_accountability_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only desensitized privacy view of one machine's responsibility
+    assignments over a closed time window.
+
+    Includes every responsibility assignment owned by the path machine whose
+    own ``created_at`` falls within the inclusive bounds, ordered by the actual
+    UTC instant of ``created_at`` and then by id, so an exact-second record
+    sorts before any fractional-second record of the same second. The raw
+    ``party`` and ``role`` values are never returned; their positions carry
+    ``party_ref`` and ``role_ref`` instead: ``SHA-256(UTF-8("privacy:v1|party"
+    + machine_id + trimmed party))`` and the same with the ``role`` prefix. A
+    value that is not a string or is blank after trimming yields ``null``
+    while the record is still included. Every other field — id, machine/event/
+    incident ids, created_at, and the responsibility chain fields — is emitted
+    exactly as stored: a missing, misowned, duplicated, or chain-damaged
+    related object never causes a record to be rewritten, filtered out, or
+    repaired, and another machine's assignments can never enter the result.
+    The query only issues reads, produces byte-identical output for identical
+    data and parameters on repeat calls, and reads assignments persisted
+    across application restarts; an empty or old database needs no migration.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    # Membership is decided by the record's own machine_id and created_at only;
+    # the referenced event/incident are never looked up, so dangling or
+    # misowned references export verbatim. Ordering parses stamps to UTC
+    # instants because an exact-second stamp sorts before a fractional stamp
+    # of the same second only after parsing (lexicographically '.' < 'Z').
+    records = _machine_rows_in_window(
+        session,
+        IncidentResponsibilityAssignment,
+        machine_id,
+        window_start,
+        window_end,
+    )
+
+    return PrivacyResponsibilityComplianceExportOut(
+        machine_id=machine_id,
+        from_created_at=params.from_created_at,
+        to_created_at=params.to_created_at,
+        responsibility_assignments=[
+            privacy_responsibility_assignment_to_out(record) for record in records
+        ],
     )
 
 
