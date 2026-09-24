@@ -28,12 +28,16 @@ hash chain. Every event returned by the create and list endpoints carries:
 - `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first event
   and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))` thereafter.
 
-All hashes are 64-character lowercase hexadecimal strings. New events are
-appended to the chain tail inside a single write transaction, so concurrent
-writes cannot lose events, fork, or break the chain. On startup the service
-adds the new columns to pre-existing databases and backfills missing chain
-data in `(created_at, id)` order; the recomputation is deterministic, so
-restarting with an already complete database performs no writes.
+All hashes are 64-character lowercase hexadecimal strings. For a decision-event
+request, the machine/status lookup, the suspended-or-declaration/policy
+decision, and the chain-tail append all run inside one locked write
+transaction — the same lock the machine status-change endpoint takes — so
+concurrent writes cannot lose events, fork, or break the chain, and a status
+change and an event append always have one definite serial order. On startup
+the service adds the new columns to pre-existing databases and backfills
+missing chain data in `(created_at, id)` order; the recomputation is
+deterministic, so restarting with an already complete database performs no
+writes.
 
 `GET /machines/{machine_id}/authorization-decision-events/integrity` verifies
 the chain read-only and returns `{valid, checked_count, broken_event_id}`:
@@ -68,6 +72,27 @@ behavior declarations or the policy rules. Decision-event requests still
 persist one event under the usual rules, linked into the machine's event hash
 chain. After reactivation the normal declaration/policy evaluation resumes;
 events recorded earlier (including while suspended) keep their stored result.
+
+The status determination, declaration/policy computation, and event append
+for a decision-event request are one indivisible authorization write,
+serialized against status changes by the same locked transaction, so two
+concurrent requests (one status change and one event append) have a single
+definite serial order and at most one can "win" a given target transition:
+
+- when the status change commits first, the later event reads the new status
+  and uses its result — after a suspension the event is `machine_suspended`,
+  never a result computed from the pre-change `active` state;
+- when the event append commits first, it keeps the pre-change authorization
+  result and the later status change never rewrites, recomputes, or
+  reinterprets the committed event; once a status update completes, later
+  event requests can no longer write a result based on the old `active`
+  state.
+
+Concurrent execution never loses events, forks or breaks the hash chain, or
+leaves a half-finished status or event record: the lookup, decision, and
+append either commit together or leave no trace. Body validation (`422`) and
+the missing-machine/path-resource (`404 not_found`) outcomes are unchanged by
+this serialization and never flip error types under a status race.
 
 ## Key rotation integrity chain
 

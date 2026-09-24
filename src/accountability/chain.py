@@ -12,7 +12,11 @@ Each machine's events form an ordered chain (ordered by ``created_at`` then
 
 New events are appended to the chain tail inside a single write transaction
 that reads the tail and inserts the row, so concurrent appenders cannot lose
-events, fork the chain, or break a link.
+events, fork the chain, or break a link. A decision-event append goes further
+(:func:`append_decision_event`): the machine lookup, the authorization
+decision, and the append share one locked transaction, the same lock status
+changes take, so a status change and an event append have a single definite
+serial order.
 """
 
 import hashlib
@@ -229,8 +233,29 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def append_event(
-    engine: Engine,
+def _backfill_machine_rows(conn: Connection, machine_id: str) -> list[Any]:
+    """Repair a machine's missing chain data, then reload and return its rows.
+
+    Normally the startup backfill leaves every row complete. If any row is
+    missing chain data (e.g. an external writer), rebuild the whole machine
+    chain before appending so the new link has a sound tail.
+    """
+    rows = _load_events(conn, machine_id)
+    if any(
+        row._mapping["content_hash"] is None or row._mapping["chain_hash"] is None
+        for row in rows
+    ):
+        for values in _recompute_rows(rows):
+            event_id = values.pop("id")
+            conn.execute(
+                _TABLE.update().where(_TABLE.c.id == event_id).values(**values)
+            )
+        rows = _load_events(conn, machine_id)
+    return rows
+
+
+def _mint_tail_link(
+    conn: Connection,
     *,
     machine_id: str,
     action_type: str,
@@ -238,53 +263,47 @@ def append_event(
     allowed: bool,
     reason: str,
 ) -> dict[str, Any]:
-    """Atomically append one event to its machine's chain tail.
+    """Read the machine's chain tail and insert one linked event.
 
-    The event id and timestamp are minted inside the write lock and are
-    guaranteed to sort after the current tail in (created_at, id) order, so
-    the previous-event link always matches the order used by backfill and
-    verification even under same-timestamp concurrency.
+    Must run inside the locked write transaction. The event id and timestamp
+    are minted here and are guaranteed to sort after the current tail in
+    ``(created_at, id)`` order, so the previous-event link always matches the
+    order used by backfill and verification even under same-timestamp
+    concurrency.
     """
+    rows = _backfill_machine_rows(conn, machine_id)
+    tail = rows[-1] if rows else None
 
-    def _work(conn: Connection) -> dict[str, Any]:
-        rows = _load_events(conn, machine_id)
+    # Regenerate (rarely) until the new key sorts strictly after the tail.
+    created_at = _utc_now_iso()
+    event_id = str(uuid.uuid4())
+    if tail is not None:
+        tail_created_at = tail._mapping["created_at"]
+        tail_id = tail._mapping["id"]
+        if created_at < tail_created_at:
+            created_at = tail_created_at
+        while created_at == tail_created_at and event_id <= tail_id:
+            event_id = str(uuid.uuid4())
 
-        # Normally the startup backfill leaves every row complete. If any row
-        # is missing chain data (e.g. an external writer), rebuild the whole
-        # machine chain before appending so the new link has a sound tail.
-        if any(
-            row._mapping["content_hash"] is None
-            or row._mapping["chain_hash"] is None
-            for row in rows
-        ):
-            for values in _recompute_rows(rows):
-                event_id = values.pop("id")
-                conn.execute(
-                    _TABLE.update().where(_TABLE.c.id == event_id).values(**values)
-                )
-            rows = _load_events(conn, machine_id)
+    if tail is None:
+        previous_event_id = None
+        previous_chain_hash = ""
+    else:
+        previous_event_id = tail._mapping["id"]
+        previous_chain_hash = tail._mapping["chain_hash"]
 
-        tail = rows[-1] if rows else None
-
-        # Regenerate (rarely) until the new key sorts strictly after the tail.
-        created_at = _utc_now_iso()
-        event_id = str(uuid.uuid4())
-        if tail is not None:
-            tail_created_at = tail._mapping["created_at"]
-            tail_id = tail._mapping["id"]
-            if created_at < tail_created_at:
-                created_at = tail_created_at
-            while created_at == tail_created_at and event_id <= tail_id:
-                event_id = str(uuid.uuid4())
-
-        if tail is None:
-            previous_event_id = None
-            previous_chain_hash = ""
-        else:
-            previous_event_id = tail._mapping["id"]
-            previous_chain_hash = tail._mapping["chain_hash"]
-
-        content_hash = compute_content_hash(
+    content_hash = compute_content_hash(
+        id=event_id,
+        machine_id=machine_id,
+        action_type=action_type,
+        resource=resource,
+        allowed=allowed,
+        reason=reason,
+        created_at=created_at,
+    )
+    chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+    conn.execute(
+        _TABLE.insert().values(
             id=event_id,
             machine_id=machine_id,
             action_type=action_type,
@@ -292,34 +311,72 @@ def append_event(
             allowed=allowed,
             reason=reason,
             created_at=created_at,
+            previous_event_id=previous_event_id,
+            content_hash=content_hash,
+            chain_hash=chain_hash,
         )
-        chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
-        conn.execute(
-            _TABLE.insert().values(
-                id=event_id,
-                machine_id=machine_id,
-                action_type=action_type,
-                resource=resource,
-                allowed=allowed,
-                reason=reason,
-                created_at=created_at,
-                previous_event_id=previous_event_id,
-                content_hash=content_hash,
-                chain_hash=chain_hash,
-            )
+    )
+    return {
+        "id": event_id,
+        "machine_id": machine_id,
+        "action_type": action_type,
+        "resource": resource,
+        "allowed": allowed,
+        "reason": reason,
+        "created_at": created_at,
+        "previous_event_id": previous_event_id,
+        "content_hash": content_hash,
+        "chain_hash": chain_hash,
+    }
+
+
+def append_decision_event(
+    engine: Engine,
+    *,
+    machine_id: str,
+    action_type: str,
+    resource: str,
+) -> dict[str, Any]:
+    """Determine one authorization decision and append its event atomically.
+
+    The machine lookup and status read, the declaration/policy evaluation,
+    and the chain-tail append all happen inside a single locked write
+    transaction. The lock is the same one status changes take
+    (``change_machine_status`` runs its read/check/update in an identical
+    locked transaction), so a status change and an event append have a single
+    definite serial order and can never interleave:
+
+    * status change first — this transaction reads the new status, so a
+      suspension denies the event with ``machine_suspended`` instead of
+      persisting a result computed from the old active state;
+    * event append first — the event commits its pre-change result and the
+      later status change never rewrites it.
+
+    Returns ``{"status": "not_found"}`` when the machine is missing (nothing
+    is written), otherwise ``{"status": "ok", "event": {...}}``.
+    """
+    from . import authorization
+
+    def _work(conn: Connection) -> dict[str, Any]:
+        status = authorization.machine_status(conn, machine_id)
+        if status is None:
+            return {"status": "not_found"}
+        allowed, reason = authorization.decide(
+            conn,
+            machine_id,
+            status,
+            action_type,
+            resource,
         )
-        return {
-            "id": event_id,
-            "machine_id": machine_id,
-            "action_type": action_type,
-            "resource": resource,
-            "allowed": allowed,
-            "reason": reason,
-            "created_at": created_at,
-            "previous_event_id": previous_event_id,
-            "content_hash": content_hash,
-            "chain_hash": chain_hash,
-        }
+        event = _mint_tail_link(
+            conn,
+            machine_id=machine_id,
+            action_type=action_type,
+            resource=resource,
+            allowed=allowed,
+            reason=reason,
+        )
+        return {"status": "ok", "event": event}
 
     return _run_with_lock_retry(engine, _work)
 

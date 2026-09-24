@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import assignment_chain, chain, incidents, machines, rotation_chain
+from . import assignment_chain, authorization, chain, incidents, machines, rotation_chain
 from .db import (
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
@@ -471,40 +471,6 @@ class AuthorizationEvaluationOut(BaseModel):
     reason: str
 
 
-def pattern_matches(pattern: str, value: str) -> bool:
-    regex = ".*".join(re.escape(part) for part in pattern.split("*"))
-    return re.fullmatch(regex, value, re.DOTALL) is not None
-
-
-def compute_authorization_decision(
-    session: Session, machine_id: str, action_type: str, resource: str
-) -> AuthorizationEvaluationOut:
-    declarations = session.scalars(
-        select(BehaviorDeclaration).where(
-            BehaviorDeclaration.machine_id == machine_id,
-            BehaviorDeclaration.action_type == action_type,
-            BehaviorDeclaration.enabled.is_(True),
-        )
-    ).all()
-    if not any(pattern_matches(d.resource_pattern, resource) for d in declarations):
-        return AuthorizationEvaluationOut(
-            allowed=False, reason="no_enabled_declaration"
-        )
-
-    rules = session.scalars(
-        select(PolicyRule).where(PolicyRule.action_type == action_type)
-    ).all()
-    matching = [r for r in rules if pattern_matches(r.resource_pattern, resource)]
-    if not matching:
-        return AuthorizationEvaluationOut(allowed=False, reason="no_matching_policy")
-
-    lowest = min(r.priority for r in matching)
-    decisive = [r for r in matching if r.priority == lowest]
-    if any(r.effect == "deny" for r in decisive):
-        return AuthorizationEvaluationOut(allowed=False, reason="denied_by_policy")
-    return AuthorizationEvaluationOut(allowed=True, reason="allowed_by_policy")
-
-
 @app.post(
     "/machines/{machine_id}/authorization-evaluations",
     response_model=AuthorizationEvaluationOut,
@@ -519,14 +485,14 @@ def evaluate_authorization(
     # A suspended machine is denied before any declaration or policy lookup,
     # so its stored behavior declarations and policy rules can never produce
     # an allow (or any other reason) while suspended.
-    if machine.status == "suspended":
-        return AuthorizationEvaluationOut(
-            allowed=False, reason="machine_suspended"
-        )
-
-    return compute_authorization_decision(
-        session, machine_id, body.action_type, body.resource
+    allowed, reason = authorization.decide(
+        session,
+        machine_id,
+        machine.status,
+        body.action_type,
+        body.resource,
     )
+    return AuthorizationEvaluationOut(allowed=allowed, reason=reason)
 
 
 class AuthorizationDecisionEventOut(BaseModel):
@@ -565,39 +531,29 @@ def decision_event_to_out(event: AuthorizationDecisionEvent) -> AuthorizationDec
 def create_authorization_decision_event(
     machine_id: str, body: AuthorizationEvaluationCreate, session: SessionDep
 ):
-    machine = session.get(Machine, machine_id)
-    if machine is None:
-        return error_response(404, "not_found")
-
-    # A suspended machine is denied without reading its declarations or any
-    # policy rule. The decision is still recorded below under the same
-    # persistence and hash-chain rules as every other decision, so the
-    # suspension leaves a complete audit trail.
-    if machine.status == "suspended":
-        decision = AuthorizationEvaluationOut(
-            allowed=False, reason="machine_suspended"
-        )
-    else:
-        decision = compute_authorization_decision(
-            session, machine_id, body.action_type, body.resource
-        )
     engine = session.get_bind()
-    # Commit and return the read connection before opening the locked write
-    # transaction, so concurrent writers never hold two pool connections at
-    # once. The decision is fully materialized above.
-    session.commit()
+    # Release the read connection before opening the locked write transaction,
+    # matching the other writers: concurrent requests never hold two pool
+    # connections at once. Body validation (422) has already run before this
+    # handler, so the only lookup failure below is a missing machine.
     session.close()
-    # Read tail, mint the new link, and insert in one write transaction so
-    # concurrent appenders cannot lose events or fork the per-machine chain.
-    result = chain.append_event(
+    # The machine/status lookup, the suspended/declaration/policy decision,
+    # and the chain-tail append run in one locked write transaction, the same
+    # lock the status-change endpoint takes. A status change and this append
+    # therefore commit in one definite serial order: when the status change
+    # commits first the event is decided against the new status (a suspension
+    # yields machine_suspended, never a stale active-era result), and when the
+    # append commits first the later status change never rewrites the stored
+    # event. No event can be lost, forked, or half-written.
+    result = chain.append_decision_event(
         engine,
         machine_id=machine_id,
         action_type=body.action_type,
         resource=body.resource,
-        allowed=decision.allowed,
-        reason=decision.reason,
     )
-    return AuthorizationDecisionEventOut(**result)
+    if result["status"] == "not_found":
+        return error_response(404, "not_found")
+    return AuthorizationDecisionEventOut(**result["event"])
 
 
 @app.get(
