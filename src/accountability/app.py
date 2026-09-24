@@ -19,6 +19,8 @@ from pydantic import (
     StrictBool,
     StrictInt,
     StringConstraints,
+    field_validator,
+    model_validator,
 )
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
@@ -45,6 +47,7 @@ from .db import (
     KeyRotationEvent,
     Machine,
     PolicyRule,
+    PrivacyAccess,
 )
 
 DEFAULT_DATABASE_URL = "sqlite:///./accountability.db"
@@ -2777,4 +2780,248 @@ def get_machine_integrity_summary(
         rotations=rotations_block,
         evidence=evidence_block,
         incidents=incidents_block,
+    )
+
+
+# --- machine-level privacy access registration and read-only query ---------
+
+
+class PrivacyAccessCreate(BaseModel):
+    """Registration body for one machine-level privacy data access.
+
+    The body must be an object carrying these fields; any other field
+    (including any responsible-party raw text, which the entry point never
+    accepts) is ignored and never stored or echoed, matching the other create
+    bodies. Pydantic validation runs before the handler, so a missing field,
+    a non-object body, a malformed timestamp, a non-UTC timestamp, an unknown
+    result, or a non-integer/negative hit count is a 422 before the machine
+    is ever looked up.
+    """
+
+    accessed_at: str
+    window_start: str
+    window_end: str
+    result: Literal["success", "failed"]
+    # StrictInt: booleans and numeric-looking strings are rejected like the
+    # policy-rule priority field, and ge=0 rejects negative counts.
+    hit_count: Annotated[StrictInt, Field(ge=0)]
+
+    @field_validator("accessed_at", "window_start", "window_end")
+    @classmethod
+    def _validate_utc_z_datetime(cls, value: object) -> str:
+        # Only the same UTC ``Z`` form accepted by the compliance-export
+        # query parameters is legal: offsets, surrounding whitespace, missing
+        # suffixes, and out-of-range calendar/time values are all 422.
+        if not isinstance(value, str) or not _RFC3339_Z_DATETIME_RE.fullmatch(
+            value
+        ):
+            raise ValueError(
+                "Input should be an RFC 3339 date-time in UTC ending with 'Z'"
+            )
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            raise ValueError(
+                "Input should be an RFC 3339 date-time in UTC ending with 'Z'"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_window_and_failed_hits(self) -> "PrivacyAccessCreate":
+        # Equal bounds are legal; an inverted window is a 422. A failed access
+        # always records zero hits, so a nonzero count with ``failed`` is an
+        # illegal hit count (422) rather than silently normalized.
+        if parse_utc_z_datetime(self.window_start) > parse_utc_z_datetime(
+            self.window_end
+        ):
+            raise ValueError("window_start must not be later than window_end")
+        if self.result == "failed" and self.hit_count != 0:
+            raise ValueError("hit_count must be 0 when result is failed")
+        return self
+
+
+class PrivacyAccessOut(BaseModel):
+    id: str
+    machine_id: str
+    accessed_at: str
+    window_start: str
+    window_end: str
+    result: str
+    hit_count: int
+
+
+def privacy_access_to_out(record: PrivacyAccess) -> PrivacyAccessOut:
+    # Only the access metadata is emitted: no responsible party or key/secret
+    # material is ever stored or returned by this feature.
+    return PrivacyAccessOut(
+        id=record.id,
+        machine_id=record.machine_id,
+        accessed_at=record.accessed_at,
+        window_start=record.window_start,
+        window_end=record.window_end,
+        result=record.result,
+        hit_count=record.hit_count,
+    )
+
+
+@app.post(
+    "/machines/{machine_id}/privacy-accesses",
+    status_code=201,
+    response_model=PrivacyAccessOut,
+)
+def register_privacy_access(
+    machine_id: str, body: PrivacyAccessCreate, session: SessionDep
+):
+    """Register one machine-level privacy data access.
+
+    The body submits the access time, the desensitized export window, the
+    access result (``success``/``failed``), and the hit count; responsible-
+    party raw text is never accepted. Body validation (422) runs before the
+    machine lookup, so a malformed payload against a non-existent machine is
+    still 422 and leaves no record. A missing machine then returns 404
+    ``not_found``. Success returns 201 with the stored record; re-registering
+    the same access time, window, and result for the same machine returns 409
+    ``duplicate_access`` and writes nothing. A failed access still leaves a
+    record with ``hit_count`` zero. Registrations persist across restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    record = PrivacyAccess(
+        id=str(uuid.uuid4()),
+        machine_id=machine_id,
+        accessed_at=body.accessed_at,
+        window_start=body.window_start,
+        window_end=body.window_end,
+        result=body.result,
+        hit_count=body.hit_count,
+    )
+    session.add(record)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        # The machine can disappear between the lookup and the failed insert;
+        # report that as not_found rather than a duplicate.
+        if session.get(Machine, machine_id) is None:
+            return error_response(404, "not_found")
+        return error_response(409, "duplicate_access")
+    return privacy_access_to_out(record)
+
+
+class PrivacyAccessExportParams(BaseModel):
+    from_accessed_at: str
+    to_accessed_at: str
+
+
+def validate_privacy_access_export_params(
+    request: Request,
+) -> PrivacyAccessExportParams:
+    """Validate the privacy-access query string before any data is read.
+
+    Exactly two parameters are accepted: ``from_accessed_at`` and
+    ``to_accessed_at``, both required UTC RFC 3339 date-times ending in ``Z``
+    (fractional seconds optional; offset forms, surrounding whitespace, and
+    non-``Z`` suffixes are rejected), with the lower bound not later than the
+    upper bound (equal bounds allowed). Any other parameter name is a 422
+    ``invalid_query``; a missing, blank, malformed, or inverted bound is a 422
+    ``bad_time``. Validation issues no database access and finishes before the
+    machine or any access record is read, so an invalid query against a
+    non-existent machine still reports 422 rather than 404.
+    """
+    allowed = {"from_accessed_at", "to_accessed_at"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    raw_from = request.query_params.get("from_accessed_at")
+    raw_to = request.query_params.get("to_accessed_at")
+
+    def _valid(value: str | None) -> bool:
+        if not value or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+            return False
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            return False
+        return True
+
+    if not _valid(raw_from) or not _valid(raw_to):
+        raise QueryError("bad_time")
+
+    if parse_utc_z_datetime(raw_from) > parse_utc_z_datetime(raw_to):
+        raise QueryError("bad_time")
+
+    return PrivacyAccessExportParams(
+        from_accessed_at=raw_from,  # type: ignore[arg-type]
+        to_accessed_at=raw_to,  # type: ignore[arg-type]
+    )
+
+
+class PrivacyAccessComplianceExportOut(BaseModel):
+    machine_id: str
+    from_accessed_at: str
+    to_accessed_at: str
+    privacy_accesses: list[PrivacyAccessOut]
+
+
+@app.get(
+    "/machines/{machine_id}/privacy-accesses/compliance-export",
+    response_model=PrivacyAccessComplianceExportOut,
+)
+def export_privacy_accesses_compliance(
+    machine_id: str,
+    params: Annotated[
+        PrivacyAccessExportParams,
+        Depends(validate_privacy_access_export_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only query of one machine's privacy accesses over a closed window.
+
+    The caller submits only the path machine id and the two UTC bounds. After
+    validation, a missing machine returns 404 ``not_found`` with no access
+    data. The response echoes the bounds verbatim and always carries
+    ``privacy_accesses`` (an empty array when the window contains nothing).
+    The array contains only records owned by the path machine whose
+    ``accessed_at`` falls inside the closed interval, ordered by the actual
+    UTC instant of ``accessed_at`` and then by id, so an exact-second record
+    sorts before any fractional-second record of the same second. Each record
+    carries exactly ``{id, machine_id, accessed_at, window_start, window_end,
+    result, hit_count}`` — responsible-party or key raw text is never present.
+    The query only issues reads: it never writes, updates, deletes, repairs,
+    or normalizes an access record, never returns another machine's accesses,
+    produces identical output for identical data and parameters on repeat
+    calls, and reads accesses persisted across application restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_accessed_at)
+    window_end = parse_utc_z_datetime(params.to_accessed_at)
+
+    # Membership is decided by the row's own machine_id and accessed_at only.
+    # Ordering parses stamps to UTC instants because an exact-second stamp
+    # sorts before a fractional stamp of the same second only after parsing
+    # (lexicographically '.' precedes 'Z').
+    rows = session.scalars(
+        select(PrivacyAccess).where(PrivacyAccess.machine_id == machine_id)
+    ).all()
+    in_window = [
+        row
+        for row in rows
+        if window_start <= parse_utc_z_datetime(row.accessed_at) <= window_end
+    ]
+    records = sorted(
+        in_window,
+        key=lambda row: (parse_utc_z_datetime(row.accessed_at), row.id),
+    )
+
+    return PrivacyAccessComplianceExportOut(
+        machine_id=machine_id,
+        from_accessed_at=params.from_accessed_at,
+        to_accessed_at=params.to_accessed_at,
+        privacy_accesses=[privacy_access_to_out(row) for row in records],
     )

@@ -255,6 +255,42 @@ class AuthorizationDecisionCausalLink(Base):
     created_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
+class PrivacyAccess(Base):
+    """One registered machine-level privacy data access.
+
+    Records when one machine performed a privacy access over a desensitized
+    export window and what the access returned. The responsible party is never
+    registered here — no free-text responsibility or key material is stored.
+    A registration is uniquely identified by ``(machine_id, accessed_at,
+    window_start, window_end, result)``: re-registering the same access time,
+    window, and result for the same machine is rejected rather than written.
+    Rows are append-only: they are never updated or deleted, and the
+    compliance query only reads them.
+    """
+
+    __tablename__ = "privacy_accesses"
+    __table_args__ = (
+        UniqueConstraint(
+            "machine_id",
+            "accessed_at",
+            "window_start",
+            "window_end",
+            "result",
+            name="uq_privacy_access_machine_time_window_result",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    accessed_at: Mapped[str] = mapped_column(String, nullable=False)
+    window_start: Mapped[str] = mapped_column(String, nullable=False)
+    window_end: Mapped[str] = mapped_column(String, nullable=False)
+    result: Mapped[str] = mapped_column(String(8), nullable=False)
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class WriteTransactionDiagnostic(Base):
     """One read-only diagnostic record per joint-write transaction attempt.
 

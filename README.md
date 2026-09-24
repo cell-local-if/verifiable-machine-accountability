@@ -693,3 +693,96 @@ unchanged data, and reads data persisted across application restarts. It adds
 no schema. `GET /health`, machine start/stop, authorization evaluation, the
 event chain, incident handling, and the existing compliance exports are
 unchanged.
+
+## Machine-level privacy access registration and read-only query
+
+The baseline records no machine-level privacy data access of its own. Two
+entries alongside the machine event paths now provide access registration and
+a read-only access query:
+
+- `POST /machines/{machine_id}/privacy-accesses` registers one privacy data
+  access;
+- `GET /machines/{machine_id}/privacy-accesses/compliance-export` queries the
+  machine's registered accesses over a closed UTC window.
+
+Neither entry accepts responsible-party raw text, and no key or secret
+material is ever stored or returned.
+
+### Registration
+
+The `POST` body must be an object carrying exactly:
+
+- `accessed_at` — the access time, a UTC RFC 3339 date-time ending in `Z`
+  (fractional seconds optional; offset forms such as `+00:00`, surrounding
+  whitespace, a missing suffix, and out-of-range calendar/time values are
+  rejected);
+- `window_start`, `window_end` — the desensitized export window covered by
+  the access, in the same UTC `Z` form; `window_start` must not be later than
+  `window_end` (equal bounds are allowed);
+- `result` — exactly `success` or `failed`;
+- `hit_count` — a non-negative integer (booleans, floats, and numeric strings
+  are rejected; a `failed` access always records zero hits, so a nonzero
+  count with `failed` is itself a 422).
+
+A missing field, a non-object body, a malformed/offset/blank timestamp, an
+inverted window, an unknown result, or a non-integer/negative hit count
+returns `422`. Any extra field — including a responsible party or role — is
+ignored rather than stored or echoed, so that raw text never reaches the
+record. Body validation runs before the machine is looked up, so the same
+malformed payload against a non-existent machine is still `422` and leaves
+no record. After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}`.
+
+Success returns `201` with `{id, machine_id, accessed_at, window_start,
+window_end, result, hit_count}`: a fresh UUID `id`, the path machine id, the
+submitted timestamps and window echoed verbatim, and the result and hit
+count. Re-registering the same access time, window, and result for the same
+machine returns `409 {"error":{"code":"duplicate_access"}}` and writes
+nothing (the hit count is not part of the access identity; the same
+coordinates with a different count are still a duplicate; the same
+coordinates with a different `result` are a distinct access). A failed query
+still leaves a record, with `hit_count` `0`. The path accepts `POST` only;
+other methods return `405` without performing any work.
+
+### Read-only query
+
+`GET /machines/{machine_id}/privacy-accesses/compliance-export` submits only
+the path machine id and two UTC bounds; both query parameters are required
+and validated before the machine or any access record is read:
+
+- `from_accessed_at`, `to_accessed_at` — UTC RFC 3339 date-times ending in
+  `Z` (fractional seconds optional; surrounding whitespace, offset forms such
+  as `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); `from_accessed_at` must not be later than `to_accessed_at`
+  (equal bounds are allowed). A missing, blank, offset, malformed, or
+  inverted bound returns `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`.
+- The path accepts `GET` only; other methods return `405`.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}` with no access data.
+
+The response is `{machine_id, from_accessed_at, to_accessed_at,
+privacy_accesses}`; the bounds are echoed verbatim and `privacy_accesses` is
+always present, an empty array when the window contains nothing. The array
+contains only records stored under the path machine name whose own
+`accessed_at` falls inside the closed interval
+`[from_accessed_at, to_accessed_at]` — the access's stored export window is
+not consulted for membership. Records are ordered by the actual UTC instant
+of `accessed_at` and then by id, so an exact-second record sorts before any
+fractional-second record of the same second (ISO text alone is not
+chronological across that boundary). Each item keeps exactly `{id,
+machine_id, accessed_at, window_start, window_end, result, hit_count}` — no
+responsibility or key raw text is exposed.
+
+Records live in their own `privacy_accesses` table, which is created
+automatically on startup, so an empty database is immediately usable.
+Registrations persist across application restarts and are strictly isolated
+by machine: another machine's accesses can never enter the result. The query
+only issues reads — it never writes, updates, deletes, repairs, recomputes,
+or normalizes an access record or any other record — produces byte-identical
+output for identical data and parameters on repeat calls, and reads accesses
+persisted across restarts. The desensitized responsibility export's
+response, digests, and filtering, `GET /health`, the hash chains, the
+diagnostics entry, and every existing compliance export are unchanged.
