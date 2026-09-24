@@ -136,7 +136,14 @@ current authorization-event integrity audit in the existing
 - `flags` — `[]`, or the actually-experienced `lock_wait` and `retry` flags
   in that order. A lock wait and its retries collapse into this one record;
   a rollback is never recorded as a partial/fragmented entry;
-- `status` — the machine's terminal status for the attempt;
+- `status` — the attempt's **transaction terminal state**, exactly
+  `committed` (the joint write landed) or `rolled_back` (it did not);
+- `machine_status` — the machine's own terminal state for the attempt,
+  `active` or `suspended` (the empty string for an attempt whose machine did
+  not exist). It is deliberately separate from the transaction outcome, so a
+  rolled-back attempt can still observe a `suspended` machine (for example,
+  the losing request of a same-target suspension race reports
+  `status = "rolled_back"` with `machine_status = "suspended"`);
 - `event` — the created decision-event id for a committed `event` attempt,
   otherwise `null`;
 - `count` — the machine's decision-event count at the terminal state (the
@@ -161,8 +168,11 @@ calls against unchanged data, is stable across restarts (the startup recovery
 pass finalizes residuals once and an already-complete database performs no
 writes), and reads data persisted across restarts. Existing databases gain
 the diagnostics table safely on startup, and an empty database is fully
-usable. `422`/`404`/`409`, the `active`/`suspended` semantics, and
-`GET /health` are unchanged.
+usable. Databases created before the terminal-state split are migrated once
+on startup: the old machine-state `status` value moves to `machine_status`
+and `status` becomes the `committed`/`rolled_back` outcome derived from the
+record's phase, so a second restart performs no writes. `422`/`404`/`409`,
+the `active`/`suspended` semantics, and `GET /health` are unchanged.
 
 ## Key rotation integrity chain
 
@@ -482,3 +492,63 @@ rewritten, filtered out, or repaired. The endpoint issues no writes, repairs,
 or deletions, never returns another machine's status history, produces
 identical output for identical data and parameters on repeat calls, and reads
 data persisted across application restarts.
+
+## Read-only machine-level accountability compliance export
+
+`GET /machines/{machine_id}/accountability/compliance-export` returns a
+deterministic, read-only, machine-level closed-loop accountability slice in
+one response. Both query parameters are required and validated before the
+machine is looked up, so a missing, malformed, or inverted parameter returns
+`422` even when the machine does not exist, and an invalid query never reads
+machine data:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); `from_created_at` must not be later than `to_created_at` (equal
+  bounds are allowed). A missing, blank, malformed, or inverted bound returns
+  `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}` with no partial closure data.
+
+The response is `{machine_id, from_created_at, to_created_at, events,
+evidence, incidents, status_history, responsibility_assignments}` — the
+bounds are echoed verbatim and every group is present, an empty array when
+the window contains nothing. Each group contains only records owned by the
+path machine whose own `created_at` falls inside the closed interval, each
+ordered by the actual UTC instant of `created_at` and then by record id, so
+an exact-second record sorts before any fractional-second record of the same
+second (ISO text alone is not chronological across that boundary).
+
+- `events` — the machine's authorization decision events, with the
+  authorization result (`allowed`, `reason`) and the full integrity-chain
+  fields (`previous_event_id`, `content_hash`, `chain_hash`). Event
+  association requires both endpoints to be events in this export's event
+  set.
+- `evidence` — evidence records with their raw `content_hash` fingerprint,
+  following the existing machine/event ownership.
+- `incidents` — registered incidents with the registration content
+  (`incident_type`, `summary`) and the current lifecycle `status`.
+- `status_history` — the machine's incident status transitions, each with
+  its before/after (`from_status`, `to_status`) statuses, following the
+  existing machine/incident ownership.
+- `responsibility_assignments` — responsibility attributions with the
+  responsible party, role, and the assignment chain fields
+  (`previous_assignment_id`, `content_hash`, `chain_hash`), following the
+  existing machine/incident ownership.
+
+The evidence, status-history, and assignment groups follow the existing
+machine/entity ownership relations of their owning incidents; whether the
+referenced event itself falls in the event window never removes a record.
+Every record is exported exactly as stored: when an associated object is
+missing or belongs to another machine, the record is still included verbatim
+— integrity failures never filter, rewrite, repair, or normalize it. The
+endpoint issues no writes, repairs, deletions, recomputations, or
+normalizations of the machine or any accountability record, produces
+byte-identical output for identical data and parameters on repeat calls, and
+reads records persisted across application restarts. `GET /health`, machine
+start/stop, authorization evaluation, the event chain, the existing exports,
+and the diagnostics error semantics are unchanged.

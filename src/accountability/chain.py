@@ -252,13 +252,15 @@ def _pre_read(engine: Engine, machine_id: str) -> tuple[str | None, int]:
 def _terminal_snapshot(
     engine: Engine, machine_id: str
 ) -> tuple[str, int, tuple[bool, int, str | None]]:
-    """Read the committed terminal ``(status, event_count, chain_check)``.
+    """Read the committed terminal ``(machine_status, event_count, chain_check)``.
 
     Used to finalize a marker from evidence after the business attempt
-    finished. Read-only.
+    finished. The machine's active/suspended state is distinct from the
+    attempt's transaction terminal state: callers derive ``committed`` /
+    ``rolled_back`` from the attempt outcome itself. Read-only.
     """
     with engine.connect() as conn:
-        status = conn.execute(
+        machine_status = conn.execute(
             Machine.__table__.select()
             .where(Machine.__table__.c.id == machine_id)
             .with_only_columns(Machine.__table__.c.status)
@@ -269,7 +271,7 @@ def _terminal_snapshot(
             .where(AuthorizationDecisionEvent.__table__.c.machine_id == machine_id)
         ).scalar_one()
         check = verify_chain(conn, machine_id)
-        return status, int(count or 0), check
+        return machine_status or "", int(count or 0), check
 
 
 def run_joint_write(
@@ -370,14 +372,14 @@ def run_joint_write(
     fail = _failure_category(error)
     if retried and "retry" not in flags:
         flags.append("retry")
-    status, count, check = _terminal_snapshot(engine, machine_id)
+    machine_status, count, check = _terminal_snapshot(engine, machine_id)
     diagnostics.finalize(
         engine,
         tid,
         phase=diagnostics.PHASE_ROLLBACK,
         fail=fail,
         flags=flags,
-        status=status or "",
+        machine_status=machine_status,
         event=None,
         count=count,
         check=check,
@@ -404,11 +406,11 @@ def _finalize_joint_write(
     re-reads the terminal state read-only.
     """
     if result.get("status") == "ok":
-        status = result.get("diag_status")
+        machine_status = result.get("diag_status")
         count = result.get("diag_count")
         check = result.get("diag_check")
-        if status is None or count is None or check is None:
-            status, count, check = _terminal_snapshot(engine, machine_id)
+        if machine_status is None or count is None or check is None:
+            machine_status, count, check = _terminal_snapshot(engine, machine_id)
         event_id: str | None = None
         if op == "event":
             event_id = result["event"]["id"]
@@ -418,7 +420,7 @@ def _finalize_joint_write(
             phase=diagnostics.PHASE_COMMIT,
             fail=diagnostics.FAIL_NONE,
             flags=flags,
-            status=status,
+            machine_status=machine_status,
             event=event_id,
             count=count,
             check=check,
@@ -427,15 +429,16 @@ def _finalize_joint_write(
 
     # Cleanly rejected attempt (missing machine / same-target status): the
     # business transaction rolled back and wrote nothing. Snapshot the
-    # terminal state it left behind.
-    status, count, check = _terminal_snapshot(engine, machine_id)
+    # terminal machine state it left behind; the transaction outcome is
+    # ``rolled_back`` regardless of the machine's active/suspended state.
+    machine_status, count, check = _terminal_snapshot(engine, machine_id)
     diagnostics.finalize(
         engine,
         tid,
         phase=diagnostics.PHASE_ROLLBACK,
         fail=reject_fail,
         flags=flags,
-        status=status or "",
+        machine_status=machine_status,
         event=None,
         count=count,
         check=check,

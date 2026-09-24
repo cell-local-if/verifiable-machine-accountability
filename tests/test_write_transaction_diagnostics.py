@@ -84,6 +84,7 @@ RECORD_KEYS = {
     "fail",
     "flags",
     "status",
+    "machine_status",
     "event",
     "count",
     "check",
@@ -127,7 +128,8 @@ def test_committed_event_attempt_record(client):
     assert record["phase"] == "started-commit"
     assert record["fail"] == "none"
     assert record["flags"] == []
-    assert record["status"] == "active"
+    assert record["status"] == "committed"
+    assert record["machine_status"] == "active"
     assert record["event"] == event["id"]
     assert record["count"] == 1
     assert record["at"].endswith("Z")
@@ -153,7 +155,8 @@ def test_committed_change_attempt_record(client):
     assert record["phase"] == "started-commit"
     assert record["fail"] == "none"
     assert record["flags"] == []
-    assert record["status"] == "suspended"
+    assert record["status"] == "committed"
+    assert record["machine_status"] == "suspended"
     # A status change creates no event: event is null and count stays 0.
     assert record["event"] is None
     assert record["count"] == 0
@@ -183,7 +186,10 @@ def test_same_target_status_loser_is_rollback_race(client):
     assert loser_record["fail"] == "race"
     assert loser_record["op"] == "change"
     assert loser_record["event"] is None
-    assert loser_record["status"] == "suspended"
+    # The transaction rolled back even though the machine is now suspended:
+    # status is the transaction outcome, machine_status the machine's state.
+    assert loser_record["status"] == "rolled_back"
+    assert loser_record["machine_status"] == "suspended"
 
 
 def test_missing_machine_event_and_change_attempts_are_rollback_other(client):
@@ -205,7 +211,7 @@ def test_missing_machine_event_and_change_attempts_are_rollback_other(client):
         rows = list(
             conn.execute(
                 text(
-                    "SELECT op, phase, fail, status, event, count "
+                    "SELECT op, phase, fail, status, machine_status, event, count "
                     "FROM write_transaction_diagnostics ORDER BY at, id"
                 )
             )
@@ -214,7 +220,8 @@ def test_missing_machine_event_and_change_attempts_are_rollback_other(client):
     for row in rows:
         assert row.phase == "started-rollback"
         assert row.fail == "other"
-        assert row.status == ""
+        assert row.status == "rolled_back"
+        assert row.machine_status == ""
         assert row.event is None
         assert row.count == 0
 
@@ -690,7 +697,8 @@ def test_crash_residual_committed_change_is_recovered(client):
     assert recovered["phase"] == "started-commit"
     assert recovered["fail"] == "none"
     assert recovered["op"] == "change"
-    assert recovered["status"] == "suspended"
+    assert recovered["status"] == "committed"
+    assert recovered["machine_status"] == "suspended"
     assert recovered["event"] is None
 
 
@@ -803,6 +811,79 @@ def test_recovery_is_idempotent_across_repeated_restarts(client):
 
     assert first_body == second_body
     assert all(r["phase"] != "started" for r in second_body["records"])
+
+
+def test_legacy_status_rows_are_split_on_startup(tmp_path, monkeypatch):
+    """Rows written before the terminal-state correction stored the machine's
+    active/suspended state in ``status``. Startup migration moves it to
+    ``machine_status`` and rewrites ``status`` to the transaction outcome.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    monkeypatch.setenv("ACCOUNTABILITY_DATABASE_URL", f"sqlite:///{db_path}")
+
+    # Build the current schema, then downgrade the diagnostics table to the
+    # pre-correction shape (no machine_status column).
+    with TestClient(app):
+        pass
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE write_transaction_diagnostics DROP COLUMN machine_status")
+    legacy_rows = [
+        # (id, op, phase, old status)
+        ("aaaaaaaa-0000-0000-0000-000000000001", "event", "started-commit", "active"),
+        ("aaaaaaaa-0000-0000-0000-000000000002", "change", "started-commit", "suspended"),
+        ("aaaaaaaa-0000-0000-0000-000000000003", "change", "started-rollback", "suspended"),
+        ("aaaaaaaa-0000-0000-0000-000000000004", "event", "started-rollback", ""),
+    ]
+    for tid, op, phase, old_status in legacy_rows:
+        conn.execute(
+            "INSERT INTO write_transaction_diagnostics "
+            "(id, machine_id, op, at, phase, fail, flags, status, event, "
+            " count, check_valid, check_checked_count, check_broken_event_id, "
+            " started_at) "
+            "VALUES (?, 'm1', ?, '2026-03-01T00:00:00Z', ?, 'none', '[]', ?, "
+            " NULL, 0, 1, 0, NULL, '2026-03-01T00:00:00Z')",
+            (tid, op, phase, old_status),
+        )
+    conn.commit()
+    conn.close()
+
+    with TestClient(app) as restarted:
+        machine_id = "m1"
+        # m1 is not a real machine, so read the rows directly instead.
+        with restarted.app.state.engine.connect() as db_conn:
+            rows = list(
+                db_conn.execute(
+                    text(
+                        "SELECT id, status, machine_status FROM "
+                        "write_transaction_diagnostics ORDER BY id"
+                    )
+                )
+            )
+
+    by_id = {row.id: row for row in rows}
+    committed_active = by_id["aaaaaaaa-0000-0000-0000-000000000001"]
+    committed_suspended = by_id["aaaaaaaa-0000-0000-0000-000000000002"]
+    rolled_suspended = by_id["aaaaaaaa-0000-0000-0000-000000000003"]
+    rolled_missing = by_id["aaaaaaaa-0000-0000-0000-000000000004"]
+    assert (committed_active.status, committed_active.machine_status) == (
+        "committed",
+        "active",
+    )
+    assert (committed_suspended.status, committed_suspended.machine_status) == (
+        "committed",
+        "suspended",
+    )
+    assert (rolled_suspended.status, rolled_suspended.machine_status) == (
+        "rolled_back",
+        "suspended",
+    )
+    assert (rolled_missing.status, rolled_missing.machine_status) == (
+        "rolled_back",
+        "",
+    )
 
 
 def test_empty_database_serves_diagnostics(tmp_path, monkeypatch):

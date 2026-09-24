@@ -24,11 +24,11 @@ evidence — the committed business effect is present (a decision event for an
 event attempt, a fresh ``updated_at`` for a status change) or absent — so a
 residual is classified as a commit or a crash rollback, never left partial.
 
-Records carry operational metadata only: op, phase, failure category,
-experienced lock-wait/retry flags, terminal status, event id, and event
-count. They never contain keys, secrets, policy text, or identity material.
-The read endpoint only issues SELECTs; diagnostics are never repaired,
-recomputed, or deleted by a query.
+Records carry operational metadata only: op, failure category,
+experienced lock-wait/retry flags, transaction terminal state, machine
+state, event id, and event count. They never contain keys, secrets, policy
+text, or identity material. The read endpoint only issues SELECTs;
+diagnostics are never repaired, recomputed, or deleted by a query.
 """
 
 import json
@@ -57,6 +57,12 @@ FAIL_RACE = "race"
 FAIL_IO = "io"
 FAIL_OTHER = "other"
 
+# The transaction terminal state stored in ``status``. It describes only
+# whether the joint write committed or rolled back; the machine's own
+# active/suspended state lives separately in ``machine_status``.
+STATUS_COMMITTED = "committed"
+STATUS_ROLLED_BACK = "rolled_back"
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -83,6 +89,7 @@ def migrate_schema(engine: Engine) -> None:
         "check_checked_count": "INTEGER NOT NULL DEFAULT 0",
         "check_broken_event_id": "VARCHAR(36)",
         "started_at": "VARCHAR",
+        "machine_status": "VARCHAR",
     }
     with engine.begin() as conn:
         for name, column_type in additions.items():
@@ -92,6 +99,41 @@ def migrate_schema(engine: Engine) -> None:
                         f"ALTER TABLE {_TABLE.name} ADD COLUMN {name} {column_type}"
                     )
                 )
+        _backfill_terminal_status(conn)
+
+
+def _backfill_terminal_status(conn) -> None:
+    """Split the legacy machine-state ``status`` into the new two-field shape.
+
+    Rows written before the terminal-state correction stored the machine's
+    ``active``/``suspended`` state in ``status`` (``""`` for attempts against a
+    missing machine). Such rows never carry a ``committed``/``rolled_back``
+    transaction state, so they are rewritten once: the machine state moves to
+    ``machine_status`` (missing machines keep ``""``) and ``status`` becomes
+    the transaction outcome derived from ``phase``. Rows already in the new
+    shape are untouched, so restarting over a migrated database performs no
+    writes.
+    """
+    legacy_rows = list(
+        conn.execute(
+            _TABLE.select().where(
+                _TABLE.c.status.notin_((STATUS_COMMITTED, STATUS_ROLLED_BACK))
+            )
+        )
+    )
+    for row in legacy_rows:
+        mapping = row._mapping
+        machine_status = mapping["status"]
+        terminal = (
+            STATUS_COMMITTED
+            if mapping["phase"] == PHASE_COMMIT
+            else STATUS_ROLLED_BACK
+        )
+        conn.execute(
+            _TABLE.update()
+            .where(_TABLE.c.id == mapping["id"])
+            .values(status=terminal, machine_status=machine_status)
+        )
 
 
 def _event_chain_check(
@@ -122,9 +164,12 @@ def insert_started(
     Returns ``(tid, waited_seconds)``. The marker owns its own transaction,
     so it is durable independently of the joint write it observes; its
     values are best-effort pre-reads and are overwritten at finalization.
-    ``waited_seconds`` reports how long the marker's own write blocked on
-    another writer's lock — part of the attempt's total lock wait even
-    though it happens before the joint transaction.
+    The transaction ``status`` starts pessimistically as ``rolled_back`` and
+    is only promoted to ``committed`` at finalization; ``machine_status``
+    carries the pre-read active/suspended state (``""`` for a missing
+    machine). ``waited_seconds`` reports how long the marker's own write
+    blocked on another writer's lock — part of the attempt's total lock wait
+    even though it happens before the joint transaction.
     """
     tid = str(uuid.uuid4())
     began = time.monotonic()
@@ -138,7 +183,8 @@ def insert_started(
                 phase=PHASE_STARTED,
                 fail=FAIL_NONE,
                 flags=json.dumps([]),
-                status=status,
+                status=STATUS_ROLLED_BACK,
+                machine_status=status,
                 event=None,
                 count=count,
                 check_valid=True,
@@ -157,13 +203,22 @@ def finalize(
     phase: str,
     fail: str,
     flags: list[str],
-    status: str,
+    machine_status: str,
     event: str | None,
     count: int,
     check: tuple[bool, int, str | None],
     at: str | None = None,
 ) -> None:
-    """Finalize one marker exactly once to its terminal outcome."""
+    """Finalize one marker exactly once to its terminal outcome.
+
+    ``status`` is the transaction terminal state derived from ``phase``:
+    ``committed`` for a committed joint write, ``rolled_back`` otherwise.
+    ``machine_status`` is the machine's active/suspended state at the
+    terminal state (``""`` for an attempt against a missing machine).
+    """
+    terminal_status = (
+        STATUS_COMMITTED if phase == PHASE_COMMIT else STATUS_ROLLED_BACK
+    )
     valid, checked_count, broken_event_id = check
     with engine.begin() as conn:
         conn.execute(
@@ -174,7 +229,8 @@ def finalize(
                 phase=phase,
                 fail=fail,
                 flags=json.dumps(flags),
-                status=status,
+                status=terminal_status,
+                machine_status=machine_status,
                 event=event,
                 count=count,
                 check_valid=valid,
@@ -263,7 +319,8 @@ def recover_pending(engine: Engine) -> None:
                         phase=PHASE_ROLLBACK,
                         fail=FAIL_OTHER,
                         flags=json.dumps([]),
-                        status="",
+                        status=STATUS_ROLLED_BACK,
+                        machine_status="",
                         event=None,
                         count=len(events),
                         check_valid=check[0],
@@ -274,7 +331,7 @@ def recover_pending(engine: Engine) -> None:
                 continue
 
             machine = machine_row._mapping
-            status = machine["status"]
+            machine_status = machine["status"]
 
             if op == "event":
                 evidenced = None
@@ -294,17 +351,19 @@ def recover_pending(engine: Engine) -> None:
                         break
                 if evidenced is not None:
                     claimed_events.add(evidenced)
+                committed = evidenced is not None
                 conn.execute(
                     _TABLE.update()
                     .where(_TABLE.c.id == marker["id"])
                     .values(
                         at=at,
-                        phase=PHASE_COMMIT if evidenced is not None else PHASE_ROLLBACK,
-                        fail=FAIL_NONE if evidenced is not None else FAIL_OTHER,
+                        phase=PHASE_COMMIT if committed else PHASE_ROLLBACK,
+                        fail=FAIL_NONE if committed else FAIL_OTHER,
                         flags=json.dumps([]),
-                        status=status,
+                        status=STATUS_COMMITTED if committed else STATUS_ROLLED_BACK,
+                        machine_status=machine_status,
                         event=evidenced,
-                        count=position if evidenced is not None else len(events),
+                        count=position if committed else len(events),
                         check_valid=check[0],
                         check_checked_count=check[1],
                         check_broken_event_id=check[2],
@@ -320,7 +379,8 @@ def recover_pending(engine: Engine) -> None:
                         phase=PHASE_COMMIT if committed else PHASE_ROLLBACK,
                         fail=FAIL_NONE if committed else FAIL_OTHER,
                         flags=json.dumps([]),
-                        status=status,
+                        status=STATUS_COMMITTED if committed else STATUS_ROLLED_BACK,
+                        machine_status=machine_status,
                         event=None,
                         count=len(events),
                         check_valid=check[0],

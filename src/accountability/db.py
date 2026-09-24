@@ -277,7 +277,10 @@ class WriteTransactionDiagnostic(Base):
     * ``flags`` — ``[]`` or a JSON array listing ``lock_wait`` and ``retry``
       in the order actually experienced (a lock wait and its retries collapse
       into this one record);
-    * ``status`` — the terminal machine status observed for the attempt;
+    * ``status`` — the attempt's transaction terminal state: ``committed``
+      when the joint write landed or ``rolled_back`` when it did not;
+    * ``machine_status`` — the machine's ``active``/``suspended`` state at
+      the terminal state, kept separate from the transaction outcome;
     * ``event`` — the created event id for ``op = "event"`` commits, else
       ``null``;
     * ``count`` — the machine's decision-event count after the attempt.
@@ -293,6 +296,11 @@ class WriteTransactionDiagnostic(Base):
     fail: Mapped[str] = mapped_column(String(16), nullable=False)
     flags: Mapped[str] = mapped_column(String, nullable=False, default="[]")
     status: Mapped[str] = mapped_column(String, nullable=False)
+    # The machine's own active/suspended state at the terminal state, distinct
+    # from the transaction outcome stored in ``status``. Nullable so databases
+    # created before the split keep working; the startup migration backfills
+    # it from the pre-split ``status`` value.
+    machine_status: Mapped[str | None] = mapped_column(String, nullable=True)
     event: Mapped[str | None] = mapped_column(String(36), nullable=True)
     count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Snapshot of the machine's event hash-chain audit at the attempt's
