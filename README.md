@@ -94,6 +94,76 @@ append either commit together or leave no trace. Body validation (`422`) and
 the missing-machine/path-resource (`404 not_found`) outcomes are unchanged by
 this serialization and never flip error types under a status race.
 
+## Read-only joint-write transaction diagnostics
+
+`GET /machines/{machine_id}/diag` exposes read-only observability over the
+joint write transaction shared by the status-change and decision-event
+entries above. Every attempt at `POST /machines/{machine_id}/status` or
+`POST /machines/{machine_id}/authorization-decision-events` produces exactly
+one diagnostic record; the diagnostics feature adds no new write entry, and
+the two README-documented endpoints remain the only way to change a machine's
+status or create a decision event.
+
+Both query parameters are required and validated before the machine is
+looked up, so an invalid query against a non-existent machine is still `422`:
+
+- `from`, `to` — UTC RFC 3339 date-times ending in `Z` (fractional seconds
+  optional; offset forms such as `+00:00`, a missing suffix, surrounding
+  whitespace, and out-of-range calendar/time values are rejected); `from`
+  must not be later than `to` (equal bounds are allowed). A missing, blank,
+  malformed, offset, or inverted bound returns
+  `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns `422 {"error":{"code":"invalid_query"}}`.
+
+After validation, a missing machine returns `404 {"error":{"code":"not_found"}}`.
+
+Success returns `200` with `{id, from, to, records, check}`: `id` is the path
+machine id, `from`/`to` echo the bounds verbatim, and `check` is the machine's
+current authorization-event integrity audit in the existing
+`{valid, checked_count, broken_event_id}` shape. Each item in `records` is:
+
+- `tid` — the diagnostic record id;
+- `at` — the terminal timestamp of the attempt, a UTC RFC 3339 date-time
+  ending in `Z`;
+- `op` — `change` for a status change, `event` for a decision-event creation;
+- `phase` — `started-commit` (the joint write committed) or
+  `started-rollback` (it rolled back; includes the attempt start and the
+  terminal state);
+- `fail` — `none` for every commit; a rollback carries one stable category:
+  `race` (a concurrency conflict, including the losing request of a
+  same-target status race), `io` (a persistence failure), or `other` (any
+  other failure or a crash rollback);
+- `flags` — `[]`, or the actually-experienced `lock_wait` and `retry` flags
+  in that order. A lock wait and its retries collapse into this one record;
+  a rollback is never recorded as a partial/fragmented entry;
+- `status` — the machine's terminal status for the attempt;
+- `event` — the created decision-event id for a committed `event` attempt,
+  otherwise `null`;
+- `count` — the machine's decision-event count at the terminal state (the
+  event's chain position for a committed event attempt);
+- `check` — the event hash-chain audit snapshot
+  (`{valid, checked_count, broken_event_id}`) at the terminal state.
+
+Records contain only this operational metadata — never keys, secrets, policy
+text, or identity material. `records` includes only finalized records owned by
+the path machine whose `at` falls inside the closed interval `[from, to]`,
+ordered by the actual UTC instant of `at` and then by `tid` (ISO-8601 text is
+not chronological across the fractional-second boundary, so instants are
+parsed first). If the process dies mid-attempt, the residual record is
+finalized on the next startup from committed evidence — a decision event at
+or after the attempt start for an event attempt, a fresh machine
+`updated_at` for a status change — and classified as a commit or a crash
+rollback; nothing is ever left half-finished.
+
+The query is strictly read-only: it never writes, repairs, recomputes, or
+deletes diagnostics or any business record, gives identical results on repeat
+calls against unchanged data, is stable across restarts (the startup recovery
+pass finalizes residuals once and an already-complete database performs no
+writes), and reads data persisted across restarts. Existing databases gain
+the diagnostics table safely on startup, and an empty database is fully
+usable. `422`/`404`/`409`, the `active`/`suspended` semantics, and
+`GET /health` are unchanged.
+
 ## Key rotation integrity chain
 
 Each machine's key rotation history forms its own per-machine, tamper-evident

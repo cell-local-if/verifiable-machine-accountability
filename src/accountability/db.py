@@ -253,3 +253,56 @@ class AuthorizationDecisionCausalLink(Base):
         index=True,
     )
     created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class WriteTransactionDiagnostic(Base):
+    """One read-only diagnostic record per joint-write transaction attempt.
+
+    A joint write is one of the two public mutating operations serialized by
+    the same machine write lock: a machine status change (``op = "change"``)
+    and an authorization decision-event creation (``op = "event"``). The
+    table is append-only observability: the records are written in their own
+    transaction(s), never updated or deleted, and never participate in
+    authorization evaluation. Columns store only operational metadata — no
+    keys, secrets, policy text, or identity material.
+
+    * ``tid`` — stable id of the diagnostic record (a fresh UUID per attempt);
+    * ``at`` — UTC RFC 3339 timestamp (ending in ``Z``) of the attempt's
+      terminal outcome, also the ordering key;
+    * ``phase`` — ``started-commit`` (the joint write committed) or
+      ``started-rollback`` (it rolled back, with a stable failure category in
+      ``fail``);
+    * ``fail`` — ``none`` for committed attempts, otherwise ``race``, ``io``,
+      or ``other``;
+    * ``flags`` — ``[]`` or a JSON array listing ``lock_wait`` and ``retry``
+      in the order actually experienced (a lock wait and its retries collapse
+      into this one record);
+    * ``status`` — the terminal machine status observed for the attempt;
+    * ``event`` — the created event id for ``op = "event"`` commits, else
+      ``null``;
+    * ``count`` — the machine's decision-event count after the attempt.
+    """
+
+    __tablename__ = "write_transaction_diagnostics"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    op: Mapped[str] = mapped_column(String(16), nullable=False)
+    at: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    phase: Mapped[str] = mapped_column(String(32), nullable=False)
+    fail: Mapped[str] = mapped_column(String(16), nullable=False)
+    flags: Mapped[str] = mapped_column(String, nullable=False, default="[]")
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    event: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Snapshot of the machine's event hash-chain audit at the attempt's
+    # terminal state, with the same shape as the event integrity endpoint:
+    # {valid, checked_count, broken_event_id}.
+    check_valid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    check_checked_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    check_broken_event_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    # Transient start timestamp of the attempt; copied into ``at`` when the
+    # marker is finalized and used to classify crash residuals at startup.
+    started_at: Mapped[str] = mapped_column(String, nullable=False)

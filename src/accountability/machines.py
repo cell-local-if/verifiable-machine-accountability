@@ -11,10 +11,15 @@ in the ``machines`` table, so it survives restarts.
 
 from typing import Any
 
-from sqlalchemy import Connection, Engine
+from sqlalchemy import Connection, Engine, func, select
 
-from .chain import _run_with_lock_retry, _utc_now_iso
-from .db import Machine
+from .chain import (
+    JointWriteOutcome,
+    _utc_now_iso,
+    run_joint_write,
+    verify_chain,
+)
+from .db import AuthorizationDecisionEvent, Machine
 
 _MACHINE_TABLE = Machine.__table__
 
@@ -38,15 +43,19 @@ def change_machine_status(
 ) -> dict[str, Any]:
     """Atomically set one machine's status.
 
-    The lookup, same-status check, and update happen in one locked
-    transaction. Returns a status dict:
+    The lookup, same-status check, and update happen in one locked joint
+    write transaction (the same lock a decision-event append takes). Returns
+    a status dict:
 
     * ``not_found`` — the machine does not exist (nothing is written);
     * ``invalid_status_transition`` — the machine already has ``to_status``
-      (nothing is written);
+      (nothing is written); this is the concurrency-loser outcome and is
+      diagnosed as a ``race`` rollback;
     * ``ok`` — with the full updated ``machine`` record. Only ``status`` and
       ``updated_at`` change; ``version``, ``public_key``, and ``created_at``
       keep their stored values.
+
+    Every attempt records exactly one joint-write diagnostic.
     """
 
     def _work(conn: Connection) -> dict[str, Any]:
@@ -54,10 +63,14 @@ def change_machine_status(
             _MACHINE_TABLE.select().where(_MACHINE_TABLE.c.id == machine_id)
         ).first()
         if machine_row is None:
-            return {"status": "not_found"}
+            raise JointWriteOutcome({"status": "not_found"})
         current_status = machine_row._mapping["status"]
         if current_status == to_status:
-            return {"status": "invalid_status_transition"}
+            # The same-target request lost the race to the request that
+            # already committed this status: nothing is written.
+            raise JointWriteOutcome(
+                {"status": "invalid_status_transition"}, fail="race"
+            )
 
         now = _utc_now_iso()
         # The status predicate is an optimistic guard in addition to the write
@@ -77,15 +90,31 @@ def change_machine_status(
                 _MACHINE_TABLE.select().where(_MACHINE_TABLE.c.id == machine_id)
             ).first()
             if current is None:
-                return {"status": "not_found"}
-            return {"status": "invalid_status_transition"}
+                raise JointWriteOutcome({"status": "not_found"})
+            raise JointWriteOutcome(
+                {"status": "invalid_status_transition"}, fail="race"
+            )
 
         updated_row = conn.execute(
             _MACHINE_TABLE.select().where(_MACHINE_TABLE.c.id == machine_id)
         ).first()
+        event_count = conn.execute(
+            select(func.count())
+            .select_from(AuthorizationDecisionEvent.__table__)
+            .where(AuthorizationDecisionEvent.__table__.c.machine_id == machine_id)
+        ).scalar_one()
+        # Snapshot the attempt's own terminal state inside the lock for its
+        # diagnostic: the new status, the (unchanged) event count, and the
+        # machine's event-chain check.
+        diag_check = verify_chain(conn, machine_id)
         return {
             "status": "ok",
             "machine": {key: updated_row._mapping[key] for key in _MACHINE_FIELDS},
+            "diag_status": to_status,
+            "diag_count": int(event_count or 0),
+            "diag_check": diag_check,
         }
 
-    return _run_with_lock_retry(engine, _work)
+    return run_joint_write(
+        engine, machine_id=machine_id, op="change", work=_work
+    )

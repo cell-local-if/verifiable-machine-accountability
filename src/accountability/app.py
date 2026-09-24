@@ -1,4 +1,5 @@
 import os
+import json
 import re
 import uuid
 from collections import deque
@@ -10,12 +11,27 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StrictBool, StrictInt, StringConstraints
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StringConstraints,
+)
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import assignment_chain, authorization, chain, incidents, machines, rotation_chain
+from . import (
+    assignment_chain,
+    authorization,
+    chain,
+    diagnostics,
+    incidents,
+    machines,
+    rotation_chain,
+)
 from .db import (
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
@@ -69,6 +85,10 @@ async def lifespan(app: FastAPI):
     rotation_chain.backfill_chains(engine)
     assignment_chain.migrate_schema(engine)
     assignment_chain.backfill_chains(engine)
+    diagnostics.migrate_schema(engine)
+    # Finalize joint-write markers left by a crashed previous process from
+    # the committed evidence, before serving any request.
+    diagnostics.recover_pending(engine)
     app.state.engine = engine
     yield
     engine.dispose()
@@ -96,6 +116,18 @@ SessionDep = Annotated[Session, Depends(get_session)]
 
 def error_response(status_code: int, code: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": {"code": code}})
+
+
+class QueryError(Exception):
+    """A query-string failure reported as ``422 {"error":{"code": ...}}``."""
+
+    def __init__(self, code: str):
+        self.code = code
+
+
+@app.exception_handler(QueryError)
+def _query_error_handler(request: Request, exc: QueryError) -> JSONResponse:
+    return error_response(422, exc.code)
 
 
 class MachineCreate(BaseModel):
@@ -2128,4 +2160,139 @@ def get_authorization_decision_event_causal_trace(
         events=[
             TracedEventOut(event_id=event.id, depth=depth) for event, depth in traced
         ],
+    )
+
+
+# --- read-only joint-write transaction diagnostics -------------------------
+
+
+class DiagParams(BaseModel):
+    from_: str
+    to: str
+
+
+def validate_diag_params(request: Request) -> DiagParams:
+    """Validate the diagnostics query string before any machine lookup.
+
+    Exactly two parameters are accepted: ``from`` and ``to``, both required
+    UTC RFC 3339 date-times ending in ``Z`` (fractional seconds optional;
+    offset forms, surrounding whitespace, and non-``Z`` suffixes are
+    rejected), with ``from`` not later than ``to`` (equal bounds allowed).
+    Any other parameter name is a 422 ``invalid_query``; a missing, blank,
+    malformed, or inverted bound is a 422 ``bad_time``. Both checks run
+    before the machine is looked up, so invalid parameters against a
+    non-existent machine still report 422 rather than 404.
+    """
+    allowed = {"from", "to"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    raw_from = request.query_params.get("from")
+    raw_to = request.query_params.get("to")
+
+    def _valid(value: str | None) -> bool:
+        if not value or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+            return False
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            return False
+        return True
+
+    if not _valid(raw_from) or not _valid(raw_to):
+        raise QueryError("bad_time")
+
+    if parse_utc_z_datetime(raw_from) > parse_utc_z_datetime(raw_to):
+        raise QueryError("bad_time")
+
+    return DiagParams(from_=raw_from, to=raw_to)  # type: ignore[arg-type]
+
+
+class DiagCheckOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_event_id: str | None
+
+
+class DiagRecordOut(BaseModel):
+    tid: str
+    at: str
+    phase: str
+    op: str
+    fail: str
+    flags: list[str]
+    status: str
+    event: str | None
+    count: int
+    check: DiagCheckOut
+
+
+class DiagOut(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    from_: str = Field(serialization_alias="from")
+    to: str
+    records: list[DiagRecordOut]
+    check: DiagCheckOut
+
+
+@app.get("/machines/{machine_id}/diag", response_model=DiagOut)
+def get_machine_diagnostics(
+    machine_id: str,
+    params: Annotated[DiagParams, Depends(validate_diag_params)],
+    session: SessionDep,
+):
+    """Read-only diagnostics for one machine's joint-write transaction attempts.
+
+    Returns every finalized diagnostic in the closed UTC window, ordered by
+    the actual UTC instant of ``at`` then ``tid``, plus a top-level ``check``
+    of the machine's current event hash chain. Each record carries its own
+    ``check`` snapshot in the event-integrity-audit shape. The query only
+    reads: it never writes, repairs, recomputes, or deletes a diagnostic or
+    any business record, and only the path machine's records are returned.
+    A missing machine returns ``404 not_found``.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_)
+    window_end = parse_utc_z_datetime(params.to)
+
+    rows = diagnostics.fetch_records(session, machine_id, window_start, window_end)
+    records = []
+    for row in rows:
+        mapping = row._mapping
+        records.append(
+            DiagRecordOut(
+                tid=mapping["id"],
+                at=mapping["at"],
+                phase=mapping["phase"],
+                op=mapping["op"],
+                fail=mapping["fail"],
+                flags=json.loads(mapping["flags"]),
+                status=mapping["status"],
+                event=mapping["event"],
+                count=mapping["count"],
+                check=DiagCheckOut(
+                    valid=bool(mapping["check_valid"]),
+                    checked_count=mapping["check_checked_count"],
+                    broken_event_id=mapping["check_broken_event_id"],
+                ),
+            )
+        )
+
+    valid, checked_count, broken_event_id = chain.verify_chain(session, machine_id)
+    return DiagOut(
+        id=machine_id,
+        from_=params.from_,
+        to=params.to,
+        records=records,
+        check=DiagCheckOut(
+            valid=valid,
+            checked_count=checked_count,
+            broken_event_id=broken_event_id,
+        ),
     )

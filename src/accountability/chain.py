@@ -23,18 +23,23 @@ import hashlib
 import json
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Connection, Engine, inspect, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import Connection, Engine, func, inspect, select, text
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
-from .db import AuthorizationDecisionEvent
+from . import diagnostics
+from .db import AuthorizationDecisionEvent, Machine
 
 _HASH_LEN = 64
 _MAX_LOCK_ATTEMPTS = 20
+# A ``BEGIN IMMEDIATE`` that takes longer than this visibly waited for another
+# writer's lock; the attempt records ``lock_wait`` even when SQLite's own
+# busy-timeout eventually grants the lock without an application-level retry.
+_LOCK_WAIT_MIN_SECONDS = 0.02
 
 _TABLE = AuthorizationDecisionEvent.__table__
 _CONTENT_COLUMNS = (
@@ -100,17 +105,36 @@ def migrate_schema(engine: Engine) -> None:
 
 
 @contextmanager
-def _locked_connection(engine: Engine) -> Iterator[Connection]:
+def _locked_connection(
+    engine: Engine, on_lock_acquired: Callable[[float], None] | None = None
+) -> Iterator[Connection]:
     """A connection inside a write transaction that serializes appenders.
 
     SQLite's default deferred transactions only take a write lock on first
     write, which lets two appenders read the same tail and fork the chain;
     ``BEGIN IMMEDIATE`` takes the reserved lock up front. Other databases use
     SERIALIZABLE isolation, which abides by the same guarantee.
+
+    ``on_lock_acquired``, when given, is called with the elapsed seconds the
+    ``BEGIN IMMEDIATE`` blocked before the lock was granted, so the joint
+    write runner can record a ``lock_wait`` flag for contended attempts.
     """
     if engine.dialect.name == "sqlite":
         conn = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
-        conn.execute(text("BEGIN IMMEDIATE"))
+        began = time.monotonic()
+        try:
+            conn.execute(text("BEGIN IMMEDIATE"))
+        except OperationalError as error:
+            # Even a rejected BEGIN blocked behind another writer's lock for
+            # the busy-timeout; surface the wait for the diagnostic flags.
+            try:
+                error.lock_wait_seconds = time.monotonic() - began  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            conn.close()
+            raise
+        if on_lock_acquired is not None:
+            on_lock_acquired(time.monotonic() - began)
         try:
             yield conn
             conn.execute(text("COMMIT"))
@@ -124,8 +148,11 @@ def _locked_connection(engine: Engine) -> Iterator[Connection]:
             conn.close()
     else:
         conn = engine.connect().execution_options(isolation_level="SERIALIZABLE")
+        started = time.monotonic()
         try:
             with conn.begin():
+                if on_lock_acquired is not None:
+                    on_lock_acquired(time.monotonic() - started)
                 yield conn
         finally:
             conn.close()
@@ -143,6 +170,18 @@ def _is_lock_conflict(error: OperationalError) -> bool:
 
 
 def _run_with_lock_retry(engine: Engine, work):
+    """Run ``work`` in the locked write transaction with conflict retries.
+
+    This is the internal lock primitive for writers that are *not* the
+    machine status-change / decision-event joint write (key rotations,
+    responsibility assignments, incident status transitions, and the startup
+    chain backfills). The two public joint-write entries —
+    :func:`append_decision_event` (``op = "event"``) and
+    :func:`machines.change_machine_status` (``op = "change"``) — must go
+    through :func:`run_joint_write` instead, which wraps this locking with
+    the per-attempt diagnostic. No new internal entry that changes a
+    machine's status or creates a decision event should bypass that runner.
+    """
     for attempt in range(_MAX_LOCK_ATTEMPTS):
         try:
             with _locked_connection(engine) as conn:
@@ -151,6 +190,256 @@ def _run_with_lock_retry(engine: Engine, work):
             if not _is_lock_conflict(error) or attempt == _MAX_LOCK_ATTEMPTS - 1:
                 raise
             time.sleep(min(0.01 * (attempt + 1), 0.2))
+
+
+class JointWriteOutcome(Exception):
+    """Raised inside a joint-write work callable for an early terminal result.
+
+    A status change ends this way when the machine is missing or already
+    carries the requested status (the documented 404/409 outcomes); an event
+    append uses it only for the missing machine. The locked transaction is
+    rolled back, leaving no business trace, and the attempt still records one
+    diagnostic. ``fail`` is the stable rollback category for the rejection:
+    ``race`` for the same-target status conflict (the concurrency-loser
+    outcome), ``other`` for a missing machine.
+    """
+
+    def __init__(self, result: dict[str, Any], fail: str = "other"):
+        self.result = result
+        self.fail = fail
+
+
+def _failure_category(error: BaseException) -> str:
+    """Map a joint-write exception to the stable rollback failure category.
+
+    * ``race`` — a serialization/deadlock/lock conflict between concurrent
+      writers (the lock itself was not granted or the write was aborted);
+    * ``io`` — a persistence failure reaching the database driver
+      (``OperationalError`` that is not a concurrency conflict, e.g. a
+      read-only or I/O database);
+    * ``other`` — anything else, including an application crash represented
+      by an unexpected error.
+    """
+    if isinstance(error, OperationalError):
+        return "race" if _is_lock_conflict(error) else "io"
+    return "other"
+
+
+def _pre_read(engine: Engine, machine_id: str) -> tuple[str | None, int]:
+    """Best-effort ``(current_status, event_count)`` before the attempt.
+
+    Only used to seed the durable marker; every value is re-read inside the
+    locked transaction and again at finalization, so a stale pre-read never
+    changes the terminal record.
+    """
+    try:
+        with engine.connect() as conn:
+            status = conn.execute(
+                Machine.__table__.select()
+                .where(Machine.__table__.c.id == machine_id)
+                .with_only_columns(Machine.__table__.c.status)
+            ).scalar()
+            count = conn.execute(
+                select(func.count())
+                .select_from(AuthorizationDecisionEvent.__table__)
+                .where(AuthorizationDecisionEvent.__table__.c.machine_id == machine_id)
+            ).scalar_one()
+            return status, int(count or 0)
+    except SQLAlchemyError:
+        return None, 0
+
+
+def _terminal_snapshot(
+    engine: Engine, machine_id: str
+) -> tuple[str, int, tuple[bool, int, str | None]]:
+    """Read the committed terminal ``(status, event_count, chain_check)``.
+
+    Used to finalize a marker from evidence after the business attempt
+    finished. Read-only.
+    """
+    with engine.connect() as conn:
+        status = conn.execute(
+            Machine.__table__.select()
+            .where(Machine.__table__.c.id == machine_id)
+            .with_only_columns(Machine.__table__.c.status)
+        ).scalar()
+        count = conn.execute(
+            select(func.count())
+            .select_from(AuthorizationDecisionEvent.__table__)
+            .where(AuthorizationDecisionEvent.__table__.c.machine_id == machine_id)
+        ).scalar_one()
+        check = verify_chain(conn, machine_id)
+        return status, int(count or 0), check
+
+
+def run_joint_write(
+    engine: Engine,
+    *,
+    machine_id: str,
+    op: str,
+    work: Callable[[Connection], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run one public joint-write attempt and record exactly one diagnostic.
+
+    ``op`` is ``"change"`` for a machine status change and ``"event"`` for a
+    decision-event creation. ``work`` runs inside the locked write
+    transaction and either returns the ``{"status": "ok", ...}`` result or
+    raises :class:`JointWriteOutcome` for the documented non-ok outcomes
+    (``not_found`` / ``invalid_status_transition``), which roll the business
+    transaction back.
+
+    The whole attempt — lock waits and application-level retries folded in —
+    produces one append-only diagnostic: ``started-commit`` with
+    ``fail = "none"`` on success, otherwise ``started-rollback`` with the
+    stable ``race`` / ``io`` / ``other`` category. Flags list ``lock_wait``
+    and ``retry`` in the order actually experienced. The business result is
+    returned unchanged.
+    """
+    pre_status, pre_count = _pre_read(engine, machine_id)
+    tid, marker_wait = diagnostics.insert_started(
+        engine,
+        machine_id=machine_id,
+        op=op,
+        started_at=_utc_now_iso(),
+        status=pre_status or "",
+        count=pre_count,
+    )
+
+    # The attempt's lock wait includes waiting to durably insert its own
+    # marker before the joint transaction and waiting to take the joint
+    # write lock; either is a contended lock wait.
+    flags: list[str] = []
+    if marker_wait >= _LOCK_WAIT_MIN_SECONDS:
+        flags.append("lock_wait")
+    retried = False
+    error: BaseException | None = None
+    result: dict[str, Any] | None = None
+    reject_fail = diagnostics.FAIL_OTHER
+
+    for attempt in range(_MAX_LOCK_ATTEMPTS):
+        wait_box = [0.0]
+        try:
+            with _locked_connection(
+                engine, on_lock_acquired=lambda elapsed: wait_box.__setitem__(0, elapsed)
+            ) as conn:
+                result = work(conn)
+        except JointWriteOutcome as outcome:
+            # Documented early outcome: the transaction rolled back cleanly,
+            # nothing was written, and the caller gets its 404/409 result.
+            if wait_box[0] >= _LOCK_WAIT_MIN_SECONDS and "lock_wait" not in flags:
+                flags.append("lock_wait")
+            if retried and "retry" not in flags:
+                flags.append("retry")
+            result = outcome.result
+            reject_fail = outcome.fail
+            break
+        except OperationalError as exc:
+            begin_wait = getattr(exc, "lock_wait_seconds", 0.0) or 0.0
+            if (
+                max(wait_box[0], begin_wait) >= _LOCK_WAIT_MIN_SECONDS
+                and "lock_wait" not in flags
+            ):
+                flags.append("lock_wait")
+            if not _is_lock_conflict(exc) or attempt == _MAX_LOCK_ATTEMPTS - 1:
+                error = exc
+                break
+            # The attempt lost the concurrency conflict and will be retried;
+            # lock_wait (already noted above if it occurred) precedes retry.
+            retried = True
+            if "retry" not in flags:
+                flags.append("retry")
+            time.sleep(min(0.01 * (attempt + 1), 0.2))
+            continue
+        except Exception as exc:  # noqa: BLE001 - every failure is categorized
+            error = exc
+            break
+        else:
+            if wait_box[0] >= _LOCK_WAIT_MIN_SECONDS and "lock_wait" not in flags:
+                flags.append("lock_wait")
+            if retried and "retry" not in flags:
+                flags.append("retry")
+            break
+
+    if error is None:
+        assert result is not None
+        _finalize_joint_write(
+            engine, tid, machine_id, op, result, flags, reject_fail
+        )
+        return result
+
+    fail = _failure_category(error)
+    if retried and "retry" not in flags:
+        flags.append("retry")
+    status, count, check = _terminal_snapshot(engine, machine_id)
+    diagnostics.finalize(
+        engine,
+        tid,
+        phase=diagnostics.PHASE_ROLLBACK,
+        fail=fail,
+        flags=flags,
+        status=status or "",
+        event=None,
+        count=count,
+        check=check,
+    )
+    raise error
+
+
+def _finalize_joint_write(
+    engine: Engine,
+    tid: str,
+    machine_id: str,
+    op: str,
+    result: dict[str, Any],
+    flags: list[str],
+    reject_fail: str = diagnostics.FAIL_OTHER,
+) -> None:
+    """Finalize the marker from a completed (committed or cleanly rejected)
+    business attempt.
+
+    A committed attempt carries the status, event count, and event-chain
+    check captured inside the locked transaction (``diag_*``), so the record
+    reflects the attempt's own outcome even if a concurrent writer commits
+    before finalization. A cleanly rejected attempt has no such snapshot and
+    re-reads the terminal state read-only.
+    """
+    if result.get("status") == "ok":
+        status = result.get("diag_status")
+        count = result.get("diag_count")
+        check = result.get("diag_check")
+        if status is None or count is None or check is None:
+            status, count, check = _terminal_snapshot(engine, machine_id)
+        event_id: str | None = None
+        if op == "event":
+            event_id = result["event"]["id"]
+        diagnostics.finalize(
+            engine,
+            tid,
+            phase=diagnostics.PHASE_COMMIT,
+            fail=diagnostics.FAIL_NONE,
+            flags=flags,
+            status=status,
+            event=event_id,
+            count=count,
+            check=check,
+        )
+        return
+
+    # Cleanly rejected attempt (missing machine / same-target status): the
+    # business transaction rolled back and wrote nothing. Snapshot the
+    # terminal state it left behind.
+    status, count, check = _terminal_snapshot(engine, machine_id)
+    diagnostics.finalize(
+        engine,
+        tid,
+        phase=diagnostics.PHASE_ROLLBACK,
+        fail=reject_fail,
+        flags=flags,
+        status=status or "",
+        event=None,
+        count=count,
+        check=check,
+    )
 
 
 def _load_events(conn: Connection, machine_id: str | None = None) -> list[Any]:
@@ -316,7 +605,7 @@ def _mint_tail_link(
             chain_hash=chain_hash,
         )
     )
-    return {
+    event = {
         "id": event_id,
         "machine_id": machine_id,
         "action_type": action_type,
@@ -328,6 +617,10 @@ def _mint_tail_link(
         "content_hash": content_hash,
         "chain_hash": chain_hash,
     }
+    # The new event's 1-based position in the machine's (created_at, id)
+    # chain, captured inside the locked transaction for its diagnostic.
+    position = len(rows) + 1
+    return event, position
 
 
 def append_decision_event(
@@ -353,14 +646,16 @@ def append_decision_event(
       later status change never rewrites it.
 
     Returns ``{"status": "not_found"}`` when the machine is missing (nothing
-    is written), otherwise ``{"status": "ok", "event": {...}}``.
+    is written), otherwise ``{"status": "ok", "event": {...}}``. Every
+    attempt records exactly one joint-write diagnostic via
+    :func:`run_joint_write`.
     """
     from . import authorization
 
     def _work(conn: Connection) -> dict[str, Any]:
         status = authorization.machine_status(conn, machine_id)
         if status is None:
-            return {"status": "not_found"}
+            raise JointWriteOutcome({"status": "not_found"})
         allowed, reason = authorization.decide(
             conn,
             machine_id,
@@ -368,7 +663,7 @@ def append_decision_event(
             action_type,
             resource,
         )
-        event = _mint_tail_link(
+        event, position = _mint_tail_link(
             conn,
             machine_id=machine_id,
             action_type=action_type,
@@ -376,9 +671,21 @@ def append_decision_event(
             allowed=allowed,
             reason=reason,
         )
-        return {"status": "ok", "event": event}
+        # Capture the attempt's own terminal snapshot inside the lock for
+        # its diagnostic: the status the decision used, the new event's chain
+        # position, and the chain check including the just-committed event.
+        diag_check = verify_chain(conn, machine_id)
+        return {
+            "status": "ok",
+            "event": event,
+            "diag_status": status,
+            "diag_count": position,
+            "diag_check": diag_check,
+        }
 
-    return _run_with_lock_retry(engine, _work)
+    return run_joint_write(
+        engine, machine_id=machine_id, op="event", work=_work
+    )
 
 
 def verify_chain(session, machine_id: str) -> tuple[bool, int, str | None]:
