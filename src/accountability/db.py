@@ -253,3 +253,54 @@ class AuthorizationDecisionCausalLink(Base):
         index=True,
     )
     created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class WriteTransactionDiagnostic(Base):
+    """One read-only observability record per joint write-transaction attempt.
+
+    A row is minted for every attempt that enters the locked joint-write
+    transaction on behalf of a machine status change (``op = "change"``) or an
+    authorization decision event creation (``op = "event"``). The row and the
+    business write share one transaction, so it is visible exactly when the
+    business outcome is; a rollback writes its diagnostic in the immediate
+    follow-up transaction, so every attempt leaves exactly one intact record
+    and no attempt leaves a half-finished one.
+
+    The table stores no keys, secrets, policy text, or identity material: the
+    authorization decision is summarized only by its event id and the
+    machine's chain check at that instant.
+    """
+
+    __tablename__ = "write_transaction_diagnostics"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    # The UTC instant the attempt entered its terminal phase, stamped inside
+    # the (rolled-back, then re-inserted) transaction so records stay ordered.
+    at: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # "change" (machine status change) or "event" (decision event creation).
+    op: Mapped[str] = mapped_column(String, nullable=False)
+    # "started-commit" (a committed business write) or "started-rollback"
+    # (a business write that began and then aborted).
+    phase: Mapped[str] = mapped_column(String, nullable=False)
+    # "none" for committed attempts; otherwise the stable failure category:
+    # "race" (concurrency conflict / same target), "io" (persistence fault),
+    # or "other" (any other failure or a crash rollback).
+    fail: Mapped[str] = mapped_column(String, nullable=False)
+    # Comma-joined ordered list of actually experienced conditions, empty for
+    # none: "lock_wait" then "retry". Stored ordered and canonical so the
+    # value needs no normalization on read.
+    flags: Mapped[str] = mapped_column(String, nullable=False, default="")
+    # "committed" or "rolled_back": the terminal state of the attempt.
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    # For an event attempt, the created event id (null on a rollback and null
+    # for every status-change attempt).
+    event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # The machine's total authorization decision event count as of the
+    # attempt's terminal instant (inside the same transaction snapshot).
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The machine's event integrity-chain verdict as of that instant.
+    chain_valid: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    broken_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)

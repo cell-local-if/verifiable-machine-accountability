@@ -354,13 +354,17 @@ def append_decision_event(
 
     Returns ``{"status": "not_found"}`` when the machine is missing (nothing
     is written), otherwise ``{"status": "ok", "event": {...}}``.
+
+    Every attempt that enters this joint write leaves one diagnostic row via
+    the instrumented joint-write runner; the write semantics above are
+    unchanged.
     """
-    from . import authorization
+    from . import authorization, joint
 
     def _work(conn: Connection) -> dict[str, Any]:
         status = authorization.machine_status(conn, machine_id)
         if status is None:
-            return {"status": "not_found"}
+            raise joint.NotFound
         allowed, reason = authorization.decide(
             conn,
             machine_id,
@@ -378,7 +382,7 @@ def append_decision_event(
         )
         return {"status": "ok", "event": event}
 
-    return _run_with_lock_retry(engine, _work)
+    return joint.run_joint_write(engine, machine_id=machine_id, op="event", work=_work)
 
 
 def verify_chain(session, machine_id: str) -> tuple[bool, int, str | None]:

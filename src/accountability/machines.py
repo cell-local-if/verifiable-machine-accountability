@@ -13,8 +13,9 @@ from typing import Any
 
 from sqlalchemy import Connection, Engine
 
-from .chain import _run_with_lock_retry, _utc_now_iso
+from .chain import _utc_now_iso
 from .db import Machine
+from . import joint
 
 _MACHINE_TABLE = Machine.__table__
 
@@ -41,9 +42,12 @@ def change_machine_status(
     The lookup, same-status check, and update happen in one locked
     transaction. Returns a status dict:
 
-    * ``not_found`` — the machine does not exist (nothing is written);
+    * ``not_found`` — the machine does not exist (nothing is written and no
+      diagnostic is produced);
     * ``invalid_status_transition`` — the machine already has ``to_status``
-      (nothing is written);
+      (the joint write begins and then rolls back as a concurrency conflict,
+      leaving one ``started-rollback``/``race`` diagnostic and no business
+      change);
     * ``ok`` — with the full updated ``machine`` record. Only ``status`` and
       ``updated_at`` change; ``version``, ``public_key``, and ``created_at``
       keep their stored values.
@@ -54,10 +58,15 @@ def change_machine_status(
             _MACHINE_TABLE.select().where(_MACHINE_TABLE.c.id == machine_id)
         ).first()
         if machine_row is None:
-            return {"status": "not_found"}
+            raise joint.NotFound
         current_status = machine_row._mapping["status"]
         if current_status == to_status:
-            return {"status": "invalid_status_transition"}
+            # Two writers targeting the same transition conflict: only one can
+            # win. This one began a joint write and must abort cleanly, so it
+            # rolls back (writing nothing) under the stable "race" category.
+            raise joint.JointRollback(
+                "race", {"status": "invalid_status_transition"}
+            )
 
         now = _utc_now_iso()
         # The status predicate is an optimistic guard in addition to the write
@@ -77,8 +86,10 @@ def change_machine_status(
                 _MACHINE_TABLE.select().where(_MACHINE_TABLE.c.id == machine_id)
             ).first()
             if current is None:
-                return {"status": "not_found"}
-            return {"status": "invalid_status_transition"}
+                raise joint.NotFound
+            raise joint.JointRollback(
+                "race", {"status": "invalid_status_transition"}
+            )
 
         updated_row = conn.execute(
             _MACHINE_TABLE.select().where(_MACHINE_TABLE.c.id == machine_id)
@@ -88,4 +99,6 @@ def change_machine_status(
             "machine": {key: updated_row._mapping[key] for key in _MACHINE_FIELDS},
         }
 
-    return _run_with_lock_retry(engine, _work)
+    return joint.run_joint_write(
+        engine, machine_id=machine_id, op="change", work=_work
+    )

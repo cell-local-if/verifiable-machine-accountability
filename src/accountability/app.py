@@ -28,6 +28,7 @@ from .db import (
     KeyRotationEvent,
     Machine,
     PolicyRule,
+    WriteTransactionDiagnostic,
 )
 
 DEFAULT_DATABASE_URL = "sqlite:///./accountability.db"
@@ -2129,3 +2130,160 @@ def get_authorization_decision_event_causal_trace(
             TracedEventOut(event_id=event.id, depth=depth) for event, depth in traced
         ],
     )
+
+
+# --- read-only joint write-transaction diagnostics -------------------------
+
+
+# The only accepted query parameters for the diagnostic view. ``from`` and
+# ``to`` bound a closed UTC interval on each record's ``at`` instant; any
+# other parameter is rejected as ``invalid_query``.
+_DIAG_ALLOWED_QUERY = {"from", "to"}
+
+
+class DiagWindow(BaseModel):
+    start: datetime
+    end: datetime
+    from_raw: str
+    to_raw: str
+
+
+def validate_diag_window(request: Request) -> DiagWindow:
+    """Validate the ``GET .../diag`` query string before any machine lookup.
+
+    Every failure here is a ``422 {"error":{"code": ...}}``:
+
+    * ``invalid_query`` — an unknown query parameter is present;
+    * ``bad_time`` — ``from``/``to`` is missing, blank/whitespace, not a UTC
+      RFC 3339 date-time ending in ``Z`` (offset forms rejected), has
+      out-of-range calendar values, or has ``from`` later than ``to``.
+
+    Validation runs before the machine is looked up, so an invalid window
+    against a non-existent machine still reports 422 rather than 404.
+    """
+    items = request.query_params.multi_items()
+    if any(name not in _DIAG_ALLOWED_QUERY for name, _ in items):
+        raise _DiagError("invalid_query")
+    # A repeated from/to is not a valid single window either.
+    names = [name for name, _ in items]
+    if len(names) != len(set(names)):
+        raise _DiagError("invalid_query")
+
+    raw = dict(items)
+    from_raw = raw.get("from")
+    to_raw = raw.get("to")
+
+    parsed: dict[str, datetime] = {}
+    for field_name, value in (("from", from_raw), ("to", to_raw)):
+        if value is None or not value.strip() or not _RFC3339_Z_DATETIME_RE.fullmatch(
+            value
+        ):
+            raise _DiagError("bad_time")
+        try:
+            parsed[field_name] = parse_utc_z_datetime(value)
+        except ValueError:
+            # Regex passed but the calendar/time values are out of range.
+            raise _DiagError("bad_time") from None
+
+    if parsed["from"] > parsed["to"]:
+        raise _DiagError("bad_time")
+
+    return DiagWindow(
+        start=parsed["from"],
+        end=parsed["to"],
+        from_raw=from_raw,  # type: ignore[arg-type]
+        to_raw=to_raw,  # type: ignore[arg-type]
+    )
+
+
+class _DiagError(Exception):
+    """A diagnostic-query validation failure carrying its error code."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+@app.exception_handler(_DiagError)
+def _diag_error_handler(request: Request, exc: _DiagError) -> JSONResponse:
+    return error_response(422, exc.code)
+
+
+def _diag_check(valid: bool, count: int, broken: str | None) -> dict[str, object]:
+    """The integrity-audit result shape shared by records and the top level."""
+    return {
+        "valid": valid,
+        "checked_count": count,
+        "broken_event_id": broken,
+    }
+
+
+@app.get("/machines/{machine_id}/diag")
+def get_machine_joint_write_diagnostics(
+    machine_id: str,
+    request: Request,
+    session: SessionDep,
+):
+    """Read-only joint write-transaction diagnostics for one machine.
+
+    Every attempt that entered the locked joint write for a status change
+    (``op`` ``change``) or an authorization decision event creation
+    (``op`` ``event``) leaves one record. ``from`` and ``to`` bound a closed
+    UTC interval on each record's ``at`` instant. The query is strictly
+    read-only — it never writes, repairs, recomputes, or deletes anything —
+    and only the path machine's records are returned, ordered by ``at`` then
+    ``id``. A missing machine returns ``404 not_found``.
+    """
+    # Validate the window (and reject unknown parameters) before any lookup.
+    window = validate_diag_window(request)
+
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    rows = session.scalars(
+        select(WriteTransactionDiagnostic).where(
+            WriteTransactionDiagnostic.machine_id == machine_id
+        )
+    ).all()
+
+    in_window = [
+        row
+        for row in rows
+        if window.start <= parse_utc_z_datetime(row.at) <= window.end
+    ]
+    # Order by the actual UTC instant of ``at`` (ISO text is not chronological
+    # across the fractional-second boundary), then by id for a fixed order.
+    ordered = sorted(
+        in_window, key=lambda row: (parse_utc_z_datetime(row.at), row.id)
+    )
+
+    records = [
+        {
+            "tid": row.id,
+            "at": row.at,
+            "phase": row.phase,
+            "op": row.op,
+            "fail": row.fail,
+            "flags": [flag for flag in row.flags.split(",") if flag],
+            "status": row.status,
+            "event": row.event_id,
+            "count": row.event_count,
+            "check": _diag_check(
+                row.chain_valid, row.event_count, row.broken_event_id
+            ),
+        }
+        for row in ordered
+    ]
+
+    # The full-machine current event-integrity verdict, independent of the
+    # requested window; reuses the existing audit result shape.
+    valid, checked_count, broken_event_id = chain.verify_chain(session, machine_id)
+
+    return {
+        "id": machine_id,
+        "from": window.from_raw,
+        "to": window.to_raw,
+        "records": records,
+        "check": _diag_check(valid, checked_count, broken_event_id),
+    }
