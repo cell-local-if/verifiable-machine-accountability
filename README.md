@@ -595,3 +595,49 @@ byte-identical output for identical data and parameters on repeat calls, and
 reads records persisted across application restarts. `GET /health`, machine
 start/stop, authorization evaluation, the event chain, the existing exports,
 and the diagnostics error semantics are unchanged.
+
+## Read-only machine-level integrity summary
+
+`GET /machines/{machine_id}/integrity-summary` returns a single read-only
+rollup of one machine's four integrity audits. The caller submits only the
+machine id in the path; the endpoint accepts no query parameters, and any
+extra parameter returns `422 {"error":{"code":"invalid_query"}}` before the
+machine is looked up, so an invalid query against a non-existent machine is
+still `422`. A missing machine returns
+`404 {"error":{"code":"not_found"}}` with no summary data. Only `GET` is
+accepted; other methods return `405`.
+
+Success returns `200` with `{machine_id, valid, events, key_rotations,
+evidence, incidents}`. Each block reuses the existing single-audit result
+shape — `valid`, `checked_count` (total records examined), and the first
+anomaly id (`null` when none), in each audit's stable order:
+
+- `events` — the authorization decision event chain audit, as
+  `{valid, checked_count, broken_event_id}`: each event's content hash,
+  previous-event link, and chain hash must be self-consistent.
+- `key_rotations` — the key rotation chain audit, as
+  `{valid, checked_count, broken_rotation_id}`: each rotation record's raw
+  fields, previous-rotation link, and chain hash must be self-consistent.
+- `evidence` — the evidence audit, as
+  `{valid, checked_count, broken_evidence_id}`: event ownership by the path
+  machine, a non-blank evidence type, and the exact 64-character lowercase
+  hexadecimal fingerprint format, compared as stored with no rewriting of a
+  damaged record.
+- `incidents` — the exception-closure audit, as
+  `{valid, checked_count, broken_incident_id}`: event ownership, the status
+  lifecycle history matching the current status, and responsibility
+  attribution closure; the first failing incident's id is retained.
+
+The top-level `valid` is true only when all four blocks pass; the first
+anomaly found in any block makes it false. A machine with no records still
+returns the complete response: all four blocks report `checked_count` 0,
+`valid` true, and a `null` anomaly id. Only records under the path machine's
+name are counted and checked, so damaged records owned by another machine
+never affect the result. The query is strictly read-only — it never creates,
+updates, deletes, repairs, recomputes, or normalizes a machine or any
+accountability record — gives identical results on repeat calls against
+unchanged data, and audits data persisted across application restarts. The
+response exposes only the existing integrity conclusions and audit record
+ids: no privacy fields, policy text, or key material. `GET /health`, machine
+start/stop, authorization evaluation, the event chain, incident handling, and
+the existing compliance exports are unchanged.

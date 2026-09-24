@@ -2543,3 +2543,104 @@ def export_machine_accountability(
             responsibility_assignment_to_out(record) for record in assignments
         ],
     )
+
+
+# --- read-only machine-level integrity summary ------------------------------
+
+
+def validate_no_query_params(request: Request) -> None:
+    """Reject every query parameter before the machine is ever looked up.
+
+    The integrity summary accepts only the machine id from the path, so any
+    query string is a 422 ``invalid_query``. The check issues no database
+    access and runs as a route dependency, so an invalid query against a
+    non-existent machine still reports 422 rather than 404.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+class IntegritySummaryOut(BaseModel):
+    machine_id: str
+    valid: bool
+    events: IntegrityOut
+    key_rotations: KeyRotationIntegrityOut
+    evidence: EvidenceIntegrityOut
+    incidents: IncidentIntegrityOut
+
+
+@app.get("/machines/{machine_id}/integrity-summary", response_model=IntegritySummaryOut)
+def get_machine_integrity_summary(
+    machine_id: str,
+    session: SessionDep,
+    _: Annotated[None, Depends(validate_no_query_params)] = None,
+):
+    """Read-only, machine-level rollup of the four integrity audits.
+
+    Runs the existing per-machine audits in their stable orders and returns
+    each block in that audit's existing single-item shape:
+
+    - ``events`` — the authorization decision event hash chain
+      (``{valid, checked_count, broken_event_id}``);
+    - ``key_rotations`` — the key rotation hash chain
+      (``{valid, checked_count, broken_rotation_id}``);
+    - ``evidence`` — evidence event ownership, type, and raw fingerprint
+      format (``{valid, checked_count, broken_evidence_id}``);
+    - ``incidents`` — incident event ownership, lifecycle history, and
+      responsibility closure (``{valid, checked_count, broken_incident_id}``).
+
+    Top-level ``valid`` is true only when all four blocks pass; any block's
+    first anomaly makes it false. An empty machine still returns the complete
+    response with every block reporting zero records, valid, and no broken id.
+    Only records owned by the path machine are examined, so damage under
+    another machine can never change the result. The endpoint only issues
+    reads — it never creates, updates, deletes, repairs, recomputes, or
+    normalizes a machine or any accountability record — gives identical
+    results on repeat calls against unchanged data, and audits data persisted
+    across application restarts. It takes no query parameters (any parameter
+    is a 422 ``invalid_query`` before the machine lookup), a missing machine
+    is a 404 ``not_found`` with no summary data, and only ``GET`` is accepted
+    (other methods yield 405).
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    events_valid, events_count, broken_event_id = chain.verify_chain(
+        session, machine_id
+    )
+    rotations_valid, rotations_count, broken_rotation_id = (
+        rotation_chain.verify_chain(session, machine_id)
+    )
+    evidence_count, broken_evidence_id = find_broken_evidence(session, machine_id)
+    incidents_count, broken_incident_id = find_broken_incident(session, machine_id)
+
+    return IntegritySummaryOut(
+        machine_id=machine_id,
+        valid=(
+            events_valid
+            and rotations_valid
+            and broken_evidence_id is None
+            and broken_incident_id is None
+        ),
+        events=IntegrityOut(
+            valid=events_valid,
+            checked_count=events_count,
+            broken_event_id=broken_event_id,
+        ),
+        key_rotations=KeyRotationIntegrityOut(
+            valid=rotations_valid,
+            checked_count=rotations_count,
+            broken_rotation_id=broken_rotation_id,
+        ),
+        evidence=EvidenceIntegrityOut(
+            valid=broken_evidence_id is None,
+            checked_count=evidence_count,
+            broken_evidence_id=broken_evidence_id,
+        ),
+        incidents=IncidentIntegrityOut(
+            valid=broken_incident_id is None,
+            checked_count=incidents_count,
+            broken_incident_id=broken_incident_id,
+        ),
+    )
