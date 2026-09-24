@@ -651,6 +651,89 @@ and empty databases need no migration. The existing create queries, hash
 chains, diagnostics terminal state, integrity summary, and other compliance
 exports are unchanged.
 
+## Machine-level privacy access registration and read-only query
+
+Two machine-scoped entries provide a machine-level audit of privacy data
+access: `privacy-accesses` registration and its `compliance-export` query. They
+follow the existing machine event paths and never change the desensitized
+responsibility export (its response, digest, and filtering semantics are
+unchanged), `GET /health`, the hash chains, diagnostics, or the other
+compliance exports.
+
+### Registering an access
+
+`POST /machines/{machine_id}/privacy-accesses` registers one privacy data
+access. The body must be a JSON object carrying exactly:
+
+- `accessed_at` — when the access happened, a UTC RFC 3339 date-time ending in
+  `Z`;
+- `window_start`, `window_end` — the desensitized export window actually used,
+  both UTC RFC 3339 date-times ending in `Z`; `window_start` must not be later
+  than `window_end` (equal bounds are allowed);
+- `result` — exactly the string `success` or `failed`;
+- `matches_count` — a non-negative integer number of records hit; a `failed`
+  access returns no data and must carry `0`.
+
+Fractional seconds are optional; offset forms such as `+00:00`, surrounding
+whitespace, a missing suffix, and out-of-range calendar/time values are
+rejected. A missing field, a non-object body, an illegal time, window, result,
+or hit count returns `422`. Body validation runs before any path lookup, so the
+same malformed payload against a non-existent machine is still `422` and leaves
+no record. Responsible-party rawtext and key material are not fields: they are
+never stored or echoed.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}` and writes nothing. Success returns `201`
+with `{id, machine_id, accessed_at, window_start, window_end, result,
+matches_count}`: a fresh UUID `id`, the path machine id, the access time and
+window echoed exactly as submitted, the result, and the hit count. A repeat
+registration with the same `(accessed_at, window_start, window_end, result)`
+for the same machine returns `409 {"error":{"code":"duplicate_access"}}` and
+writes nothing — the hit count is not part of the access identity, so even a
+different count is a duplicate; a different access time, window, or result is a
+distinct record. The path accepts `POST` only; other methods return `405`.
+
+### Querying accesses
+
+`GET /machines/{machine_id}/privacy-accesses/compliance-export` returns a
+deterministic, read-only slice of the machine's registered accesses. It
+submits only the machine id and a closed window over access time; validation
+completes before the machine or any access record is read:
+
+- `from_accessed_at`, `to_accessed_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); `from_accessed_at` must not be later than `to_accessed_at` (equal
+  bounds are allowed). A missing, blank, offset, malformed, or inverted bound
+  returns `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`.
+- The path accepts `GET` only; other methods return `405`.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}` with no access data.
+
+The response is `{machine_id, from_accessed_at, to_accessed_at,
+privacy_accesses}`; the bounds are echoed verbatim and `privacy_accesses` is
+always present, an empty array when the window contains nothing. The array
+contains only records whose stored `machine_id` is the path machine and whose
+own `accessed_at` falls inside the closed interval
+`[from_accessed_at, to_accessed_at]` — membership follows the access time, not
+the recorded `window_start`/`window_end`. Records are ordered by the actual UTC
+instant of `accessed_at` and then by record id ascending, so an exact-second
+record sorts before any fractional-second record of the same second. Each item
+exposes exactly `{id, machine_id, accessed_at, window_start, window_end,
+result, matches_count}` — never a responsible party or key rawtext.
+
+Records live in their own append-only table, are strictly isolated by machine
+(another machine's records can never enter a result), and are registered
+automatically as a table on startup, so an empty database is fully usable and
+records persist across application restarts. The query is strictly read-only:
+it never creates, updates, deletes, repairs, or normalizes a record, gives
+identical results on repeat calls against unchanged data, and reads records
+persisted across restarts.
+
+
 ## Read-only machine-level integrity summary
 
 `GET /machines/{machine_id}/integrity-summary` returns a deterministic,
