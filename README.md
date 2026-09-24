@@ -552,3 +552,50 @@ byte-identical output for identical data and parameters on repeat calls, and
 reads records persisted across application restarts. `GET /health`, machine
 start/stop, authorization evaluation, the event chain, the existing exports,
 and the diagnostics error semantics are unchanged.
+
+## Read-only machine-level causal-link compliance export
+
+`GET /machines/{machine_id}/causal-links/compliance-export` returns a
+deterministic, read-only, machine-level compliance slice of the machine's
+causal links, windowed by the links' own creation time. Both query parameters
+are required and validated before the machine is looked up, so a missing,
+malformed, or inverted parameter returns `422` even when the machine does not
+exist, and an invalid query never reads machine data:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); `from_created_at` must not be later than `to_created_at` (equal
+  bounds are allowed). A missing, blank, malformed, or inverted bound returns
+  `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`.
+- The subpath accepts `GET` only; other methods return `405`.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}`.
+
+The response is `{machine_id, from_created_at, to_created_at, causal_links}`
+— the bounds are echoed verbatim and `causal_links` is always present, an
+empty array when the window contains nothing (including a machine with no
+links or an empty database). `causal_links` contains only links whose stored
+`machine_id` is the path machine and whose own `created_at` falls inside the
+closed interval `[from_created_at, to_created_at]`; the timestamps of the
+events the links point at are irrelevant. Each item has exactly
+`{id, machine_id, cause_event_id, effect_event_id, created_at}` as stored,
+ordered by the actual UTC instant of `created_at` and then by record id, so an
+exact-second link sorts before any fractional-second link of the same second
+(ISO text alone is not chronological across that boundary).
+
+Links are exported exactly as stored: when the cause or effect event is
+missing, belongs to another machine, is duplicated, or the row is otherwise
+damaged, the link is still included verbatim — integrity failures never
+filter, rewrite, repair, recompute, or normalize it. Ownership follows the
+stored `machine_id` alone, so another machine's links never enter the result.
+The endpoint issues no writes, repairs, deletions, recomputations, or
+normalizations, produces identical output for identical data and parameters
+on repeat calls, and reads links persisted across application restarts;
+existing databases need no migration. The event-window export's
+both-endpoints-in-the-event-set rule, the closed-loop export's five fixed
+arrays, causal-link creation, cycle detection, trace traversal, and integrity
+repair are all unchanged.

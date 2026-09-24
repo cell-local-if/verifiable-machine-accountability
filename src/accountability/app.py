@@ -2472,3 +2472,68 @@ def export_machine_accountability(
             responsibility_assignment_to_out(record) for record in assignments
         ],
     )
+
+
+# --- read-only machine-level causal-link compliance export ------------------
+
+
+class CausalLinkComplianceExportOut(BaseModel):
+    machine_id: str
+    from_created_at: str
+    to_created_at: str
+    causal_links: list[CausalLinkOut]
+
+
+@app.get(
+    "/machines/{machine_id}/causal-links/compliance-export",
+    response_model=CausalLinkComplianceExportOut,
+)
+def export_causal_links_compliance(
+    machine_id: str,
+    params: Annotated[
+        ComplianceExportParams, Depends(validate_accountability_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only, machine-level causal-link compliance slice over a window.
+
+    The window bounds the links' own ``created_at`` (not the events they point
+    at): ``causal_links`` contains only links whose stored ``machine_id`` is
+    the path machine and whose own ``created_at`` falls inside the closed
+    interval ``[from_created_at, to_created_at]``, ordered by the actual UTC
+    instant of ``created_at`` and then by id (an exact-second link sorts before
+    a fractional-second link of the same second). Each item has exactly the
+    fields of the causal-link list endpoint, and the array is present (empty)
+    even when the window contains nothing or the machine has no links.
+
+    Links are exported exactly as stored: a missing, foreign, duplicate, or
+    otherwise damaged cause or effect event reference never causes a link to be
+    rewritten, filtered out, or repaired, and event membership in any event
+    window is irrelevant. Only the stored ``machine_id`` decides ownership, so
+    another machine's links can never appear. The query issues no writes,
+    repairs, deletions, recomputations, or normalizations, produces
+    byte-identical output for identical data and parameters on repeat calls,
+    and reads links persisted across application restarts; an empty database
+    exports an empty array and no migration is involved.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    links = _machine_rows_in_window(
+        session,
+        AuthorizationDecisionCausalLink,
+        machine_id,
+        window_start,
+        window_end,
+    )
+
+    return CausalLinkComplianceExportOut(
+        machine_id=machine_id,
+        from_created_at=params.from_created_at,
+        to_created_at=params.to_created_at,
+        causal_links=[causal_link_to_out(link) for link in links],
+    )
