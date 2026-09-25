@@ -35,6 +35,7 @@ from . import (
     evidence_chain,
     incidents,
     machines,
+    policy_preview,
     policy_rule_chain,
     privacy_chain,
     rotation_chain,
@@ -1074,6 +1075,78 @@ def check_policy_rule_integrity(
         checked_count=checked_count,
         broken_policy_rule_id=broken_policy_rule_id,
     )
+
+
+@app.post("/policy-rules/decision-preview")
+async def preview_policy_rule_decision(request: Request):
+    """Read-only preview of the global policy decision for one request.
+
+    The body is a JSON object carrying exactly two string fields, ``action``
+    and ``resource``; both stay non-empty after surrounding whitespace is
+    stripped. Validation runs entirely before any rule is read:
+
+    - any query parameter is ``422 invalid_query`` first of all;
+    - a body that is not a JSON object, that lacks or adds a field, or that
+      types either field wrongly is ``422 invalid_request``;
+    - an action or resource empty after trimming is ``422 invalid_value``.
+
+    Every malformed request is rejected identically against an empty rule
+    table, and non-POST methods return ``405`` without reading rules. The
+    preview reads global policy rules only — never machine declarations,
+    machine status, or authorization events — and issues no writes.
+
+    Every stored rule is retained in ``rules`` and annotated ``invalid``
+    (an illegal stored field), ``unmatched``, ``winner``, ``overridden`` (a
+    larger-priority matching candidate), or ``conflict`` (a same-minimum
+    mixed allow/deny tier, which is decided as a denial). Rules sort by
+    priority, then the actual UTC instant of ``created_at`` (damaged stamps
+    last), then id. ``conflicts`` reports the mixed minimum tier as id-sorted
+    pairs; ``winners`` lists the decisive rules ordered by
+    ``(created_at instant, id)`` and is empty on a conflict. With no legal
+    candidate the decision is ``{"allowed": false,
+    "reason": "no_matching_policy"}`` and both groups are empty. A failure
+    that prevents reading the rules returns ``500 internal_error`` with no
+    partial preview. The body is compact UTF-8 JSON with one trailing newline.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_request")
+    if not isinstance(payload, dict) or set(payload) != {"action", "resource"}:
+        return error_response(422, "invalid_request")
+    action_raw, resource_raw = payload["action"], payload["resource"]
+    if isinstance(action_raw, bool) or not isinstance(action_raw, str):
+        return error_response(422, "invalid_request")
+    if isinstance(resource_raw, bool) or not isinstance(resource_raw, str):
+        return error_response(422, "invalid_request")
+
+    action = action_raw.strip()
+    resource = resource_raw.strip()
+    if not action or not resource:
+        # Empty-after-trim is a value-domain failure, reported without ever
+        # reading the rule table.
+        return error_response(422, "invalid_value")
+
+    try:
+        with Session(request.app.state.engine) as session:
+            stored_rules = policy_preview.load_rules(session)
+            result = policy_preview.build_preview(action, resource, stored_rules)
+    except Exception:
+        # Never emit a partial preview when the rules cannot be read.
+        return error_response(500, "internal_error")
+
+    # Serialize by hand so the body is compact UTF-8 JSON in a fixed field
+    # order, terminated by a single newline, and free of floating-point or
+    # non-finite values (allow_nan=False).
+    body = (
+        json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 class KeyRotationComplianceExportOut(BaseModel):

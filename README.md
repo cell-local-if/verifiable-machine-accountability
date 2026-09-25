@@ -596,6 +596,68 @@ listing and compliance export keep returning only their existing fields, and
 neither the chain fields nor the verification queries participate in
 authorization evaluation.
 
+## Read-only global policy rule decision preview
+
+`POST /policy-rules/decision-preview` previews which global policy rules
+would decide a hypothetical `(action, resource)` request, without consulting
+machine status, behavior declarations, or authorization decision events and
+without writing anything. The body is a JSON object carrying exactly two
+string fields, `action` and `resource`; both must stay non-empty after
+surrounding whitespace is stripped. Validation runs entirely before any rule
+is read, so an illegal request is rejected identically against an empty rule
+table:
+
+- any query parameter is `422 {"error":{"code":"invalid_query"}}`, checked
+  before the body is even parsed;
+- a body that is not a JSON object, that is missing a field, that carries an
+  extra field, or that types either field wrongly is
+  `422 {"error":{"code":"invalid_request"}}`;
+- an `action` or `resource` that is empty after trimming is
+  `422 {"error":{"code":"invalid_value"}}`.
+
+The path accepts `POST` only; other methods return `405` without reading
+rules. A failure that prevents reading the rules returns
+`500 {"error":{"code":"internal_error"}}` with no partial preview.
+
+On success the response is `{action, resource, rules, conflicts, winners,
+decision}` — every group is always present. `action` and `resource` echo the
+trimmed request values. `rules` retains every stored rule verbatim (the seven
+visible fields, never normalized or repaired) and appends a `relation`
+annotation:
+
+- `invalid` — a stored field is missing or of an illegal shape/value (a
+  missing or mistyped field, a boolean or negative priority, an effect other
+  than `allow`/`deny`); illegal fields never participate in the decision;
+- `unmatched` — a valid rule whose action differs or whose resource pattern
+  does not match the requested resource (the usual `*`-wildcard,
+  literal-otherwise semantics);
+- `winner` — one of the decisive minimum-priority matching candidates;
+- `overridden` — a valid matching candidate at a larger numeric priority than
+  the decisive minimum;
+- `conflict` — a decisive minimum-priority candidate when the minimum tier
+  mixes allows and denies; the mixed tier is decided as a denial.
+
+Details are ordered by priority ascending, then by the actual UTC instant of
+`created_at` and then by id (an exact-second stamp sorts before a fractional
+stamp of the same second; a damaged stamp sorts after every parseable one).
+When the minimum tier mixes allows and denies, `conflicts` reports that tier
+as all unordered id pairs (each pair id-ascending, the list ordered by first
+then second id) and `winners` is empty; otherwise `conflicts` is empty and
+`winners` lists the decisive rules as `{id, effect, priority, created_at}`
+ordered by `(created_at instant, id)`. `decision` is `{allowed, reason}`:
+`allowed_by_policy` when the minimum tier is all allows, `denied_by_policy`
+when it contains any deny (including a mixed tier), and
+`{"allowed": false, "reason": "no_matching_policy"}` with empty `winners` and
+`conflicts` when no legal candidate matches.
+
+The preview is strictly read-only: it never creates, updates, deletes,
+repairs, recomputes, or normalizes a rule, and the body is compact UTF-8 JSON
+terminated by a single newline, byte-identical on repeat calls against
+unchanged data, including rules persisted across application restarts. Policy
+creation, the rule listing, the window export, authorization evaluation, the
+machine interfaces, the event chain, and the existing compliance exports are
+unchanged.
+
 ## Read-only compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/compliance-export`
