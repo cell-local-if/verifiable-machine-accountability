@@ -94,6 +94,44 @@ append either commit together or leave no trace. Body validation (`422`) and
 the missing-machine/path-resource (`404 not_found`) outcomes are unchanged by
 this serialization and never flip error types under a status race.
 
+## Machine status transition history
+
+Every accepted status change appends one immutable record to the machine's
+status history inside the same locked write transaction as the status update
+itself, so the machine's new `status`/`updated_at` and its history entry
+commit together or not at all — a failed or rejected change leaves no record,
+and concurrent same-target requests (at most one success) leave exactly one
+record from the winner. History rows are append-only: they are never updated,
+deleted, recomputed, or rewritten, and they persist across application
+restarts. Existing databases gain the history table automatically on startup
+without any change to already-stored records, and an empty database is fully
+usable.
+
+`GET /machines/{machine_id}/status-history` returns the machine's history as
+a JSON array (`[]` for a machine that has never changed status). The caller
+submits only the path machine id — the query accepts no business filter or
+other parameters, and any query parameter returns
+`422 {"error":{"code":"invalid_query"}}` before the machine is looked up. A
+missing machine returns `404 {"error":{"code":"not_found"}}` with no history
+data. The path accepts `GET` only; other methods return `405` without reading
+records, computing a result, or writing anything.
+
+Each array item carries exactly `{id, machine_id, from_status, to_status,
+created_at}` in this key order: a fresh UUID `id`, the owning machine id, the
+before/after statuses, and `created_at` — the commit time of the status
+change as a UTC RFC 3339 date-time ending in `Z`. Items are ordered by the
+actual UTC instant of `created_at` and then by record id ascending, so an
+exact-second record sorts before any fractional-second record of the same
+second. History is strictly isolated by machine: another machine's records
+can never enter the result. The query is strictly read-only — it never
+creates, updates, deletes, repairs, or normalizes status, history, or any
+other accountability record — and the response body is compact UTF-8 JSON
+terminated by a single newline, free of any floating-point or non-finite
+value, and byte-identical on repeat calls against unchanged data. The
+joint-write diagnostics (`GET /machines/{machine_id}/diag`) are observability
+only and are never a source for this history; their `change` records and
+error classification are unchanged.
+
 ## Read-only joint-write transaction diagnostics
 
 `GET /machines/{machine_id}/diag` exposes read-only observability over the

@@ -48,6 +48,7 @@ from .db import (
     IncidentStatusEvent,
     KeyRotationEvent,
     Machine,
+    MachineStatusEvent,
     PolicyRule,
     PrivacyAccess,
 )
@@ -296,6 +297,79 @@ def update_machine_status(
     if result["status"] == "invalid_status_transition":
         return error_response(409, "invalid_status_transition")
     return MachineOut(**result["machine"])
+
+
+def validate_machine_status_history_params(request: Request) -> None:
+    """Validate the machine status-history query string before any lookup.
+
+    The history query is keyed on the path machine alone and accepts no query
+    parameters; any parameter name is a 422 ``invalid_query``. The check runs
+    before the machine is looked up and issues no database access, so an extra
+    parameter against a non-existent machine still reports 422 rather than 404.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/status-history")
+def list_machine_status_history(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_machine_status_history_params)],
+    session: SessionDep,
+):
+    """Read-only, immutable history of one machine's status transitions.
+
+    The caller submits only the path machine id — no business filter or other
+    query parameter; any parameter is a 422 ``invalid_query`` raised before
+    the machine is ever looked up. A missing machine is a 404 ``not_found``
+    carrying no history. Only ``GET`` is routed; other methods return 405
+    without reading records, computing a result, or writing anything.
+
+    On success the response is a JSON array of the machine's transition
+    records — ``[]`` for a machine that has never changed status — ordered by
+    the actual UTC instant of ``created_at`` and then by record id ascending
+    (an exact-second record sorts before any fractional-second record of the
+    same second). Each item carries exactly ``{id, machine_id, from_status,
+    to_status, created_at}`` in this fixed key order, with ``created_at`` the
+    commit time of the status change as a UTC RFC 3339 date-time ending in
+    ``Z``. History is strictly isolated by machine: another machine's records
+    can never enter the result, and committed records are never recomputed or
+    rewritten. The query only issues reads — it never creates, updates,
+    deletes, repairs, or normalizes status, history, or any other
+    accountability record — and the body is compact UTF-8 JSON terminated by a
+    single newline, free of any floating-point or non-finite value,
+    byte-identical on repeat calls against unchanged data, including data
+    persisted across application restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    records = session.scalars(
+        select(MachineStatusEvent).where(
+            MachineStatusEvent.machine_id == machine_id
+        )
+    ).all()
+    payload = [
+        {
+            "id": record.id,
+            "machine_id": record.machine_id,
+            "from_status": record.from_status,
+            "to_status": record.to_status,
+            "created_at": record.created_at,
+        }
+        for record in order_by_created_at_instant(records)
+    ]
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed key order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 class KeyRotationEventOut(BaseModel):

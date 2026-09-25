@@ -1,14 +1,18 @@
 """Persistent machine enablement state (``active`` <-> ``suspended``).
 
 Every accepted status change updates only the machine's ``status`` and
-``updated_at`` inside a single locked write transaction; ``version``,
+``updated_at`` and appends one immutable ``machine_status_events`` history
+record, all inside a single locked write transaction; ``version``,
 ``public_key``, ``created_at``, and every other record are left untouched.
 The lock serializes concurrent updates, so two requests for the same target
-status can never both observe the prior state: at most one succeeds, and the
-other sees ``invalid_status_transition`` and writes nothing. The state lives
-in the ``machines`` table, so it survives restarts.
+status can never both observe the prior state: at most one succeeds — and
+appends exactly one history record — and the other sees
+``invalid_status_transition`` and writes nothing. The state lives in the
+``machines`` table and the history in its own append-only table, so both
+survive restarts.
 """
 
+import uuid
 from typing import Any
 
 from sqlalchemy import Connection, Engine, func, select
@@ -19,9 +23,10 @@ from .chain import (
     run_joint_write,
     verify_chain,
 )
-from .db import AuthorizationDecisionEvent, Machine
+from .db import AuthorizationDecisionEvent, Machine, MachineStatusEvent
 
 _MACHINE_TABLE = Machine.__table__
+_HISTORY_TABLE = MachineStatusEvent.__table__
 
 _MACHINE_FIELDS = (
     "id",
@@ -53,7 +58,10 @@ def change_machine_status(
       diagnosed as a ``race`` rollback;
     * ``ok`` — with the full updated ``machine`` record. Only ``status`` and
       ``updated_at`` change; ``version``, ``public_key``, and ``created_at``
-      keep their stored values.
+      keep their stored values. The same transaction appends exactly one
+      immutable history record ``(from_status, to_status, created_at)`` to the
+      machine's status history, so the status update and its history entry
+      commit together or not at all.
 
     Every attempt records exactly one joint-write diagnostic.
     """
@@ -98,6 +106,18 @@ def change_machine_status(
         updated_row = conn.execute(
             _MACHINE_TABLE.select().where(_MACHINE_TABLE.c.id == machine_id)
         ).first()
+        # The history record commits in the same transaction as the status
+        # update, so a successful change always leaves exactly one entry and a
+        # failure leaves none.
+        conn.execute(
+            _HISTORY_TABLE.insert().values(
+                id=str(uuid.uuid4()),
+                machine_id=machine_id,
+                from_status=current_status,
+                to_status=to_status,
+                created_at=now,
+            )
+        )
         event_count = conn.execute(
             select(func.count())
             .select_from(AuthorizationDecisionEvent.__table__)

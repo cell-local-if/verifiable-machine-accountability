@@ -19,6 +19,26 @@ class Machine(Base):
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
+class MachineStatusEvent(Base):
+    """One immutable machine status transition (``active`` <-> ``suspended``).
+
+    Rows are append-only: each is written in the same locked write transaction
+    as the machine status change it records, and is never updated or deleted
+    afterwards, so the table is a complete, strictly machine-isolated history
+    of every accepted status change.
+    """
+
+    __tablename__ = "machine_status_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    from_status: Mapped[str] = mapped_column(String, nullable=False)
+    to_status: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class KeyRotationEvent(Base):
     __tablename__ = "key_rotation_events"
 
