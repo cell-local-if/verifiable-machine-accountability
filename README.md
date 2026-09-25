@@ -596,6 +596,54 @@ listing and compliance export keep returning only their existing fields, and
 neither the chain fields nor the verification queries participate in
 authorization evaluation.
 
+## Read-only global policy rule conflict and override analysis
+
+`GET /policy-rules/conflicts` is a read-only analysis entry point under the
+global policy rules. It accepts `GET` only (other methods return `405`
+without reading rules, computing matches, or writing anything) and accepts no
+filter parameters: any query parameter is
+`422 {"error":{"code":"invalid_query"}}` raised during validation, before any
+rule is read and identically against an empty database.
+
+The response is `{rules, conflicts, overrides}` — all three arrays always
+present, all three empty when the rule table is empty. `rules` holds every
+stored global rule ordered by rule id ascending, each item carrying the seven
+stored fields `{id, action_type, resource_pattern, effect, priority,
+created_at, updated_at}` exactly as stored — illegal values are never
+repaired, deleted, or normalized — plus `valid`. A rule is invalid when its
+stored action type or resource pattern is not a string, its stored effect is
+not exactly `allow`/`deny`, or its stored priority is a boolean, a
+non-integer, or negative. Invalid rules still appear in `rules` but never
+produce a conflict or an override, and the analysis never changes an
+authorization-evaluation result.
+
+Matching keeps the existing resource-pattern semantics: `*` matches any text,
+every other segment matches literally, and two patterns intersect only when
+some resource string can satisfy both. Two valid rules form a conflict group
+when they share the same action type, their resource patterns intersect, their
+priorities are equal, and their effects are opposite; the entry is
+`{rule_ids, intersection, reason}` with the two ids ascending and `reason`
+`"same_priority_opposite_effect"`. Two valid rules form an override relation
+when they share the same action type, their resource patterns intersect, and
+their priorities differ; the smaller priority value has decisive effect and is
+the overriding side, and the entry is `{overriding_rule_id,
+overridden_rule_id, intersection, reason}` with `reason`
+`"lower_priority_overrides"`. `intersection` is a glob pattern under the same
+`*` semantics describing the intersecting resource scope. `conflicts` is
+ordered by the rule-id pair ascending and `overrides` by
+`(overriding_rule_id, overridden_rule_id)` ascending.
+
+The query is strictly read-only — it never creates, updates, deletes,
+repairs, recomputes, or normalizes a rule — and a damaged record never
+crashes the query and is never rewritten (a stored value JSON cannot
+represent at all is surfaced in the details in a deterministic textual form).
+The body is compact UTF-8 JSON terminated by a single newline, contains no
+floating-point, `-0.0`, or non-finite computed value, is byte-identical on
+repeat calls against unchanged data, and reads rules persisted across
+application restarts. Policy creation, the rule listing, the compliance
+export, authorization evaluation, the event chain, and the machine interfaces
+are unchanged.
+
 ## Read-only compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/compliance-export`
