@@ -1,4 +1,5 @@
 import os
+import bisect
 import hashlib
 import json
 import re
@@ -2245,6 +2246,175 @@ def summarize_privacy_access_buckets(
         to_accessed_at=params.to_accessed_at,
         bucket_width_seconds=PRIVACY_ACCESS_BUCKET_WIDTH_SECONDS,
         summary_buckets=summary_buckets,
+    )
+
+
+class PrivacyAccessChangesParams(BaseModel):
+    limit: int
+    cursor: str | None = None
+
+
+# An exclusive pagination cursor is ``<accessed_at original text>|<record id>``.
+# The split is on the first separator, so the timestamp segment may itself
+# contain ``|``; the record-id segment must be exactly a UUID.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def validate_privacy_access_changes_params(
+    request: Request,
+) -> PrivacyAccessChangesParams:
+    """Validate the incremental ``changes`` query string before any lookup.
+
+    Exactly two parameters are accepted: the required ``limit`` and the
+    optional ``cursor``. ``limit`` must be a non-boolean integer in 1..100;
+    a missing, non-integer (``3.0``, ``true``, blank, non-decimal text),
+    out-of-range, or boolean value is a 422 ``bad_limit``. ``cursor``, when
+    present, must be a string shaped ``<accessed_at original text>|<uuid>``;
+    a malformed, non-string, or shape-mismatching cursor is a 422
+    ``invalid_cursor`` and the machine is never queried. Any other parameter
+    name is a 422 ``invalid_query``. All three checks run before the machine
+    is looked up and issue no database access, so an invalid query against a
+    non-existent machine still reports 422 rather than 404.
+    """
+    allowed = {"limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``limit=1&limit=2`` rather than silently taking one occurrence.
+    if len(request.query_params.getlist("limit")) != 1:
+        raise QueryError("bad_limit")
+    if len(request.query_params.getlist("cursor")) > 1:
+        raise QueryError("invalid_cursor")
+
+    raw_limit = request.query_params.get("limit")
+    if (
+        raw_limit is None
+        or not _INTEGER_QUERY_RE.fullmatch(raw_limit)
+    ):
+        raise QueryError("bad_limit")
+    limit = int(raw_limit)
+    if not 1 <= limit <= 100:
+        raise QueryError("bad_limit")
+
+    cursor = request.query_params.get("cursor")
+    if cursor is not None:
+        # Query parameters arrive as strings; an empty value carries no
+        # separator and fails the shape check below.
+        parts = cursor.split("|", 1)
+        if len(parts) != 2 or not parts[0] or not _UUID_RE.fullmatch(parts[1]):
+            raise QueryError("invalid_cursor")
+        # The position segment is the original ``accessed_at`` text, always a
+        # UTC RFC 3339 date-time ending in ``Z``; a damaged value is rejected
+        # here rather than failing later while parsing the position.
+        cursor_accessed_at = parts[0]
+        if not _RFC3339_Z_DATETIME_RE.fullmatch(cursor_accessed_at):
+            raise QueryError("invalid_cursor")
+        try:
+            parse_utc_z_datetime(cursor_accessed_at)
+        except ValueError:
+            raise QueryError("invalid_cursor") from None
+
+    return PrivacyAccessChangesParams(limit=limit, cursor=cursor)
+
+
+class PrivacyAccessChangesOut(BaseModel):
+    machine_id: str
+    limit: int
+    records: list[PrivacyAccessOut]
+    next_cursor: str | None
+    has_more: bool
+
+
+def _encode_access_cursor(accessed_at: str, access_id: str) -> str:
+    return f"{accessed_at}|{access_id}"
+
+
+@app.get(
+    "/machines/{machine_id}/privacy-accesses/changes",
+    response_model=PrivacyAccessChangesOut,
+)
+def get_privacy_access_changes(
+    machine_id: str,
+    params: Annotated[
+        PrivacyAccessChangesParams,
+        Depends(validate_privacy_access_changes_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only incremental, keyset-paginated query of one machine's accesses.
+
+    The caller submits the path machine id, a required ``limit`` (an integer
+    from 1 to 100), and an optional opaque ``cursor`` returned by a previous
+    page. Query validation (``invalid_query`` for unknown parameters,
+    ``bad_limit`` for a missing/non-integer/boolean/out-of-range limit,
+    ``invalid_cursor`` for a malformed, non-string, or shape-mismatching
+    cursor) completes before the machine or any access record is read. A
+    missing machine is a ``404 not_found`` carrying no access records.
+
+    On success the response is ``{machine_id, limit, records, next_cursor,
+    has_more}``. ``records`` contains only records owned by the path machine,
+    ordered by the actual UTC instant of ``accessed_at`` and then by record id
+    ascending (so an exact-second record sorts before any fractional-second
+    record of the same second), and is an empty array on an empty page. Each
+    record exposes exactly the seven registered visible fields — never a
+    responsible-party rawtext, key, policy text, or identity material. The
+    cursor is an exclusive position ``<accessed_at original text>|<record
+    id>`` pointing just after a page's last record, so repeating the same
+    cursor against unchanged data returns the byte-identical next page, a
+    record inserted before an old cursor position never resurfaces on later
+    pages, and already-returned records are never read back. ``next_cursor``
+    is that position when at least one record follows the current page and
+    ``null`` on the last page; ``has_more`` is true exactly when a record
+    exists after the current position (false on an empty page). The endpoint
+    adds no schema (cursors are stateless), issues only reads — it never
+    writes, updates, deletes, repairs, or normalizes a record and never
+    returns another machine's records — and keeps reading data persisted
+    across application restarts. Non-GET methods return ``405`` without
+    reading records, computing a page, or writing anything.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    rows = session.scalars(
+        select(PrivacyAccess).where(PrivacyAccess.machine_id == machine_id)
+    ).all()
+    ordered = sorted(
+        rows,
+        key=lambda row: (parse_utc_z_datetime(row.accessed_at), row.id),
+    )
+
+    start = 0
+    if params.cursor is not None:
+        cursor_accessed_at, cursor_id = params.cursor.split("|", 1)
+        # Exclusive keyset position: the first record strictly after
+        # (cursor-instant, cursor-id). Registered rows always parse, so a
+        # cursor built by this endpoint lands exactly at its record.
+        start = bisect.bisect_right(
+            ordered,
+            (parse_utc_z_datetime(cursor_accessed_at), cursor_id),
+            key=lambda row: (parse_utc_z_datetime(row.accessed_at), row.id),
+        )
+
+    remaining = ordered[start:]
+    page = remaining[: params.limit]
+    has_more = len(remaining) > len(page)
+    next_cursor = (
+        _encode_access_cursor(page[-1].accessed_at, page[-1].id) if page and has_more
+        else None
+    )
+
+    return PrivacyAccessChangesOut(
+        machine_id=machine_id,
+        limit=params.limit,
+        records=[privacy_access_to_out(record) for record in page],
+        next_cursor=next_cursor,
+        has_more=has_more,
     )
 
 

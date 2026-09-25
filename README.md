@@ -778,6 +778,52 @@ it never creates, updates, deletes, repairs, or normalizes a record, gives
 identical results on repeat calls against unchanged data, and reads records
 persisted across restarts.
 
+### Incrementally querying changes
+
+`GET /machines/{machine_id}/privacy-accesses/changes` is a stable,
+keyset-paginated incremental view of one machine's accesses. It submits only
+the machine id, a page size, and an optional cursor; validation completes
+before the machine or any access record is read:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, non-integer (e.g. `3.0`, `abc`), boolean (`true`/`false`), or
+  out-of-range value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque string shaped
+  `<accessed_at original text>|<record uuid>` and returned by a previous page.
+  An empty, non-string, damaged, or shape-mismatching value returns
+  `422 {"error":{"code":"invalid_cursor"}}` without querying the machine.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`; all three checks precede the
+  machine lookup, so an invalid query against a non-existent machine is still
+  `422`.
+- After validation, a missing machine returns
+  `404 {"error":{"code":"not_found"}}` with no access records.
+- The path accepts `GET` only; other methods return `405` without reading
+  records, computing a page, or writing anything.
+
+The response is `{machine_id, limit, records, next_cursor, has_more}`;
+`records` contains only records owned by the path machine, ordered by the
+actual UTC instant of `accessed_at` and then by record id ascending (an
+exact-second record sorts before any fractional-second record of the same
+second), and is an empty array on an empty page. Each record exposes exactly
+the seven registered fields `{id, machine_id, accessed_at, window_start,
+window_end, result, matches_count}` — never a responsible-party rawtext, key,
+policy text, or identity material.
+
+The cursor is an exclusive position over `(accessed_at, record id)`: it points
+just after a page's last record, so a page returns only records strictly after
+the cursor. Repeating the same cursor against unchanged data returns the
+byte-identical next page, and a record inserted (even at an earlier access
+time) never causes an already-returned record to be read back. `next_cursor`
+is the position after the page's last record when at least one record follows,
+and `null` on the last page; `has_more` is `true` exactly when a record exists
+after the current position and `false` otherwise (including on an empty page).
+Cursors are stateless and add no schema: the endpoint issues only reads, never
+writes or repairs, keeps strict machine isolation on empty pages, and keeps
+reading records persisted across application restarts. Single and batch
+registration, duplicate detection, the integrity audit, the summary, buckets,
+and the existing compliance exports are unchanged.
+
 ### Summarizing accesses
 
 `GET /machines/{machine_id}/privacy-accesses/summary` is a read-only aggregate
