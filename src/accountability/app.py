@@ -35,6 +35,7 @@ from . import (
     evidence_chain,
     incidents,
     machines,
+    policy_conflicts,
     policy_preview,
     policy_rule_chain,
     privacy_chain,
@@ -614,14 +615,14 @@ def list_policy_rules(session: SessionDep):
 
 
 def validate_policy_rule_chain_query_params(request: Request) -> None:
-    """Validate the policy-rule chain/integrity query string before any read.
+    """Validate the policy-rule chain/integrity/conflicts query string.
 
-    Both read-only chain endpoints are keyed on the global rule table alone
-    and accept no filter parameters; any parameter name is a 422
-    ``invalid_query``. The check runs during validation, before any rule is
-    read and without any database access, so an extra parameter is rejected
-    identically against an empty database and never changes into another
-    error type.
+    The read-only chain, integrity, and conflict-analysis endpoints are keyed
+    on the global rule table alone and accept no filter parameters; any
+    parameter name is a 422 ``invalid_query``. The check runs during
+    validation, before any rule is read and without any database access, so an
+    extra parameter is rejected identically against an empty database and
+    never changes into another error type.
     """
     if request.query_params:
         raise QueryError("invalid_query")
@@ -1075,6 +1076,76 @@ def check_policy_rule_integrity(
         checked_count=checked_count,
         broken_policy_rule_id=broken_policy_rule_id,
     )
+
+
+@app.get("/policy-rules/conflicts")
+def analyze_policy_rule_conflicts(
+    request: Request,
+    _: Annotated[None, Depends(validate_policy_rule_chain_query_params)],
+):
+    """Read-only conflict and override audit over the global policy rules.
+
+    The caller submits no filter parameters; any query parameter is a 422
+    ``invalid_query`` raised during validation before any rule is read and
+    without database access, so it is rejected identically against an empty
+    database. Only ``GET`` is routed; other methods return 405 without reading
+    rules, computing matches, or writing anything. A failure that prevents
+    reading the rules returns 500 ``internal_error`` with no partial analysis.
+
+    On success the response is ``{rules, conflicts, overrides}`` — all three
+    arrays always present and all three empty when the rule table is empty.
+    ``rules`` keeps every stored row exactly as it is, ordered by the actual
+    UTC instant of ``created_at`` and then by id ascending (an exact-second
+    record sorts before a fractional-second record of the same second; a
+    damaged stamp sorts after every parseable one), each item carrying the
+    seven visible fields plus a ``relation`` annotation: ``invalid`` (the
+    stored action type or resource pattern is not a string, the effect is not
+    exactly ``allow``/``deny``, or the priority is a boolean, non-integer, or
+    negative), ``unmatched`` (a valid rule with no intersecting peer),
+    ``conflict`` (a member of a conflict group), or ``overridden`` (a valid
+    rule covered by a smaller-priority rule). Damaged fields are neither
+    repaired nor deleted.
+
+    Only valid rules take part in matching. Two valid rules are a candidate
+    pair only when their action types are equal and their resource patterns
+    have a common matching scope under the existing ``*`` semantics (a star
+    matches any text, every other fragment matches literally). Equal
+    priorities plus opposite effects form a conflict group; each conflict
+    entry is ``{rule_ids, intersection, reason}`` with ``rule_ids`` ascending,
+    ``intersection`` a glob describing the shared scope, and ``reason``
+    ``"same_priority_opposite_effect"``. Different priorities make the
+    smaller-priority rule cover the larger-priority one regardless of effect;
+    each override entry is ``{covering_rule_id, covered_rule_id,
+    intersection, reason}`` with ``reason``
+    ``"lower_priority_overrides"``. Conflicts sort by the id pair and
+    overrides by covering then covered id, all ascending.
+
+    The query is strictly read-only over global policy rules — it never
+    creates, updates, deletes, repairs, recomputes, or normalizes anything and
+    never changes an authorization-evaluation result. The body is compact
+    UTF-8 JSON terminated by a single newline, free of floating-point,
+    ``-0.0``, or non-finite values, byte-identical on repeat calls against
+    unchanged data, including rules persisted across application restarts;
+    old and empty databases work without migration.
+    """
+    try:
+        with Session(request.app.state.engine) as session:
+            stored_rules = policy_conflicts.load_rules(session)
+            payload = policy_conflicts.build_analysis(stored_rules)
+    except Exception:
+        # Never emit a partial analysis when the rules cannot be read.
+        return error_response(500, "internal_error")
+
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 @app.post("/policy-rules/decision-preview")

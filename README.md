@@ -703,6 +703,65 @@ application restarts. The single preview, rule creation, the rule listing,
 the window export, the integrity chain, and authorization evaluation are
 unchanged.
 
+## Read-only global policy rule conflict and override audit
+
+`GET /policy-rules/conflicts` is a read-only static analysis of the global
+policy rules for conflicts and override coverage. It is a separate audit
+entry point: policy creation, the rule listing, the window export, the
+decision previews, authorization evaluation, and the machine interfaces are
+unchanged, and this endpoint never participates in an evaluation.
+
+The query accepts no parameters: any query parameter is
+`422 {"error":{"code":"invalid_query"}}` during validation, before any rule
+is read and identically against an empty database. The path accepts `GET`
+only; other methods return `405` without reading rules, computing matches,
+or writing anything. A failure that prevents reading the rules returns
+`500 {"error":{"code":"internal_error"}}` with no partial analysis.
+
+The response is `{rules, conflicts, overrides}` — all three arrays always
+present, all three empty when the rule table is empty. `rules` retains every
+stored row exactly as stored (damaged fields are neither repaired nor
+deleted; a stored value JSON cannot represent is surfaced in a deterministic
+textual form), ordered by the actual UTC instant of `created_at` and then by
+id ascending, so an exact-second record sorts before any fractional-second
+record of the same second and a damaged stamp sorts after every parseable
+one. Each item carries the seven visible fields
+`{id, action_type, resource_pattern, effect, priority, created_at,
+updated_at}` plus a `relation` annotation:
+
+- `invalid` — the stored action type or resource pattern is not a string,
+  the effect is not exactly `allow`/`deny`, or the priority is a boolean, a
+  non-integer, or negative; invalid rules take no part in any matching
+  decision and can neither conflict nor be covered;
+- `unmatched` — a valid rule with no intersecting peer under the rules
+  below;
+- `conflict` — a member of a conflict group;
+- `overridden` — a valid rule covered over an intersecting scope by another
+  valid rule with a smaller numeric priority.
+
+Two valid rules form a candidate pair only when their action types are equal
+and their resource patterns have a common matching scope under the existing
+`*` semantics: a star matches any (possibly empty) text and every other
+fragment matches literally, so two patterns relate only when some resource
+string can satisfy both. A conflict group is a candidate pair with equal
+priorities and opposite effects; each conflict entry is
+`{rule_ids, intersection, reason}` with the two ids ascending,
+`intersection` a glob describing the shared resource scope, and the stable
+reason `same_priority_opposite_effect`. An override relation is a candidate
+pair with different priorities: the smaller priority value covers the larger
+one regardless of effect, and each entry is
+`{covering_rule_id, covered_rule_id, intersection, reason}` with the stable
+reason `lower_priority_overrides`. Conflict groups sort by the id pair and
+override relations by covering id then covered id, all ascending.
+
+The query is strictly read-only over global policy rules — it never creates,
+updates, deletes, repairs, recomputes, or normalizes a rule and never changes
+an authorization-evaluation result. The body is compact UTF-8 JSON
+terminated by a single newline, contains no floating-point, `-0.0`, or
+non-finite value, is byte-identical on repeat calls against unchanged data,
+and reads rules persisted across application restarts; old and empty
+databases work directly with no migration.
+
 ## Read-only compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/compliance-export`

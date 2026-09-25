@@ -37,6 +37,66 @@ def pattern_matches(pattern: str, value: str) -> bool:
     return re.fullmatch(regex, value, re.DOTALL) is not None
 
 
+def _split_glob(pattern: str) -> tuple[str, tuple[str, ...], str]:
+    """Split a ``*``-glob into its prefix literal, middle literals, suffix."""
+    parts = pattern.split("*")
+    return parts[0], tuple(parts[1:-1]), parts[-1]
+
+
+def patterns_intersect(first: str, second: str) -> bool:
+    """Whether two resource patterns can both match some common resource.
+
+    The existing ``*`` semantics are kept: a star matches any (possibly empty)
+    text and every other segment matches literally. Two patterns intersect
+    exactly when a single resource string can satisfy both. A pattern without
+    a star matches exactly one string, so a literal pair intersects only when
+    equal and a literal intersects a glob only when the glob matches the
+    literal. When both patterns carry a star, a common string exists exactly
+    when the prefix literals are prefix-comparable (one starts with the other)
+    and the suffix literals are suffix-comparable: the middle literal runs can
+    always be laid out one after another inside one string.
+    """
+    return intersection_pattern(first, second) is not None
+
+
+def intersection_pattern(first: str, second: str) -> str | None:
+    """A glob pattern describing the intersecting scope of two patterns.
+
+    Returns ``None`` when the patterns cannot match a common resource (the
+    same test as ``patterns_intersect``). Otherwise the result is a glob under
+    the existing ``*`` semantics whose every match is matched by both
+    patterns: the longer of the two prefix literals, both middle literal runs
+    (the first pattern's, then the second's), and the longer of the two suffix
+    literals, joined by stars. A literal pattern's intersection with a glob it
+    matches is the literal itself.
+    """
+    if "*" not in first:
+        if "*" not in second:
+            return first if first == second else None
+        return first if pattern_matches(second, first) else None
+    if "*" not in second:
+        return second if pattern_matches(first, second) else None
+    first_prefix, first_middles, first_suffix = _split_glob(first)
+    second_prefix, second_middles, second_suffix = _split_glob(second)
+    if not (
+        first_prefix.startswith(second_prefix)
+        or second_prefix.startswith(first_prefix)
+    ):
+        return None
+    if not (
+        first_suffix.endswith(second_suffix)
+        or second_suffix.endswith(first_suffix)
+    ):
+        return None
+    prefix = (
+        first_prefix if len(first_prefix) >= len(second_prefix) else second_prefix
+    )
+    suffix = (
+        first_suffix if len(first_suffix) >= len(second_suffix) else second_suffix
+    )
+    return "*".join([prefix, *first_middles, *second_middles, suffix])
+
+
 def machine_status(executor: Execution, machine_id: str) -> str | None:
     """Return one machine's stored status, or ``None`` if it does not exist."""
     return executor.execute(
