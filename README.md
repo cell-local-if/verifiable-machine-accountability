@@ -651,6 +651,62 @@ and empty databases need no migration. The existing create queries, hash
 chains, diagnostics terminal state, integrity summary, and other compliance
 exports are unchanged.
 
+## Read-only desensitized privacy key rotation export
+
+`GET /machines/{machine_id}/key-rotation-events/privacy-export` returns a
+deterministic, read-only, machine-level privacy view of the machine's key
+rotations. It submits only the machine id and the time window — no business
+filter parameters — and both query parameters are required and validated
+before the machine or any rotation record is read, so an invalid query never
+touches machine or rotation data and still reports `422` when the machine
+does not exist:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); `from_created_at` must not be later than `to_created_at` (equal
+  bounds are allowed). A missing, blank, offset, malformed, or inverted bound
+  returns `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`.
+- The path accepts `GET` only; other methods return `405` without filtering,
+  digest computation, or any write.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}` with no rotation data.
+
+The response body is compact UTF-8 JSON terminated by a single newline, with
+the fixed field order `{machine_id, from_created_at, to_created_at,
+rotations}`; the bounds are echoed verbatim and `rotations` is always
+present, an empty array when the window contains nothing. The array contains
+only rotations whose stored `machine_id` is the path machine and whose own
+`created_at` falls inside the closed interval `[from_created_at,
+to_created_at]`. Records are ordered by the actual UTC instant of
+`created_at` and then by record id, so an exact-second record sorts before
+any fractional-second record of the same second.
+
+Each item keeps `{id, machine_id, version, created_at,
+previous_rotation_id, chain_hash}` exactly as stored. The raw public keys are
+never emitted; their positions carry `old_public_key_ref` and
+`new_public_key_ref` instead:
+
+- `old_public_key_ref` = lowercase-hex `SHA-256(UTF-8("privacy:v1|old_public_key"
+  + machine_id + key_with_surrounding_whitespace_removed))`;
+- `new_public_key_ref` follows the same order and digest with the
+  `privacy:v1|new_public_key` prefix.
+
+When the stored key is not a string or is empty after trimming surrounding
+whitespace, the corresponding ref is `null`; the record is still included.
+Missing, misowned, duplicated, or chain-damaged records are likewise exported
+verbatim, never filtered out, rewritten, or repaired, and another machine's
+rotations can never enter the result. The endpoint issues no writes, repairs,
+deletions, recomputations, or normalizations, contains no floating-point
+values, produces byte-identical output for identical data and parameters on
+repeat calls, reads rotations persisted across application restarts, and adds
+no schema — old and empty databases need no migration. The rotation list,
+the rotation integrity audit, the desensitized responsibility export, the
+health check, and the other compliance exports are unchanged.
+
 ## Machine-level privacy access registration and read-only query
 
 Two machine-scoped entries provide a machine-level audit of privacy data

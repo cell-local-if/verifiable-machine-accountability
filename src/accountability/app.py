@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import (
@@ -1607,6 +1607,91 @@ def export_privacy_responsibility_compliance(
             privacy_responsibility_assignment_to_out(record) for record in records
         ],
     )
+
+
+# --- read-only desensitized privacy export of key rotation events ----------
+
+
+def privacy_key_rotation_to_out(record: KeyRotationEvent) -> dict[str, object]:
+    # The raw public keys never leave the service: only their desensitizing
+    # digests are emitted, computed with the record-owning machine's id. Every
+    # other kept field is emitted exactly as stored.
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "version": record.version,
+        "created_at": record.created_at,
+        "previous_rotation_id": record.previous_rotation_id,
+        "chain_hash": record.chain_hash,
+        "old_public_key_ref": privacy_reference_digest(
+            "old_public_key", record.machine_id, record.old_public_key
+        ),
+        "new_public_key_ref": privacy_reference_digest(
+            "new_public_key", record.machine_id, record.new_public_key
+        ),
+    }
+
+
+@app.get("/machines/{machine_id}/key-rotation-events/privacy-export")
+def export_key_rotation_events_privacy(
+    machine_id: str,
+    params: Annotated[
+        ComplianceExportParams, Depends(validate_accountability_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only desensitized privacy view of one machine's key rotations over
+    a closed time window.
+
+    The caller submits only the path machine id and the closed UTC window
+    ``[from_created_at, to_created_at]``; query validation (``invalid_query``
+    for any other parameter, ``bad_time`` for a missing/blank/offset/malformed
+    or inverted bound) completes before the machine or any rotation record is
+    read. A missing machine is a ``404 not_found`` carrying no rotation data.
+
+    On success the response carries the machine id, the bounds echoed
+    verbatim, and ``rotations`` — always present, an empty array when the
+    window contains nothing. The array holds only records owned by the path
+    machine whose own ``created_at`` falls in the inclusive interval, ordered
+    by the actual UTC instant of ``created_at`` and then by id, so an
+    exact-second record sorts before any fractional-second record of the same
+    second. Each item keeps exactly ``id``, ``machine_id``, ``version``,
+    ``created_at``, ``previous_rotation_id``, and ``chain_hash`` as stored,
+    plus ``old_public_key_ref``/``new_public_key_ref``:
+    ``SHA-256(UTF-8("privacy:v1|old_public_key" + machine_id + trimmed key))``
+    and the same with the ``new_public_key`` prefix — 64 lowercase hex, or
+    ``null`` when the stored key is not a string or is blank after trimming.
+    A missing, misowned, duplicated, or chain-damaged record is exported
+    verbatim, never rewritten, filtered out, or repaired, and another
+    machine's rotations can never enter the result. The query only issues
+    reads, produces byte-identical output for identical data and parameters on
+    repeat calls, and reads rotations persisted across application restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    # Membership is decided by the record's own machine_id and created_at
+    # only; ordering parses stamps to UTC instants because an exact-second
+    # stamp sorts before a fractional stamp of the same second only after
+    # parsing (lexicographically '.' precedes 'Z').
+    records = _machine_rows_in_window(
+        session, KeyRotationEvent, machine_id, window_start, window_end
+    )
+
+    # Serialize manually so the field order is fixed and the body is compact
+    # UTF-8 JSON terminated by a single newline, byte-identical on repeats.
+    payload = {
+        "machine_id": machine_id,
+        "from_created_at": params.from_created_at,
+        "to_created_at": params.to_created_at,
+        "rotations": [privacy_key_rotation_to_out(record) for record in records],
+    }
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    return Response(content=body, media_type="application/json")
 
 
 # --- machine-level privacy access registration and read-only query ---------
