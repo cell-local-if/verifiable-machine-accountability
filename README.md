@@ -778,6 +778,52 @@ it never creates, updates, deletes, repairs, or normalizes a record, gives
 identical results on repeat calls against unchanged data, and reads records
 persisted across restarts.
 
+### Summarizing accesses
+
+`GET /machines/{machine_id}/privacy-accesses/summary` is a read-only aggregate
+view of one machine's accesses, sitting alongside the audit chain rather than
+inside it. It takes the same machine id and closed access-time window as the
+compliance export, under the same validation rules and order:
+
+- `from_accessed_at`, `to_accessed_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); the lower bound must not be later than the upper bound (equal
+  bounds are allowed). A missing, blank, offset, missing-`Z`, malformed, or
+  inverted bound returns `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`.
+- Both checks complete before the machine or any access record is read, so an
+  invalid query against a non-existent machine is still `422`.
+- After validation, a missing machine returns
+  `404 {"error":{"code":"not_found"}}` with no summary data.
+- The path accepts `GET` only; other methods return `405` without filtering,
+  counting, writing, or reading machine records.
+
+Success returns `{machine_id, from_accessed_at, to_accessed_at, success_count,
+failed_count, matches_count}`; the bounds are echoed verbatim. Totals are
+computed from stored values over exactly the records owned by the path machine
+whose own `accessed_at` falls inside the closed interval — membership follows
+the access time, not the recorded `window_start`/`window_end`:
+
+- `success_count` — number of in-window records whose `result` is `success`;
+- `failed_count` — number of in-window records whose `result` is `failed`,
+  counted separately;
+- `matches_count` — sum of every in-window record's stored `matches_count`,
+  totaled independently of the result (a success with zero hits contributes
+  nothing; registered failed records carry zero hits).
+
+An empty window still returns the complete envelope with all three totals at
+zero. The summary is strictly machine-isolated (another machine's records can
+never enter a total), strictly read-only — it never creates, updates, deletes,
+repairs, or normalizes an access record or any chain field — returns
+byte-identical results on repeat calls against unchanged data, and reads
+records persisted across application restarts. It exposes only the machine id,
+the time bounds, and the three totals — never a responsible-party rawtext or
+key material — and changes nothing about single registration, batch
+registration, duplicate detection, the integrity audits, the compliance
+exports, or query ordering.
+
 
 ## Read-only machine-level integrity summary
 
