@@ -273,7 +273,10 @@ def test_rules_exported_with_exactly_the_list_endpoint_fields(client):
         assert set(rule.keys()) == RULE_KEYS
 
     [posted_rule] = [r for r in body["policy_rules"] if r["id"] == created["id"]]
-    assert posted_rule == created
+    # The export keeps only the visible list fields; the creation response
+    # additionally carries the rule chain fields exposed on
+    # /policy-rules/chain.
+    assert posted_rule == {key: created[key] for key in RULE_KEYS}
 
 
 def test_stored_values_are_exported_without_normalization(client):

@@ -535,6 +535,67 @@ JSON (terminated by a single newline, with no floating-point, `-0.0`, or
 non-finite value and a stable field order) for identical data and parameters
 on repeat calls, and reads rules persisted across application restarts.
 
+## Global policy rule tamper-evident chain
+
+Every global policy rule belongs to one hash chain spanning the whole table
+(the chain covers global rules only; there is no per-machine rule chain).
+Rules are ordered by the actual UTC instant of `created_at` and then by `id`,
+so an exact-second rule precedes any fractional-second rule of the same
+second. For each rule:
+
+- `content_hash` is SHA-256 of the compact, key-sorted JSON document built
+  from the rule's seven visible fields `{id, action_type, resource_pattern,
+  effect, priority, created_at, updated_at}`; the chain fields are never part
+  of the digest;
+- `chain_hash` is SHA-256 of `<previous chain_hash>:<content_hash>`, using the
+  empty string as the previous chain hash for the first rule (the same
+  empty-prefix and colon convention as the event chain);
+- `previous_rule_id` is `null` for the first rule and the immediately
+  preceding rule's id otherwise.
+
+All digests are 64 lowercase hexadecimal characters.
+
+`POST /policy-rules` is the only creation entry point and is unchanged apart
+from recording the chain: an invalid body is still `422`, a duplicate
+`(action_type, resource_pattern, priority)` triple is still
+`409 {"error":{"code":"duplicate_policy_rule"}}`, and a failed creation
+writes neither a rule nor a chain link. On success the duplicate check, the
+chain-tail read, and the rule insert commit in a single locked write
+transaction, so concurrent creations cannot lose rules, skip a link, fork the
+chain, or point two rules at the same predecessor. The `201` response carries
+the visible fields together with `previous_rule_id`, `content_hash`, and
+`chain_hash`; these are exactly the values later shown by the chain view.
+
+`GET /policy-rules/chain` returns the complete chain as an array — empty when
+no rules exist — in the chain order described above. Each item contains the
+seven visible fields plus `previous_rule_id`, `content_hash`, and
+`chain_hash`, identical to the creation response. A stored `created_at` that
+no longer parses never crashes the query: the rule is taken in last order,
+still returned, and its stored text is emitted untouched.
+
+`GET /policy-rules/integrity` verifies the chain read-only and returns
+`{valid, checked_count, broken_policy_rule_id}` — all three fields even for an
+empty table, which reports `true`, `0`, `null`. Rules are examined in chain
+order (an unparseable `created_at` sorts last but still counts toward the
+total and is judged by its chain values rather than crashing the scan); the
+first rule whose stored `content_hash`, `previous_rule_id` link, or
+`chain_hash` does not recompute makes `valid` `false` and sets
+`broken_policy_rule_id` to that rule's stored id, otherwise the id is `null`.
+
+Both read-only endpoints accept `GET` only — other methods return `405`
+without reading rule content — and accept no filter parameters: any query
+parameter is `422 {"error":{"code":"invalid_query"}` during validation, before
+any rule is read and identically against an empty database. The endpoints are
+strictly read-only (never creating, updating, deleting, repairing,
+recomputing, or normalizing a rule), return byte-identical compact UTF-8 JSON
+on repeat calls, and read chains persisted across restarts. On startup an
+older database has the three columns added and its rows backfilled in stable
+chain order; a restart over an already complete chain issues no writes, and an
+empty database can both create rules and run the queries. The plain rule
+listing and compliance export keep returning only their existing fields, and
+neither the chain fields nor the verification queries participate in
+authorization evaluation.
+
 ## Read-only compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/compliance-export`

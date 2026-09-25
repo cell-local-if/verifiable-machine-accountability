@@ -35,6 +35,7 @@ from . import (
     evidence_chain,
     incidents,
     machines,
+    policy_rule_chain,
     privacy_chain,
     rotation_chain,
 )
@@ -96,6 +97,8 @@ async def lifespan(app: FastAPI):
     privacy_chain.backfill_chains(engine)
     evidence_chain.migrate_schema(engine)
     evidence_chain.backfill_chains(engine)
+    policy_rule_chain.migrate_schema(engine)
+    policy_rule_chain.backfill_chains(engine)
     diagnostics.migrate_schema(engine)
     # Finalize joint-write markers left by a crashed previous process from
     # the committed evidence, before serving any request.
@@ -527,6 +530,14 @@ class PolicyRuleOut(BaseModel):
     updated_at: str
 
 
+class PolicyRuleChainOut(PolicyRuleOut):
+    # The creation response and the chain view add the tamper-evident chain
+    # fields; the plain listing and compliance export keep the 7-field shape.
+    previous_rule_id: str | None
+    content_hash: str
+    chain_hash: str
+
+
 def policy_rule_to_out(rule: PolicyRule) -> PolicyRuleOut:
     return PolicyRuleOut(
         id=rule.id,
@@ -539,25 +550,39 @@ def policy_rule_to_out(rule: PolicyRule) -> PolicyRuleOut:
     )
 
 
-@app.post("/policy-rules", status_code=201, response_model=PolicyRuleOut)
+@app.post("/policy-rules", status_code=201, response_model=PolicyRuleChainOut)
 def create_policy_rule(body: PolicyRuleCreate, session: SessionDep):
-    now = utc_now_iso()
-    rule = PolicyRule(
-        id=str(uuid.uuid4()),
+    """Create one global policy rule and append it to the rule chain tail.
+
+    Body validation runs before any write, so a malformed payload (missing or
+    blank action/resource, an effect other than ``allow``/``deny``, a negative
+    or non-integer priority) is a 422 and writes neither a rule nor a chain
+    link. The duplicate ``(action_type, resource_pattern, priority)`` check,
+    the chain-tail read, and the rule insert run in one locked write
+    transaction: a duplicate business triple is a 409
+    ``duplicate_policy_rule`` and writes nothing, while concurrent successful
+    creations cannot lose rules, skip a link, fork the chain, or point two
+    rules at the same predecessor. On success the rule is returned with 201
+    carrying its visible fields together with ``previous_rule_id`` (``null``
+    for the first rule), its 64-lowercase-hex ``content_hash`` over those
+    fields, and its ``chain_hash``; these are exactly the values later shown
+    by ``GET /policy-rules/chain``.
+    """
+    engine = session.get_bind()
+    # Release the read connection before opening the locked write transaction,
+    # matching the other chain appenders: concurrent creations never hold two
+    # pool connections at once.
+    session.close()
+    result = policy_rule_chain.append_policy_rule(
+        engine,
         action_type=body.action_type,
         resource_pattern=body.resource_pattern,
         effect=body.effect,
         priority=body.priority,
-        created_at=now,
-        updated_at=now,
     )
-    session.add(rule)
-    try:
-        session.commit()
-    except IntegrityError:
-        session.rollback()
+    if result["status"] == "duplicate_policy_rule":
         return error_response(409, "duplicate_policy_rule")
-    return policy_rule_to_out(rule)
+    return PolicyRuleChainOut(**result["rule"])
 
 
 @app.get("/policy-rules", response_model=list[PolicyRuleOut])
@@ -568,15 +593,16 @@ def list_policy_rules(session: SessionDep):
     then by ``id``; a table with no rules yields ``[]``. Each item carries
     exactly the persisted ``{id, action_type, resource_pattern, effect,
     priority, created_at, updated_at}`` values, with no normalization or
-    repair. ISO-8601 text ordering is not chronological once fractional
-    seconds are present (``...:00.5Z`` sorts before ``...:00Z`` because ``.``
-    precedes ``Z``), so stamps are parsed to UTC instants before the id
-    tie-break. A stored ``created_at`` that no longer parses never crashes the
-    listing: it deterministically sorts after every parseable instant while
-    its stored text is emitted untouched. The query only reads: it never
-    writes, updates, deletes, normalizes, or repairs a rule, and it never
-    participates in authorization evaluation, so repeated calls are stable
-    and rules remain queryable across restarts.
+    repair and no chain fields (those live on the creation response and
+    ``GET /policy-rules/chain``). ISO-8601 text ordering is not chronological
+    once fractional seconds are present (``...:00.5Z`` sorts before
+    ``...:00Z`` because ``.`` precedes ``Z``), so stamps are parsed to UTC
+    instants before the id tie-break. A stored ``created_at`` that no longer
+    parses never crashes the listing: it deterministically sorts after every
+    parseable instant while its stored text is emitted untouched. The query
+    only reads: it never writes, updates, deletes, normalizes, or repairs a
+    rule, and it never participates in authorization evaluation, so repeated
+    calls are stable and rules remain queryable across restarts.
     """
     rules = session.scalars(select(PolicyRule)).all()
     records = sorted(
@@ -584,6 +610,73 @@ def list_policy_rules(session: SessionDep):
         key=lambda rule: (_policy_rule_created_instant(rule.created_at), rule.id),
     )
     return [policy_rule_to_out(rule) for rule in records]
+
+
+def validate_policy_rule_chain_query_params(request: Request) -> None:
+    """Validate the policy-rule chain/integrity query string before any read.
+
+    Both read-only chain endpoints are keyed on the global rule table alone
+    and accept no filter parameters; any parameter name is a 422
+    ``invalid_query``. The check runs during validation, before any rule is
+    read and without any database access, so an extra parameter is rejected
+    identically against an empty database and never changes into another
+    error type.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/policy-rules/chain")
+def list_policy_rule_chain(
+    _: Annotated[None, Depends(validate_policy_rule_chain_query_params)],
+    session: SessionDep,
+):
+    """Read-only view of the complete global policy-rule hash chain.
+
+    The caller submits no machine path and no filter parameters; any query
+    parameter is a 422 ``invalid_query`` raised before any rule is read, and
+    non-GET methods return 405 without reading rule content. The response is
+    an array — empty when no rules exist — of every global rule in the chain
+    order used to build and verify it: the actual UTC instant of
+    ``created_at`` and then ``id``, so an exact-second rule sorts before any
+    fractional-second rule of the same second. Each item carries the rule's
+    visible fields ``{id, action_type, resource_pattern, effect, priority,
+    created_at, updated_at}`` exactly as stored plus ``previous_rule_id``
+    (``null`` only on the first rule), ``content_hash`` (the SHA-256 of the
+    compact key-sorted JSON of the visible fields), and ``chain_hash``
+    (``sha256("<previous chain_hash>:<content_hash>")`` from the empty-prefix
+    root), all 64 lowercase hexadecimal characters. The values are identical
+    to those returned at creation. A stored ``created_at`` that no longer
+    parses never crashes the query: it sorts after every parseable instant, is
+    still returned, and keeps its stored text. The query is strictly
+    read-only — it never creates, updates, deletes, repairs, recomputes, or
+    normalizes a rule — and the body is compact UTF-8 JSON terminated by a
+    single newline, byte-identical on repeat calls against unchanged data,
+    including data persisted across restarts.
+    """
+    rows = policy_rule_chain.ordered_rules(session)
+    payload = [
+        {
+            "id": row._mapping["id"],
+            "action_type": row._mapping["action_type"],
+            "resource_pattern": row._mapping["resource_pattern"],
+            "effect": row._mapping["effect"],
+            "priority": row._mapping["priority"],
+            "created_at": row._mapping["created_at"],
+            "updated_at": row._mapping["updated_at"],
+            "previous_rule_id": row._mapping["previous_rule_id"],
+            "content_hash": row._mapping["content_hash"],
+            "chain_hash": row._mapping["chain_hash"],
+        }
+        for row in rows
+    ]
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 # A stored ``created_at`` that no longer parses is ordered after every
@@ -942,128 +1035,43 @@ def export_policy_rules_compliance(
     return Response(content=body, media_type="application/json")
 
 
-def validate_policy_rule_integrity_params(request: Request) -> None:
-    """Validate the policy-rule integrity query string before any read.
-
-    The integrity audit is keyed on the global rule table alone and accepts
-    no filter parameters; any parameter name is a 422 ``invalid_query``. The
-    check runs before any rule is read and issues no database access.
-    """
-    if request.query_params:
-        raise QueryError("invalid_query")
-
-
 class PolicyRuleIntegrityOut(BaseModel):
     valid: bool
     checked_count: int
     broken_policy_rule_id: str | None
 
 
-def _is_utc_z_datetime(value: object) -> bool:
-    """Whether a stored value is a UTC RFC 3339 date-time ending in ``Z``.
-
-    Fractional seconds are optional; offset forms, a missing suffix, and
-    out-of-range calendar/time values (the pattern alone admits month 13 or
-    hour 24) are all rejected.
-    """
-    if not isinstance(value, str) or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
-        return False
-    try:
-        parse_utc_z_datetime(value)
-    except ValueError:
-        return False
-    return True
-
-
-def _policy_rule_business_identity(rule: PolicyRule) -> tuple:
-    """Business identity of one rule: trimmed action, trimmed pattern, priority."""
-    action_type = rule.action_type
-    resource_pattern = rule.resource_pattern
-    return (
-        action_type.strip() if isinstance(action_type, str) else action_type,
-        resource_pattern.strip()
-        if isinstance(resource_pattern, str)
-        else resource_pattern,
-        rule.priority,
-    )
-
-
-def find_broken_policy_rule(rules: list[PolicyRule]) -> str | None:
-    """Audit the global policy rules and report the first broken rule's id.
-
-    Rules are scanned in (created_at instant, id) order — an exact-second
-    stamp before any fractional-second stamp of the same second, and a damaged
-    stamp after every parseable instant. A rule is broken when its ``id`` is
-    not a UUID, its ``action_type`` or ``resource_pattern`` is not a string
-    that stays non-empty after trimming surrounding whitespace, its ``effect``
-    is not exactly ``allow`` or ``deny``, its ``priority`` is not a
-    non-boolean non-negative integer, or its ``created_at``/``updated_at`` is
-    not a UTC RFC 3339 date-time ending in ``Z``. The trimmed ``(action_type,
-    resource_pattern, priority)`` triple is the business identity: when one
-    combination appears on more than one rule, the rule sorting first is
-    broken. The returned id is the stored value verbatim, even when the id
-    itself is the damaged field. Read-only: nothing is normalized or repaired.
-    """
-    ordered = sorted(
-        rules,
-        key=lambda rule: (_policy_rule_created_instant(rule.created_at), rule.id),
-    )
-    identity_counts: dict[tuple, int] = {}
-    for rule in ordered:
-        identity = _policy_rule_business_identity(rule)
-        identity_counts[identity] = identity_counts.get(identity, 0) + 1
-
-    for rule in ordered:
-        priority = rule.priority
-        if (
-            not isinstance(rule.id, str)
-            or _UUID_RE.fullmatch(rule.id) is None
-            or not isinstance(rule.action_type, str)
-            or not rule.action_type.strip()
-            or not isinstance(rule.resource_pattern, str)
-            or not rule.resource_pattern.strip()
-            or rule.effect not in ("allow", "deny")
-            or isinstance(priority, bool)
-            or not isinstance(priority, int)
-            or priority < 0
-            or not _is_utc_z_datetime(rule.created_at)
-            or not _is_utc_z_datetime(rule.updated_at)
-            or identity_counts[_policy_rule_business_identity(rule)] > 1
-        ):
-            return rule.id
-    return None
-
-
 @app.get("/policy-rules/integrity", response_model=PolicyRuleIntegrityOut)
 def check_policy_rule_integrity(
-    _: Annotated[None, Depends(validate_policy_rule_integrity_params)],
+    _: Annotated[None, Depends(validate_policy_rule_chain_query_params)],
     session: SessionDep,
 ):
-    """Read-only integrity audit of every global policy rule.
+    """Read-only verification of the global policy-rule hash chain.
 
     The caller submits no machine path and no filter parameters; any query
-    parameter is a 422 ``invalid_query`` raised before any rule is read, and
-    non-GET methods return 405 without reading rule data. Returns ``{valid,
-    checked_count, broken_policy_rule_id}``: an empty rule table reports
-    ``true``, zero, and ``null``; ``checked_count`` always counts every global
-    rule. Rules are examined in (created_at instant, id) order — an
-    exact-second rule before any fractional-second rule of the same second,
-    and a damaged ``created_at`` after every parseable instant. The first rule
-    failing the id-UUID, non-blank action/resource, ``allow``/``deny`` effect,
-    non-boolean non-negative integer priority, or ``Z``-suffixed UTC timestamp
-    checks — or whose trimmed ``(action_type, resource_pattern, priority)``
-    business identity duplicates another rule's — makes the conclusion
-    ``false`` and is reported by its stored id, emitted verbatim even when the
-    id itself is damaged; when every rule passes, the broken id is ``null``.
-    The query is strictly read-only: it never creates, updates, deletes,
-    repairs, recomputes, or normalizes a rule and never changes an
-    authorization-evaluation result.
+    parameter is a 422 ``invalid_query`` raised during validation before any
+    rule is read, and non-GET methods return 405 without reading rule content.
+    Returns ``{valid, checked_count, broken_policy_rule_id}``: an empty rule
+    table reports ``true``, zero, and ``null``; ``checked_count`` always
+    counts every global rule, even one whose stored ``created_at`` no longer
+    parses (it is taken in last chain order rather than crashing the scan).
+    Rules are examined in the chain order — the actual UTC instant of
+    ``created_at`` and then ``id``, so an exact-second rule precedes any
+    fractional-second rule of the same second — and the first rule whose
+    stored ``content_hash``, ``previous_rule_id`` link, or ``chain_hash`` does
+    not verify against the recomputed chain makes the conclusion ``false`` and
+    is reported by its stored id, emitted verbatim; when every rule verifies,
+    the broken id is ``null``. The query is strictly read-only: it never
+    creates, updates, deletes, repairs, recomputes, or normalizes a rule and
+    never changes an authorization-evaluation result, and repeated calls
+    against unchanged data return byte-identical results.
     """
-    rules = session.scalars(select(PolicyRule)).all()
-    broken_policy_rule_id = find_broken_policy_rule(rules)
+    valid, checked_count, broken_policy_rule_id = policy_rule_chain.verify_chain(
+        session
+    )
     return PolicyRuleIntegrityOut(
-        valid=broken_policy_rule_id is None,
-        checked_count=len(rules),
+        valid=valid,
+        checked_count=checked_count,
         broken_policy_rule_id=broken_policy_rule_id,
     )
 

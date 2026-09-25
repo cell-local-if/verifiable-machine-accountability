@@ -92,7 +92,20 @@ def test_list_items_have_exactly_the_persisted_fields(client):
         "created_at",
         "updated_at",
     }
-    assert rule == created
+    # The listing keeps only the visible fields; the creation response also
+    # carries the chain fields, which are exposed on /policy-rules/chain.
+    assert rule == {
+        key: created[key]
+        for key in (
+            "id",
+            "action_type",
+            "resource_pattern",
+            "effect",
+            "priority",
+            "created_at",
+            "updated_at",
+        )
+    }
 
 
 def test_list_values_are_persisted_without_normalization(client, tmp_path):
