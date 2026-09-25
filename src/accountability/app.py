@@ -35,6 +35,7 @@ from . import (
     evidence_chain,
     incidents,
     machines,
+    policy_conflicts,
     policy_preview,
     policy_rule_chain,
     privacy_chain,
@@ -614,14 +615,14 @@ def list_policy_rules(session: SessionDep):
 
 
 def validate_policy_rule_chain_query_params(request: Request) -> None:
-    """Validate the policy-rule chain/integrity query string before any read.
+    """Validate the policy-rule chain/integrity/conflicts query string.
 
-    Both read-only chain endpoints are keyed on the global rule table alone
-    and accept no filter parameters; any parameter name is a 422
-    ``invalid_query``. The check runs during validation, before any rule is
-    read and without any database access, so an extra parameter is rejected
-    identically against an empty database and never changes into another
-    error type.
+    The read-only chain, integrity, and conflict-analysis endpoints are keyed
+    on the global rule table alone and accept no filter parameters; any
+    parameter name is a 422 ``invalid_query``. The check runs during
+    validation, before any rule is read and without any database access, so an
+    extra parameter is rejected identically against an empty database and
+    never changes into another error type.
     """
     if request.query_params:
         raise QueryError("invalid_query")
@@ -1075,6 +1076,77 @@ def check_policy_rule_integrity(
         checked_count=checked_count,
         broken_policy_rule_id=broken_policy_rule_id,
     )
+
+
+@app.get("/policy-rules/conflicts")
+def analyze_policy_rule_conflicts(
+    _: Annotated[None, Depends(validate_policy_rule_chain_query_params)],
+    session: SessionDep,
+):
+    """Read-only conflict and override analysis over the global policy rules.
+
+    The caller submits no machine path and no filter parameters; any query
+    parameter is a 422 ``invalid_query`` raised during validation before any
+    rule is read and without any database access, and only ``GET`` is routed,
+    so non-GET methods return 405 without reading rules, computing matches, or
+    writing anything. An empty rule table returns three empty arrays.
+
+    On success the response always carries exactly ``{rules, conflicts,
+    overrides}`` in this fixed field order. ``rules`` keeps every stored
+    global rule with the seven visible fields ``{id, action_type,
+    resource_pattern, effect, priority, created_at, updated_at}`` emitted
+    exactly as stored — illegal or damaged values are never repaired, deleted,
+    or normalized — plus a ``relation`` annotation:
+
+    - ``invalid`` — the stored action type or resource pattern is not a
+      string, the effect is not exactly ``allow``/``deny``, or the priority is
+      a boolean, non-integer, or negative; such a rule never takes part in any
+      matching judgement. Damaged ``id`` or timestamp values neither
+      invalidate a rule nor are repaired (matching never depends on them);
+    - ``unmatched`` — a valid rule with no same-action candidate whose
+      resource pattern has a common matching scope;
+    - ``conflict`` — a valid rule in a same-action pair whose patterns
+      intersect, at the same priority, with opposite effects;
+    - ``override`` — a valid rule in a same-action intersecting pair whose
+      priorities differ; ``overrides`` states which side covers which.
+
+    Details are ordered by the actual UTC instant of ``created_at`` and then
+    by id, so an exact-second record sorts before any fractional-second
+    record of the same second and a damaged stamp sorts after every parseable
+    one. Two valid rules are candidates only when their actions are equal and
+    their resource patterns can match a common resource (the existing ``*``
+    matches-any-text, everything-else-literal semantics); ``intersection`` is
+    the glob describing exactly that shared scope. Each conflict entry is
+    ``{rule_ids, intersection, reason}`` with both ids ascending and reason
+    ``"same_priority_opposite_effect"``; each override entry is
+    ``{overriding_rule_id, overridden_rule_id, intersection, reason}`` with
+    the smaller numeric priority covering the larger and reason
+    ``"lower_priority_overrides"``. Both lists sort by their pair of rule ids
+    ascending, so repeat queries over unchanged data are byte-identical.
+
+    A failure that prevents reading the rules returns 500
+    ``internal_error`` with no partial analysis. The query is strictly
+    read-only — it never creates, updates, deletes, repairs, recomputes, or
+    normalizes a rule and never changes an authorization result — and the body
+    is compact UTF-8 JSON terminated by a single newline, free of
+    floating-point, ``-0.0``, or non-finite values, including data persisted
+    across application restarts; old and empty databases work unchanged.
+    """
+    try:
+        stored_rules = policy_conflicts.load_rules(session)
+        payload = policy_conflicts.build_analysis(stored_rules)
+    except Exception:
+        # Never emit a partial analysis when the rules cannot be read.
+        return error_response(500, "internal_error")
+
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a fixed
+    # field order, terminated by a single newline, and free of any
+    # floating-point or non-finite computed value (allow_nan=False).
+    body = (
+        json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 @app.post("/policy-rules/decision-preview")

@@ -703,6 +703,67 @@ application restarts. The single preview, rule creation, the rule listing,
 the window export, the integrity chain, and authorization evaluation are
 unchanged.
 
+## Read-only global policy rule conflict and override audit
+
+`GET /policy-rules/conflicts` is a separate, strictly read-only audit entry
+over the global policy rules: it never participates in an authorization
+evaluation and changes neither policy creation, the rule listing, the window
+export, the decision previews, the machine interfaces, nor any other semantic.
+The query takes no business filter parameters — any query parameter is
+`422 {"error":{"code":"invalid_query"}}` during the validation phase, before
+any rule is read and without database access, identically against an empty
+database. The path accepts `GET` only; other methods return `405` without
+reading rules, computing matches, or producing a write. A failure while
+reading the rules returns `500 {"error":{"code":"internal_error"}}` with no
+partial analysis.
+
+The response always contains exactly the three arrays `{rules, conflicts,
+overrides}` in this fixed field order; an empty rule table returns three empty
+arrays. `rules` keeps every stored global rule with the seven visible fields
+`{id, action_type, resource_pattern, effect, priority, created_at,
+updated_at}` emitted exactly as stored — corrupted fields are neither repaired
+nor deleted — plus a `relation` annotation:
+
+- `invalid` — the stored action type or resource pattern is not a string, the
+  effect is not exactly `allow`/`deny`, or the priority is a boolean,
+  non-integer, or negative; such a record never takes part in any matching
+  judgement (a damaged `id` or `created_at` neither invalidates the rule nor is
+  repaired, because matching never depends on them);
+- `unmatched` — a valid rule with no same-action counterpart whose resource
+  pattern has a common matching scope;
+- `conflict` — a valid rule in a same-action pair with intersecting resource
+  patterns, equal priority, and opposite effects;
+- `override` — a valid rule in a same-action pair with intersecting resource
+  patterns and different priorities; the direction is carried by the
+  `overrides` array.
+
+Two valid rules become candidates only when their actions are equal and their
+resource patterns can match some common resource, under the existing pattern
+semantics (`*` matches any text, every other segment is literal). The
+intersecting scope is reported as a glob under the same semantics: the longer
+of the two prefix literals, both middle literal runs, and the longer of the
+two suffix literals joined by stars; an exact pattern's intersection with a
+matching glob is the exact pattern itself.
+
+Each conflict entry is
+`{rule_ids, intersection, reason}` with the two rule ids sorted ascending and
+`reason` `"same_priority_opposite_effect"`. Each override entry is
+`{overriding_rule_id, overridden_rule_id, intersection, reason}`: the rule
+with the smaller numeric priority covers the same intersecting scope of the
+larger-priority rule, with `reason` `"lower_priority_overrides"`. The
+`conflicts` list sorts by `(first id, second id)` and `overrides` by
+`(overriding rule id, overridden rule id)`, so both lists are stable for the
+same data. Rule details order by the actual UTC instant of `created_at` and
+then by id, so an exact-second record sorts before a fractional-second record
+of the same second and a damaged stamp sorts after every parseable one.
+
+The audit is strictly read-only — it never creates, updates, deletes,
+repairs, recomputes, or normalizes a rule. The body is compact UTF-8 JSON
+terminated by a single newline, contains no floating-point, `-0.0`, or
+non-finite value, is byte-identical on repeat calls against unchanged data,
+and reads rules persisted across application restarts; old and empty databases
+work without migration.
+
 ## Read-only compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/compliance-export`
