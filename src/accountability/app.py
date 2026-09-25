@@ -560,26 +560,6 @@ def create_policy_rule(body: PolicyRuleCreate, session: SessionDep):
     return policy_rule_to_out(rule)
 
 
-@app.get("/policy-rules", response_model=list[PolicyRuleOut])
-def list_policy_rules(session: SessionDep):
-    """Read-only listing of every global policy rule.
-
-    Returns all rules ordered by the actual UTC instant of ``created_at``,
-    then by ``id``; a table with no rules yields ``[]``. Each item carries
-    exactly the persisted ``{id, action_type, resource_pattern, effect,
-    priority, created_at, updated_at}`` values, with no normalization or
-    repair. ISO-8601 text ordering is not chronological once fractional
-    seconds are present (``...:00.5Z`` sorts before ``...:00Z`` because ``.``
-    precedes ``Z``), so stamps are parsed to UTC instants before the id
-    tie-break. The query only reads: it never writes, updates, deletes,
-    normalizes, or repairs a rule, and it never participates in authorization
-    evaluation, so repeated calls are stable and rules remain queryable across
-    restarts.
-    """
-    rules = session.scalars(select(PolicyRule)).all()
-    return [policy_rule_to_out(rule) for rule in order_by_created_at_instant(rules)]
-
-
 # A stored ``created_at`` that no longer parses is ordered after every
 # parseable record (the same tolerant convention the evidence chain uses), so
 # a damaged stamp sorts deterministically last instead of crashing a read-only
@@ -592,7 +572,8 @@ def _policy_rule_created_instant(value: object) -> datetime:
 
     Legitimately written values always satisfy the RFC 3339 ``Z`` contract; a
     damaged value sorts after every parseable record instead of raising, so the
-    read-only window export neither crashes nor repairs the stored text.
+    read-only list, window export, and integrity audit neither crash nor repair
+    the stored text.
     """
     if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
         try:
@@ -600,6 +581,45 @@ def _policy_rule_created_instant(value: object) -> datetime:
         except ValueError:
             pass
     return _POLICY_RULE_FAR_FUTURE
+
+
+def _order_policy_rules_by_created_instant(rules: list) -> list:
+    """Order policy rules by the actual UTC instant of ``created_at``, then id.
+
+    Parsing first makes an exact-second stamp sort before any fractional stamp
+    of the same second (lexicographically ``.`` precedes ``Z``); a stored stamp
+    that no longer parses sorts after every parseable record instead of
+    crashing the read.
+    """
+    return sorted(
+        rules,
+        key=lambda rule: (_policy_rule_created_instant(rule.created_at), rule.id),
+    )
+
+
+@app.get("/policy-rules", response_model=list[PolicyRuleOut])
+def list_policy_rules(session: SessionDep):
+    """Read-only listing of every global policy rule.
+
+    Returns all rules ordered by the actual UTC instant of ``created_at``,
+    then by ``id``; a table with no rules yields ``[]``. Each item carries
+    exactly the persisted ``{id, action_type, resource_pattern, effect,
+    priority, created_at, updated_at}`` values, with no normalization or
+    repair. ISO-8601 text ordering is not chronological once fractional
+    seconds are present (``...:00.5Z`` sorts before ``...:00Z`` because ``.``
+    precedes ``Z``), so stamps are parsed to UTC instants before the id
+    tie-break. A stored ``created_at`` that no longer parses never crashes the
+    listing: the damaged record deterministically sorts after every parseable
+    rule and is emitted with its stored text untouched. The query only reads:
+    it never writes, updates, deletes, normalizes, or repairs a rule, and it
+    never participates in authorization evaluation, so repeated calls are
+    stable and rules remain queryable across restarts.
+    """
+    rules = session.scalars(select(PolicyRule)).all()
+    return [
+        policy_rule_to_out(rule)
+        for rule in _order_policy_rules_by_created_instant(rules)
+    ]
 
 
 class AuthorizationEvaluationCreate(BaseModel):
@@ -902,10 +922,7 @@ def export_policy_rules_compliance(
         for rule in rules
         if window_start <= _policy_rule_created_instant(rule.created_at) <= window_end
     ]
-    records = sorted(
-        in_window,
-        key=lambda rule: (_policy_rule_created_instant(rule.created_at), rule.id),
-    )
+    records = _order_policy_rules_by_created_instant(in_window)
 
     payload = {
         "from_created_at": params.from_created_at,
@@ -933,6 +950,147 @@ def export_policy_rules_compliance(
         + "\n"
     )
     return Response(content=body, media_type="application/json")
+
+
+def validate_policy_rule_integrity_params(request: Request) -> None:
+    """Validate the policy-rule integrity query string.
+
+    The audit is keyed on the global rule table alone and accepts no query
+    parameters; any parameter name is a 422 ``invalid_query``. The check runs
+    before any rule is read and issues no database access.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+class PolicyRuleIntegrityOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_policy_rule_id: str | None
+
+
+def _is_utc_z_datetime_text(value: object) -> bool:
+    """Whether a stored value is a well-formed UTC RFC 3339 date-time text.
+
+    Fractional seconds are optional and the literal ``Z`` suffix is required;
+    the calendar/time fields must also be in range (month 13 or hour 24 is a
+    format failure, not a parseable instant).
+    """
+    if not isinstance(value, str) or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        return False
+    try:
+        parse_utc_z_datetime(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _policy_rule_business_identity(rule: PolicyRule) -> tuple:
+    """The business identity of one rule for the duplication check.
+
+    The identity joins the action type and resource pattern with surrounding
+    whitespace removed and the priority exactly as stored; two rules sharing
+    all three are the same business rule. Non-string stored values cannot be
+    trimmed and are used verbatim (they already fail the field checks).
+    """
+    action_type = rule.action_type
+    resource_pattern = rule.resource_pattern
+    return (
+        action_type.strip() if isinstance(action_type, str) else action_type,
+        resource_pattern.strip()
+        if isinstance(resource_pattern, str)
+        else resource_pattern,
+        rule.priority,
+    )
+
+
+def _policy_rule_fails_field_checks(rule: PolicyRule) -> bool:
+    """Whether one stored policy rule fails a field or format condition.
+
+    A sound rule has a UUID ``id``; an ``action_type`` and
+    ``resource_pattern`` that are strings staying non-empty after surrounding
+    whitespace is removed; an ``effect`` of exactly ``allow`` or ``deny``; a
+    ``priority`` that is a non-boolean, non-negative integer; and
+    ``created_at``/``updated_at`` values that are UTC RFC 3339 date-times with
+    optional fractional seconds and a literal ``Z`` suffix.
+    """
+    if not isinstance(rule.id, str) or _UUID_RE.fullmatch(rule.id) is None:
+        return True
+    if not isinstance(rule.action_type, str) or not rule.action_type.strip():
+        return True
+    if not isinstance(rule.resource_pattern, str) or not rule.resource_pattern.strip():
+        return True
+    if rule.effect not in ("allow", "deny"):
+        return True
+    priority = rule.priority
+    if isinstance(priority, bool) or not isinstance(priority, int) or priority < 0:
+        return True
+    return not (
+        _is_utc_z_datetime_text(rule.created_at)
+        and _is_utc_z_datetime_text(rule.updated_at)
+    )
+
+
+@app.get("/policy-rules/integrity", response_model=PolicyRuleIntegrityOut)
+def check_policy_rule_integrity(
+    _: Annotated[None, Depends(validate_policy_rule_integrity_params)],
+    session: SessionDep,
+):
+    """Read-only integrity audit of the global policy-rule table.
+
+    The caller submits no parameters — any query parameter is a 422
+    ``invalid_query`` raised before any rule is read. Only ``GET`` is routed;
+    other methods return 405 without reading rules, computing a result, or
+    writing anything. The audit is global (there is no machine in the path),
+    so no 404 case exists.
+
+    Returns ``{valid, checked_count, broken_policy_rule_id}``. Every global
+    rule is examined in order by the actual UTC instant of ``created_at`` and
+    then by id, so an exact-second rule sorts before any fractional-second
+    rule of the same second and a rule whose stored ``created_at`` no longer
+    parses sorts after every parseable rule. A rule is broken when its ``id``
+    is not a UUID; when ``action_type`` or ``resource_pattern`` is not a
+    string that stays non-empty after trimming surrounding whitespace; when
+    ``effect`` is not exactly ``allow`` or ``deny``; when ``priority`` is a
+    boolean, a non-integer, or negative; when either timestamp is not a UTC
+    RFC 3339 date-time with optional fractional seconds ending in ``Z``; or
+    when its business identity — trimmed action type, trimmed resource
+    pattern, and priority — duplicates another rule's, in which case the
+    record sorting first among the duplicates is the broken one. The first
+    broken rule in that order makes the overall conclusion ``false`` and is
+    reported by its stored id exactly as persisted, even when the id itself
+    is damaged; when every rule passes, the broken id is ``null``.
+    ``checked_count`` is always the total number of global rules, so an empty
+    table reports ``true``, zero records, and ``null``.
+
+    The query is strictly read-only — it never creates, updates, deletes,
+    repairs, recomputes, or normalizes a rule and never changes an
+    authorization-evaluation result — so repeated calls against unchanged
+    data return identical results, including data persisted across
+    application restarts.
+    """
+    rules = session.scalars(select(PolicyRule)).all()
+    ordered = _order_policy_rules_by_created_instant(rules)
+
+    identity_counts: dict[tuple, int] = {}
+    for rule in ordered:
+        identity = _policy_rule_business_identity(rule)
+        identity_counts[identity] = identity_counts.get(identity, 0) + 1
+
+    for rule in ordered:
+        if _policy_rule_fails_field_checks(rule) or (
+            identity_counts[_policy_rule_business_identity(rule)] > 1
+        ):
+            return PolicyRuleIntegrityOut(
+                valid=False,
+                checked_count=len(rules),
+                broken_policy_rule_id=rule.id,
+            )
+    return PolicyRuleIntegrityOut(
+        valid=True,
+        checked_count=len(rules),
+        broken_policy_rule_id=None,
+    )
 
 
 class KeyRotationComplianceExportOut(BaseModel):
