@@ -204,6 +204,49 @@ def backfill_chains(engine: Engine) -> None:
         _run_with_lock_retry(engine, _work)
 
 
+def _find_duplicate(conn: Connection, machine_id: str, item: dict[str, Any]):
+    return conn.execute(
+        _TABLE.select()
+        .where(
+            _TABLE.c.machine_id == machine_id,
+            _TABLE.c.accessed_at == item["accessed_at"],
+            _TABLE.c.window_start == item["window_start"],
+            _TABLE.c.window_end == item["window_end"],
+            _TABLE.c.result == item["result"],
+        )
+        .with_only_columns(_TABLE.c.id)
+    ).first()
+
+
+def _insert_access(
+    conn: Connection, machine_id: str, item: dict[str, Any]
+) -> dict[str, Any]:
+    access_id = str(uuid.uuid4())
+    conn.execute(
+        _TABLE.insert().values(
+            id=access_id,
+            machine_id=machine_id,
+            accessed_at=item["accessed_at"],
+            window_start=item["window_start"],
+            window_end=item["window_end"],
+            result=item["result"],
+            matches_count=item["matches_count"],
+            previous_access_id=None,
+            content_hash=None,
+            chain_hash=None,
+        )
+    )
+    return {
+        "id": access_id,
+        "machine_id": machine_id,
+        "accessed_at": item["accessed_at"],
+        "window_start": item["window_start"],
+        "window_end": item["window_end"],
+        "result": item["result"],
+        "matches_count": item["matches_count"],
+    }
+
+
 def append_access(
     engine: Engine,
     *,
@@ -232,35 +275,17 @@ def append_access(
         if machine is None:
             return {"status": "not_found"}
 
-        duplicate = conn.execute(
-            _TABLE.select()
-            .where(
-                _TABLE.c.machine_id == machine_id,
-                _TABLE.c.accessed_at == accessed_at,
-                _TABLE.c.window_start == window_start,
-                _TABLE.c.window_end == window_end,
-                _TABLE.c.result == result,
-            )
-            .with_only_columns(_TABLE.c.id)
-        ).first()
-        if duplicate is not None:
+        item = {
+            "accessed_at": accessed_at,
+            "window_start": window_start,
+            "window_end": window_end,
+            "result": result,
+            "matches_count": matches_count,
+        }
+        if _find_duplicate(conn, machine_id, item) is not None:
             return {"status": "duplicate_access"}
 
-        access_id = str(uuid.uuid4())
-        conn.execute(
-            _TABLE.insert().values(
-                id=access_id,
-                machine_id=machine_id,
-                accessed_at=accessed_at,
-                window_start=window_start,
-                window_end=window_end,
-                result=result,
-                matches_count=matches_count,
-                previous_access_id=None,
-                content_hash=None,
-                chain_hash=None,
-            )
-        )
+        access = _insert_access(conn, machine_id, item)
 
         # Link the new row into the machine's chain. ``accessed_at`` is
         # client-supplied, so the row may sort before the current tail;
@@ -271,18 +296,58 @@ def append_access(
         rows = _load_records(conn, machine_id)
         _apply_updates(conn, rows)
 
-        return {
-            "status": "ok",
-            "access": {
-                "id": access_id,
-                "machine_id": machine_id,
-                "accessed_at": accessed_at,
-                "window_start": window_start,
-                "window_end": window_end,
-                "result": result,
-                "matches_count": matches_count,
-            },
-        }
+        return {"status": "ok", "access": access}
+
+    return _run_with_lock_retry(engine, _work)
+
+
+def append_accesses_batch(
+    engine: Engine, *, machine_id: str, items: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Register a whole batch of privacy accesses in one locked transaction.
+
+    The batch goes through the same lock primitive as :func:`append_access`,
+    so a batch and single registrations are fully serialized against each
+    other. The machine is looked up once; every item then reuses the existing
+    duplicate check and insert in request-array order. The duplicate SELECT
+    runs on the batch's own connection, so a prior item inserted earlier in
+    this same transaction is visible: the first item of a given access
+    identity registers and later identical items (same ``(accessed_at,
+    window_start, window_end, result)``; the hit count never participates)
+    come back as ``duplicate_access`` without a new row, while the other items
+    still register. A duplicate never aborts the batch.
+
+    All inserts and the chain relink commit together or not at all: a
+    persistence failure rolls the single transaction back and leaves no
+    partial records. Returns ``{"status": "not_found"}`` for a missing
+    machine, otherwise ``{"status": "ok", "outcomes": [...]}`` with one
+    ``{"status": "duplicate_access"}`` or ``{"status": "ok", "access": ...}``
+    entry per item, in request order.
+    """
+
+    def _work(conn: Connection) -> dict[str, Any]:
+        machine = conn.execute(
+            Machine.__table__.select().where(Machine.__table__.c.id == machine_id)
+        ).first()
+        if machine is None:
+            return {"status": "not_found"}
+
+        outcomes: list[dict[str, Any]] = []
+        for item in items:
+            if _find_duplicate(conn, machine_id, item) is not None:
+                outcomes.append({"status": "duplicate_access"})
+                continue
+            access = _insert_access(conn, machine_id, item)
+            outcomes.append({"status": "ok", "access": access})
+
+        # Link every new row into the machine's chain once, in chain order.
+        # As with the single path, client-supplied ``accessed_at`` values may
+        # sort before the current tail; recomputing inside this same
+        # transaction keeps every record pointing at its immediate predecessor.
+        rows = _load_records(conn, machine_id)
+        _apply_updates(conn, rows)
+
+        return {"status": "ok", "outcomes": outcomes}
 
     return _run_with_lock_retry(engine, _work)
 

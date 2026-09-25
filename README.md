@@ -693,6 +693,51 @@ writes nothing — the hit count is not part of the access identity, so even a
 different count is a duplicate; a different access time, window, or result is a
 distinct record. The path accepts `POST` only; other methods return `405`.
 
+### Registering a batch of accesses
+
+`POST /machines/{machine_id}/privacy-accesses/batch` registers a whole batch
+of privacy data accesses in one request. The body must be a JSON object
+carrying a `privacy_accesses` array; each item carries the same five fields as
+one single registration (`accessed_at`, `window_start`, `window_end`,
+`result`, `matches_count`), under the same timestamp, window, result, and
+hit-count rules. The batch is validated in full and before any machine
+lookup:
+
+- a body that is not an object, a missing or non-array `privacy_accesses`, an
+  array item that is not an object, a missing item field, or a business field
+  of the wrong type returns `422 {"error":{"code":"invalid_batch"}}`;
+- a malformed, offset, whitespace-bearing, or out-of-range timestamp, or an
+  inverted window, returns `422 {"error":{"code":"bad_time"}}`;
+- a `result` other than `success`/`failed`, a negative integer hit count, or a
+  `failed` access with a non-zero count returns
+  `422 {"error":{"code":"invalid_value"}}`;
+- any query parameter returns `422 {"error":{"code":"invalid_query"}}`.
+
+Validation is all-or-nothing: any invalid item rejects the whole request and
+writes nothing. An empty array is legal and returns
+`200 {"results":[]}` without touching the database. After validation, a
+missing machine returns `404 {"error":{"code":"not_found"}}` and writes
+nothing.
+
+On success the status is `200` with a `results` array aligned by position
+with the request array. The whole batch enters one locked write transaction —
+the same lock the single registration takes, so batches and single
+registrations are serialized against each other — and items reuse the existing
+duplicate check and insert in array order. The first item of a given access
+identity `(accessed_at, window_start, window_end, result)` for the machine
+(the hit count never participates) registers; an item that repeats a
+previously registered access or an earlier item in the same batch comes back
+as a duplicate without a new row and without aborting the other items. A
+success result is `{"outcome":"success", id, machine_id, accessed_at,
+window_start, window_end, result, matches_count}` — one full record with a
+fresh UUID; a duplicate result is
+`{"outcome":"duplicate_access", accessed_at, window_start, window_end,
+result, matches_count}`, echoing only the submitted fields. Any persistence
+failure returns `500 {"error":{"code":"internal_error"}}`; the single
+transaction rolls back and leaves no partial records. The path accepts `POST`
+only; other methods return `405`. Batch-written records carry the same
+per-machine hash chain fields and persist across restarts.
+
 ### Querying accesses
 
 `GET /machines/{machine_id}/privacy-accesses/compliance-export` returns a
