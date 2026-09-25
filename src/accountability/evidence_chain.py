@@ -67,6 +67,36 @@ def _created_instant(value: object) -> datetime:
     return _FAR_FUTURE
 
 
+def _created_at_parseable(value: object) -> bool:
+    """Whether a stored ``created_at`` still parses to a UTC instant.
+
+    Mirrors :func:`_created_instant`: anything that would sort to the
+    far-future sentinel is unparseable.
+    """
+    if isinstance(value, str):
+        try:
+            datetime.fromisoformat(value[:-1] + "+00:00")
+            return True
+        except ValueError:
+            pass
+    return False
+
+
+def _first_unparseable_created_at_id(rows: list[Any]) -> str | None:
+    """Id of the first row in chain order whose ``created_at`` cannot parse.
+
+    A corrupted stamp sorts its record after every parseable one, so the
+    record's chain successor would otherwise be blamed for the broken link;
+    reporting the corrupted record itself keeps the audit pointed at the
+    actual damage. ``None`` when every row parses.
+    """
+    for row in rows:
+        mapping = row._mapping
+        if not _created_at_parseable(mapping["created_at"]):
+            return mapping["id"]
+    return None
+
+
 def _chain_order(rows: list[Any]) -> list[Any]:
     """Order records by the actual UTC instant of ``created_at``, then id."""
     return sorted(
@@ -363,8 +393,9 @@ def verify_chain(session, machine_id: str) -> tuple[bool, int, str | None]:
     whose recomputed content digest, previous-evidence link, or chain hash
     differs from the stored values is reported; an empty chain is valid. A
     record whose ``created_at`` no longer parses still enters the total count
-    and is reported as broken (the digest cannot verify), instead of crashing
-    the scan. Only the path machine's records are examined. Read-only.
+    and is itself reported as the first broken record (its digest cannot
+    verify), instead of crashing the scan or blaming its chain successor.
+    Only the path machine's records are examined. Read-only.
     """
     rows = _chain_order(
         list(
@@ -373,6 +404,10 @@ def verify_chain(session, machine_id: str) -> tuple[bool, int, str | None]:
             )
         )
     )
+
+    corrupted_id = _first_unparseable_created_at_id(rows)
+    if corrupted_id is not None:
+        return False, len(rows), corrupted_id
 
     previous_evidence_id: str | None = None
     previous_chain_hash = ""
@@ -406,12 +441,18 @@ def verify_full_chain(session, machine_id: str) -> tuple[bool, int, str | None]:
     exactly 64 lowercase hexadecimal characters compared as stored — or when
     its recomputed content digest, previous-evidence link, or chain hash does
     not match. A record whose ``created_at`` is corrupted is still counted and
-    reported as broken (its digest cannot verify); a missing associated event
-    does not remove the record. Only the path machine's records are examined,
-    the first broken record only is reported, and the function is strictly
-    read-only: it never writes, repairs, deletes, or normalizes anything.
+    is itself reported as the first broken record (its digest cannot verify),
+    never crashing the scan or blaming its chain successor; a missing
+    associated event does not remove the record. Only the path machine's
+    records are examined, the first broken record only is reported, and the
+    function is strictly read-only: it never writes, repairs, deletes, or
+    normalizes anything.
     """
     rows = ordered_records(session, machine_id)
+
+    corrupted_id = _first_unparseable_created_at_id(rows)
+    if corrupted_id is not None:
+        return False, len(rows), corrupted_id
 
     machine_event_ids = set(
         session.scalars(
