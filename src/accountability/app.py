@@ -1076,6 +1076,279 @@ def check_policy_rule_integrity(
     )
 
 
+def _json_safe_stored_value(value: object) -> object:
+    """Surface one stored field value in the preview rule details.
+
+    JSON-native stored values (string, integer, boolean, ``None``) are emitted
+    exactly as stored. A damaged record can hold a value JSON cannot represent
+    — raw bytes, a float (the preview body never carries any floating-point
+    number, finite or not) — and must still never crash the read-only query,
+    so such a value is surfaced in a deterministic textual form (UTF-8 with
+    replacement for bytes, ``str`` for anything else) instead of raising.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _policy_rule_preview_valid(rule: PolicyRule) -> bool:
+    """Whether a stored rule takes part in the preview determination.
+
+    A rule is a legal candidate only when its stored action type and resource
+    pattern are strings, its stored effect is exactly ``allow`` or ``deny``,
+    and its stored priority is a non-boolean, non-negative integer. Any other
+    stored shape — a non-string action type or resource pattern, an illegal
+    effect, or a boolean, non-integer, or negative priority — is an invalid
+    rule: it still appears in the rule details exactly as stored, marked
+    ``invalid``, but it never matches, wins, overrides, or conflicts.
+    """
+    return (
+        isinstance(rule.action_type, str)
+        and isinstance(rule.resource_pattern, str)
+        and rule.effect in ("allow", "deny")
+        and isinstance(rule.priority, int)
+        and not isinstance(rule.priority, bool)
+        and rule.priority >= 0
+    )
+
+
+def _preview_priority_key(value: object) -> tuple[int, int]:
+    """Sort key for a stored priority in the rule-details ordering.
+
+    Integer priorities (including a damaged negative value) sort numerically;
+    a non-integer stored priority sorts after every integer one, the same
+    tolerant convention that sorts a damaged ``created_at`` last, so one
+    damaged row can never crash the read-only preview.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return (1, 0)
+    return (0, value)
+
+
+def _preview_id_key(value: object) -> str:
+    """Deterministic tie-break key for a stored rule id."""
+    return value if isinstance(value, str) else str(value)
+
+
+def _decision_preview_body(
+    action_type: str, resource: str, rules: list[PolicyRule]
+) -> str:
+    """Compute the preview over the stored global rules and serialize it.
+
+    Every stored rule appears in the details exactly as stored, marked with
+    its relation to the request: ``invalid`` (illegal stored fields, never
+    participates), ``unmatched`` (different action or a non-matching resource
+    pattern), ``overridden`` (a matching candidate above the lowest candidate
+    priority), ``winning`` (a decisive lowest-priority candidate in a
+    single-effect group), or ``conflict`` (a decisive lowest-priority
+    candidate in a mixed allow/deny group). The determination itself is the
+    authorization rule restricted to the global rules: the lowest candidate
+    priority decides, a deny at that priority wins over same-priority allows,
+    and no candidate at all is ``no_matching_policy``.
+    """
+    ordered = sorted(
+        rules,
+        key=lambda rule: (
+            _preview_priority_key(rule.priority),
+            _policy_rule_created_instant(rule.created_at),
+            _preview_id_key(rule.id),
+        ),
+    )
+
+    details: list[dict[str, object]] = []
+    candidates: list[tuple[PolicyRule, dict[str, object]]] = []
+    for rule in ordered:
+        entry: dict[str, object] = {
+            "id": _json_safe_stored_value(rule.id),
+            "action_type": _json_safe_stored_value(rule.action_type),
+            "resource_pattern": _json_safe_stored_value(rule.resource_pattern),
+            "effect": _json_safe_stored_value(rule.effect),
+            "priority": _json_safe_stored_value(rule.priority),
+            "created_at": _json_safe_stored_value(rule.created_at),
+            "updated_at": _json_safe_stored_value(rule.updated_at),
+            "relation": None,
+        }
+        details.append(entry)
+        if not _policy_rule_preview_valid(rule):
+            entry["relation"] = "invalid"
+        elif rule.action_type == action_type and authorization.pattern_matches(
+            rule.resource_pattern, resource
+        ):
+            candidates.append((rule, entry))
+        else:
+            entry["relation"] = "unmatched"
+
+    conflicts: list[dict[str, object]] = []
+    winning_rules: list[dict[str, object]] = []
+    if not candidates:
+        decision: dict[str, object] = {
+            "allowed": False,
+            "reason": "no_matching_policy",
+        }
+    else:
+        lowest = min(rule.priority for rule, _ in candidates)
+        decisive = [
+            (rule, entry) for rule, entry in candidates
+            if rule.priority == lowest
+        ]
+        for rule, entry in candidates:
+            if rule.priority != lowest:
+                entry["relation"] = "overridden"
+        effects = {rule.effect for rule, _ in decisive}
+        if effects == {"allow", "deny"}:
+            # A mixed lowest-priority group is decided as a deny; every rule
+            # in the group is a conflict participant and no rule wins.
+            decision = {"allowed": False, "reason": "denied_by_policy"}
+            allows = sorted(
+                (rule.id for rule, _ in decisive if rule.effect == "allow"),
+                key=_preview_id_key,
+            )
+            denies = sorted(
+                (rule.id for rule, _ in decisive if rule.effect == "deny"),
+                key=_preview_id_key,
+            )
+            for _, entry in decisive:
+                entry["relation"] = "conflict"
+            conflicts = [
+                {
+                    "rule_ids": sorted(
+                        (
+                            _json_safe_stored_value(allow_id),
+                            _json_safe_stored_value(deny_id),
+                        )
+                    )
+                }
+                for allow_id in allows
+                for deny_id in denies
+            ]
+            conflicts.sort(
+                key=lambda pair: (pair["rule_ids"][0], pair["rule_ids"][1])
+            )
+        else:
+            allowed = effects == {"allow"}
+            decision = {
+                "allowed": allowed,
+                "reason": "allowed_by_policy" if allowed else "denied_by_policy",
+            }
+            for rule, entry in decisive:
+                entry["relation"] = "winning"
+                winning_rules.append(
+                    {
+                        "id": _json_safe_stored_value(rule.id),
+                        "effect": _json_safe_stored_value(rule.effect),
+                        "priority": _json_safe_stored_value(rule.priority),
+                        "created_at": _json_safe_stored_value(rule.created_at),
+                    }
+                )
+
+    payload = {
+        "action_type": action_type,
+        "resource": resource,
+        "rules": details,
+        "conflicts": conflicts,
+        "winning_rules": winning_rules,
+        "decision": decision,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    return (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+
+
+@app.post("/policy-rules/decision-preview")
+async def preview_policy_rule_decision(request: Request):
+    """Read-only preview of the global policy-rule decision for one request.
+
+    The body must be a JSON object carrying exactly ``action_type`` and
+    ``resource``; both are stripped of surrounding whitespace and must be
+    non-empty afterwards. Validation runs entirely before any rule is read:
+    any query parameter is a 422 ``invalid_query``; an unparseable body, a
+    non-object body, a missing or extra field, or a non-string value is a 422
+    ``invalid_request``; a blank-after-strip action or resource is a 422
+    ``invalid_value``. These outcomes are identical against an empty rule
+    table, and non-POST methods return 405 without reading rules.
+
+    On success the preview reads only the global policy rules — never a
+    machine, a behavior declaration, or an authorization event — and reports
+    how they would decide the submitted ``(action_type, resource)`` pair
+    under the existing ``*`` wildcard semantics (a star matches any text,
+    every other segment matches literally). The response presents, in order,
+    ``action_type``, ``resource``, ``rules``, ``conflicts``,
+    ``winning_rules``, and ``decision``; every collection is always present.
+
+    ``rules`` holds every stored global rule exactly as stored — illegal
+    values are never repaired, deleted, or normalized — plus ``relation``:
+    ``invalid`` (the stored action type or resource pattern is not a string,
+    the stored effect is not exactly ``allow``/``deny``, or the stored
+    priority is a boolean, a non-integer, or negative; such a rule never
+    participates), ``unmatched``, ``overridden``, ``winning``, or
+    ``conflict``. Details are ordered by priority ascending (a non-integer
+    stored priority sorts after every integer one), then by the actual UTC
+    instant of ``created_at`` and by id (a damaged stamp sorts after every
+    parseable instant).
+
+    Among the valid matching candidates the lowest priority decides: all
+    allows means ``allowed`` with reason ``allowed_by_policy`` and any deny
+    means ``denied_by_policy``. Candidates with a numerically larger priority
+    are marked ``overridden``. A lowest-priority group mixing allow and deny
+    is decided as a deny, its rules are marked ``conflict`` and reported in
+    ``conflicts`` as allow/deny ``rule_ids`` pairs ascending, and
+    ``winning_rules`` is empty; otherwise the decisive rules are marked
+    ``winning`` and listed in ``winning_rules`` with their id, effect,
+    priority, and created_at. With no valid matching candidate the decision
+    is ``denied`` with reason ``no_matching_policy`` and both ``conflicts``
+    and ``winning_rules`` are empty.
+
+    The query is strictly read-only — it never creates, updates, deletes,
+    repairs, recomputes, or normalizes a rule and never changes an
+    authorization-evaluation result. An internal failure that aborts the read
+    or the computation returns 500 ``internal_error`` with no partial
+    preview. The body is compact UTF-8 JSON terminated by a single newline,
+    contains no floating-point, ``-0.0``, or non-finite value, is
+    byte-identical on repeat calls against unchanged data, and reads rules
+    persisted across application restarts.
+    """
+    # Any query parameter is rejected first, before the body is examined and
+    # before any rule is read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_request")
+    if not isinstance(payload, dict) or set(payload) != {
+        "action_type",
+        "resource",
+    }:
+        return error_response(422, "invalid_request")
+    action_type = payload["action_type"]
+    resource = payload["resource"]
+    if not isinstance(action_type, str) or not isinstance(resource, str):
+        return error_response(422, "invalid_request")
+    action_type = action_type.strip()
+    resource = resource.strip()
+    if not action_type or not resource:
+        return error_response(422, "invalid_value")
+
+    try:
+        with Session(request.app.state.engine) as session:
+            rules = session.scalars(select(PolicyRule)).all()
+            body = _decision_preview_body(action_type, resource, rules)
+    except Exception:
+        # A failure anywhere in the read or the computation yields no partial
+        # preview: the response is the bare 500 error envelope.
+        return error_response(500, "internal_error")
+    return Response(content=body, media_type="application/json")
+
+
 class KeyRotationComplianceExportOut(BaseModel):
     machine_id: str
     from_created_at: str

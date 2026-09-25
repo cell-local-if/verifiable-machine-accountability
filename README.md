@@ -596,6 +596,61 @@ listing and compliance export keep returning only their existing fields, and
 neither the chain fields nor the verification queries participate in
 authorization evaluation.
 
+## Read-only global policy rule decision preview
+
+`POST /policy-rules/decision-preview` previews how the global policy rules
+alone would decide one `(action_type, resource)` request. It never touches
+machines, behavior declarations, or authorization events, and it never
+creates, updates, deletes, repairs, recomputes, or normalizes a rule.
+
+The body must be a JSON object carrying exactly `action_type` and `resource`;
+both are stripped of surrounding whitespace and must be non-empty afterwards.
+All validation runs before any rule is read, so an invalid request behaves
+identically against an empty rule table:
+
+- any query parameter returns `422 {"error":{"code":"invalid_query"}}`;
+- an unparseable body, a non-object body, a missing or extra field, or a
+  non-string value returns `422 {"error":{"code":"invalid_request"}}`;
+- a blank-after-strip action or resource returns
+  `422 {"error":{"code":"invalid_value"}}`;
+- the path accepts `POST` only; other methods return `405` without reading
+  rules.
+
+On success the response presents, in order, `action_type`, `resource`,
+`rules`, `conflicts`, `winning_rules`, and `decision`; every collection is
+always present. `rules` holds every stored global rule exactly as stored —
+illegal values are never repaired, deleted, or normalized — plus `relation`:
+`invalid` (the stored action type or resource pattern is not a string, the
+stored effect is not exactly `allow`/`deny`, or the stored priority is a
+boolean, a non-integer, or negative; such a rule never participates),
+`unmatched` (different action or a resource pattern that does not match under
+the existing `*` wildcard semantics), `overridden`, `winning`, or `conflict`.
+Details are ordered by priority ascending (a non-integer stored priority
+sorts after every integer one), then by the actual UTC instant of
+`created_at` and by id (a damaged stamp sorts after every parseable
+instant).
+
+Among the valid matching candidates the lowest priority decides: all allows
+means `{"allowed": true, "reason": "allowed_by_policy"}` and any deny means
+`denied_by_policy`. Candidates with a numerically larger priority are marked
+`overridden`. A lowest-priority group mixing allow and deny is decided as a
+deny, its rules are marked `conflict` and reported in `conflicts` as
+allow/deny `rule_ids` pairs ascending, and `winning_rules` is empty;
+otherwise the decisive rules are marked `winning` and listed in
+`winning_rules` with their id, effect, priority, and created_at. With no
+valid matching candidate the decision is
+`{"allowed": false, "reason": "no_matching_policy"}` and both `conflicts` and
+`winning_rules` are empty.
+
+An internal failure that aborts the read or the computation returns
+`500 {"error":{"code":"internal_error"}}` with no partial preview. The body
+is compact UTF-8 JSON terminated by a single newline, contains no
+floating-point, `-0.0`, or non-finite value, is byte-identical on repeat
+calls against unchanged data, and reads rules persisted across application
+restarts. Policy rule creation, listing, the window export, authorization
+evaluation, the machine interfaces, the event chains, and the existing
+compliance exports are unchanged.
+
 ## Read-only compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/compliance-export`
