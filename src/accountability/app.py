@@ -33,6 +33,7 @@ from . import (
     diagnostics,
     incidents,
     machines,
+    privacy_access_chain,
     rotation_chain,
 )
 from .db import (
@@ -89,6 +90,8 @@ async def lifespan(app: FastAPI):
     rotation_chain.backfill_chains(engine)
     assignment_chain.migrate_schema(engine)
     assignment_chain.backfill_chains(engine)
+    privacy_access_chain.migrate_schema(engine)
+    privacy_access_chain.backfill_chains(engine)
     diagnostics.migrate_schema(engine)
     # Finalize joint-write markers left by a crashed previous process from
     # the committed evidence, before serving any request.
@@ -1699,29 +1702,22 @@ def create_privacy_access(
     ``(accessed_at, window_start, window_end, result)`` for the same machine
     returns 409 ``duplicate_access`` and writes nothing (the hit count is not
     part of the identity). On success the record is persisted in its own
-    append-only table — it never modifies machines, events, chains, or the
-    desensitized responsibility export — and is returned with 201 carrying a
-    fresh UUID, the machine id, the access time and window exactly as
-    submitted, the result, and the hit count. No responsible-party rawtext or
-    key material is ever stored or echoed.
+    append-only table and linked into the machine's tamper-evident access
+    chain: the duplicate check, the insert, and the chain-tail linking commit
+    in a single locked write transaction, so concurrent registrations cannot
+    lose records, fork the chain, or break a link. The write never modifies
+    machines, events, other chains, or the desensitized responsibility
+    export. The 201 response carries a fresh UUID, the machine id, the access
+    time and window exactly as submitted, the result, and the hit count. No
+    responsible-party rawtext or key material is ever stored or echoed.
     """
-    machine = session.get(Machine, machine_id)
-    if machine is None:
-        return error_response(404, "not_found")
-
-    duplicate_filters = (
-        PrivacyAccess.machine_id == machine_id,
-        PrivacyAccess.accessed_at == body.accessed_at,
-        PrivacyAccess.window_start == body.window_start,
-        PrivacyAccess.window_end == body.window_end,
-        PrivacyAccess.result == body.result,
-    )
-    existing = session.scalar(select(PrivacyAccess.id).where(*duplicate_filters))
-    if existing is not None:
-        return error_response(409, "duplicate_access")
-
-    record = PrivacyAccess(
-        id=str(uuid.uuid4()),
+    engine = session.get_bind()
+    # Release the read connection before opening the locked write transaction,
+    # matching the other chain appenders: concurrent registrations never hold
+    # two pool connections at once.
+    session.close()
+    result = privacy_access_chain.append_access(
+        engine,
         machine_id=machine_id,
         accessed_at=body.accessed_at,
         window_start=body.window_start,
@@ -1729,14 +1725,11 @@ def create_privacy_access(
         result=body.result,
         matches_count=body.matches_count,
     )
-    session.add(record)
-    try:
-        session.commit()
-    except IntegrityError:
-        # A concurrent identical registration won the unique constraint.
-        session.rollback()
+    if result["status"] == "not_found":
+        return error_response(404, "not_found")
+    if result["status"] == "duplicate_access":
         return error_response(409, "duplicate_access")
-    return privacy_access_to_out(record)
+    return PrivacyAccessOut(**result["access"])
 
 
 class PrivacyAccessExportParams(BaseModel):
@@ -1866,6 +1859,60 @@ def export_privacy_accesses(
         from_accessed_at=params.from_accessed_at,
         to_accessed_at=params.to_accessed_at,
         privacy_accesses=[privacy_access_to_out(record) for record in records],
+    )
+
+
+def validate_privacy_access_integrity_params(request: Request) -> None:
+    """Validate the privacy-access-integrity query string before any lookup.
+
+    The audit is keyed on the path machine alone and accepts no query
+    parameters; any parameter name is a 422 ``invalid_query``. The check runs
+    before the machine is looked up and issues no database access, so an
+    extra parameter against a non-existent machine still reports 422 rather
+    than 404.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+class PrivacyAccessIntegrityOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_access_id: str | None
+
+
+@app.get(
+    "/machines/{machine_id}/privacy-accesses/integrity",
+    response_model=PrivacyAccessIntegrityOut,
+)
+def check_privacy_access_integrity(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_privacy_access_integrity_params)],
+    session: SessionDep,
+):
+    """Read-only verification of one machine's privacy access hash chain.
+
+    Returns ``{valid, checked_count, broken_access_id}``: a machine with no
+    accesses or a fully sound chain reports ``true``, the machine's total
+    access count, and ``null``; otherwise the first record — in the stable
+    (accessed_at instant, id) order — whose previous-access link, content
+    hash, or chain hash does not verify is reported. Only the path machine's
+    records are examined or counted, and the query never writes, repairs, or
+    deletes. A missing machine is a 404 ``not_found`` with no integrity
+    conclusion; any query parameter is a 422 ``invalid_query`` checked before
+    the machine lookup; non-GET methods are a 405.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    valid, checked_count, broken_access_id = privacy_access_chain.verify_chain(
+        session, machine_id
+    )
+    return PrivacyAccessIntegrityOut(
+        valid=valid,
+        checked_count=checked_count,
+        broken_access_id=broken_access_id,
     )
 
 

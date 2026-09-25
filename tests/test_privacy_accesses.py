@@ -368,7 +368,8 @@ def test_extra_responsibility_or_key_fields_are_never_stored_or_echoed(client):
     assert secret_party not in response.text
     assert secret_key not in response.text
 
-    # The stored row has only the seven audit columns, no responsibility data.
+    # The stored row has only the seven audit columns plus the three chain
+    # columns, no responsibility data.
     with client.app.state.engine.connect() as conn:
         raw = conn.execute(
             text("SELECT * FROM privacy_accesses WHERE machine_id = :m"),
@@ -382,6 +383,9 @@ def test_extra_responsibility_or_key_fields_are_never_stored_or_echoed(client):
             "window_end",
             "result",
             "matches_count",
+            "previous_access_id",
+            "content_hash",
+            "chain_hash",
         }
         exported = client.get(export_url(machine_id)).content.decode()
     assert secret_party not in exported
