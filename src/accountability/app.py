@@ -298,6 +298,82 @@ def update_machine_status(
     return MachineOut(**result["machine"])
 
 
+def validate_machine_status_history_params(request: Request) -> None:
+    """Validate the machine status-history query string.
+
+    The history query is keyed on the path machine alone and accepts no
+    business filter parameters; any parameter name is a 422 ``invalid_query``.
+    The check runs before the machine is looked up and issues no database
+    access, so an extra parameter against a non-existent machine still
+    reports 422 rather than 404.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/status-history")
+def list_machine_status_history(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_machine_status_history_params)],
+    session: SessionDep,
+):
+    """Read-only, immutable history of one machine's status transitions.
+
+    The caller submits only the path machine id — no time range, business
+    filter, or request body; any query parameter is a 422 ``invalid_query``
+    raised before the machine is ever looked up. A missing machine is a 404
+    ``not_found`` carrying no history data. Only ``GET`` is routed; other
+    methods return 405 without reading records, computing a result, or
+    writing anything.
+
+    On success the response is an array — empty when the machine has never
+    changed status — of the machine's own transition records, ordered by the
+    actual UTC instant of ``created_at`` and then by id, so an exact-second
+    record sorts before any fractional-second record of the same second. Each
+    item carries exactly ``{id, machine_id, from_status, to_status,
+    created_at}`` in this fixed field order, with ``created_at`` the UTC
+    commit-moment stamp ending in ``Z``. Records are returned exactly as
+    stored: they are never rewritten, recomputed, filtered out, or repaired,
+    and another machine's records can never enter the result. The query only
+    issues reads — it never creates, updates, deletes, repairs, or normalizes
+    status, history, or any other accountability record — and the body is
+    compact UTF-8 JSON terminated by a single newline, free of any
+    floating-point or non-finite value, byte-identical on repeat calls
+    against unchanged data, including data persisted across application
+    restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    # Ordering parses stamps to UTC instants because an exact-second stamp
+    # sorts before a fractional stamp of the same second only after parsing
+    # (lexicographically '.' precedes 'Z').
+    records = order_by_created_at_instant(
+        machines.list_status_history(session, machine_id)
+    )
+    payload = [
+        {
+            "id": record.id,
+            "machine_id": record.machine_id,
+            "from_status": record.from_status,
+            "to_status": record.to_status,
+            "created_at": record.created_at,
+        }
+        for record in records
+    ]
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 class KeyRotationEventOut(BaseModel):
     id: str
     machine_id: str

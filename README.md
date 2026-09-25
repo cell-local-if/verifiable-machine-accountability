@@ -94,6 +94,29 @@ append either commit together or leave no trace. Body validation (`422`) and
 the missing-machine/path-resource (`404 not_found`) outcomes are unchanged by
 this serialization and never flip error types under a status race.
 
+## Machine status history
+
+Every accepted status change appends exactly one immutable record to the
+`machine_status_events` table inside the same locked write transaction that
+updates the machine, so the status update and its history record commit
+together or not at all. History records are never updated, deleted, or
+recomputed afterwards, and the table is created automatically at startup on
+databases that predate the feature, without touching existing records.
+
+`GET /machines/{machine_id}/status-history` returns the machine's own
+transition records as a JSON array — empty when the machine has never changed
+status. The query accepts no parameters: any query parameter is a
+`422 {"error":{"code":"invalid_query"}}` raised before the machine is looked
+up, a missing machine is `404 {"error":{"code":"not_found"}}`, and only `GET`
+is routed (other methods return `405`). Each item carries exactly
+`{id, machine_id, from_status, to_status, created_at}` in this fixed field
+order, with `created_at` the UTC commit-moment stamp ending in `Z`. Records
+are ordered by the actual UTC instant of `created_at`, then by `id`. The
+response body is compact UTF-8 JSON terminated by a single newline and
+contains no floating-point or non-finite values. The query only reads: it
+never creates, updates, deletes, repairs, or normalizes status, history, or
+any other record, and another machine's records never enter the result.
+
 ## Read-only joint-write transaction diagnostics
 
 `GET /machines/{machine_id}/diag` exposes read-only observability over the

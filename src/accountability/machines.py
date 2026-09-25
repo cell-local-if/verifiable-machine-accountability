@@ -1,17 +1,21 @@
 """Persistent machine enablement state (``active`` <-> ``suspended``).
 
 Every accepted status change updates only the machine's ``status`` and
-``updated_at`` inside a single locked write transaction; ``version``,
+``updated_at`` and appends exactly one immutable ``machine_status_events``
+history record, all inside a single locked write transaction; ``version``,
 ``public_key``, ``created_at``, and every other record are left untouched.
 The lock serializes concurrent updates, so two requests for the same target
-status can never both observe the prior state: at most one succeeds, and the
-other sees ``invalid_status_transition`` and writes nothing. The state lives
-in the ``machines`` table, so it survives restarts.
+status can never both observe the prior state: at most one succeeds and
+appends its history record, and the other sees ``invalid_status_transition``
+and writes nothing. The state lives in the ``machines`` table and the history
+in ``machine_status_events``, so both survive restarts.
 """
 
+import uuid
 from typing import Any
 
 from sqlalchemy import Connection, Engine, func, select
+from sqlalchemy.orm import Session
 
 from .chain import (
     JointWriteOutcome,
@@ -19,9 +23,10 @@ from .chain import (
     run_joint_write,
     verify_chain,
 )
-from .db import AuthorizationDecisionEvent, Machine
+from .db import AuthorizationDecisionEvent, Machine, MachineStatusEvent
 
 _MACHINE_TABLE = Machine.__table__
+_HISTORY_TABLE = MachineStatusEvent.__table__
 
 _MACHINE_FIELDS = (
     "id",
@@ -53,7 +58,8 @@ def change_machine_status(
       diagnosed as a ``race`` rollback;
     * ``ok`` — with the full updated ``machine`` record. Only ``status`` and
       ``updated_at`` change; ``version``, ``public_key``, and ``created_at``
-      keep their stored values.
+      keep their stored values. The update and the append of exactly one
+      status-history record commit atomically: a failure leaves neither.
 
     Every attempt records exactly one joint-write diagnostic.
     """
@@ -95,6 +101,20 @@ def change_machine_status(
                 {"status": "invalid_status_transition"}, fail="race"
             )
 
+        # The history record joins the same transaction, so the status update
+        # and its history append commit together or not at all; its timestamp
+        # is the transaction's commit-moment clock read, shared with the
+        # machine's updated_at.
+        conn.execute(
+            _HISTORY_TABLE.insert().values(
+                id=str(uuid.uuid4()),
+                machine_id=machine_id,
+                from_status=current_status,
+                to_status=to_status,
+                created_at=now,
+            )
+        )
+
         updated_row = conn.execute(
             _MACHINE_TABLE.select().where(_MACHINE_TABLE.c.id == machine_id)
         ).first()
@@ -117,4 +137,21 @@ def change_machine_status(
 
     return run_joint_write(
         engine, machine_id=machine_id, op="change", work=_work
+    )
+
+
+def list_status_history(
+    session: Session, machine_id: str
+) -> list[MachineStatusEvent]:
+    """Return one machine's immutable status transitions, unordered.
+
+    The caller applies the chronological (created_at instant, id) ordering;
+    this helper only reads the machine's own rows and never writes.
+    """
+    return list(
+        session.scalars(
+            select(MachineStatusEvent).where(
+                MachineStatusEvent.machine_id == machine_id
+            )
+        )
     )
