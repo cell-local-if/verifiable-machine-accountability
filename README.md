@@ -477,6 +477,54 @@ machine, ignores links whose target event no longer exists, terminates even
 when links form a cycle, and returns an empty array when nothing is
 reachable. The query never writes or modifies any record.
 
+## Global policy rule tamper-evident chain
+
+The whole `policy_rules` table forms one global, tamper-evident hash chain
+covering global rules only, following the same digest rules as the other
+integrity chains. A successful `POST /policy-rules` inserts the rule and
+appends it to the chain tail in one locked write transaction — the business
+duplicate check, the insert, and the tail link commit together or not at all
+— so concurrent creations cannot lose rules, fork the chain, skip a link, or
+point two rules at the same predecessor. An invalid body is still a `422`
+before any write and a repeated trimmed `(action_type, resource_pattern,
+priority)` business identity is still a `409 duplicate_policy_rule`; neither
+failure writes a rule or a chain link. The create response keeps the rule's
+existing visible fields unchanged.
+
+Every item returned by `GET /policy-rules/chain` carries the rule's existing
+visible fields `{id, action_type, resource_pattern, effect, priority,
+created_at, updated_at}` plus:
+
+- `previous_rule_id` — the prior rule's id, or `null` for the first rule;
+- `content_hash` — `SHA-256(UTF-8(JSON))` of the compact key-sorted JSON
+  document built from exactly the seven visible fields;
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first
+  rule and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))`
+  thereafter.
+
+Both digests are 64 lowercase hexadecimal characters. The chain is ordered by
+the actual UTC instant of `created_at` and then by id — an exact-second rule
+precedes any fractional-second rule of the same second — and a stored
+`created_at` that no longer parses sorts deterministically last instead of
+crashing a read; such a rule still enters the total count and is judged on
+its chain values like every other rule.
+
+`GET /policy-rules/chain` returns the complete chain, `[]` on an empty
+database. `GET /policy-rules/integrity` verifies the chain read-only and
+returns `{valid, checked_count, broken_policy_rule_id}`: a complete or empty
+chain reports `true`, the total count, and `null`; otherwise it reports the
+first rule in chain order whose content hash, previous-rule link, or chain
+hash does not verify, by its stored id. Both paths accept `GET` only (other
+methods return `405` without reading rule content), take no query parameter
+(any parameter is `422 {"error":{"code":"invalid_query"}}` during validation,
+identically on an empty database), and are strictly read-only — they never
+create, update, delete, repair, recompute, or normalize a rule, so repeated
+calls are byte-identical. On startup the service adds the new columns to
+pre-existing databases and backfills missing chain data in stable
+`(created_at instant, id)` order; restarting over an already complete chain
+issues no writes. The policy rule listing, the compliance export, and
+authorization evaluation are unchanged and expose no chain fields.
+
 ## Read-only global policy rule listing
 
 `GET /policy-rules` returns every global policy rule, or `[]` when none exist.

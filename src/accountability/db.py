@@ -97,6 +97,12 @@ class PolicyRule(Base):
     priority: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
+    # Global hash chain over every policy rule. Nullable so databases created
+    # before the rule-chain feature keep working; the startup migration
+    # backfills any missing values.
+    previous_rule_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class AuthorizationDecisionEvent(Base):
