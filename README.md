@@ -492,6 +492,41 @@ normalizes, or repairs a rule — takes no part in authorization evaluation,
 returns identical results on repeat calls against unchanged data, and reads
 rules persisted across application restarts.
 
+## Read-only global policy rule compliance export
+
+`GET /policy-rules/compliance-export` returns a deterministic, read-only
+compliance slice of the global policy rules over a closed time window. Exactly
+two query parameters are accepted, both validated before any policy rule is
+read, so an invalid query never reads rule data:
+
+- `from_created_at`, `to_created_at` — required UTC RFC 3339 date-times ending
+  in `Z` (fractional seconds optional; surrounding whitespace, offset forms
+  such as `+00:00`, a missing suffix, and out-of-range calendar/time values
+  are rejected); `from_created_at` must not be later than `to_created_at`
+  (equal bounds are allowed).
+
+Any other parameter name returns `422 {"error":{"code":"invalid_query"}}`; a
+missing, blank, malformed, or inverted bound returns
+`422 {"error":{"code":"bad_time"}}`. Only `GET` is routed; other methods
+return `405` without filtering, sorting, reading rule content, or writing
+anything.
+
+The response is `{from_created_at, to_created_at, policy_rules}` with the
+bounds echoed exactly as submitted. `policy_rules` is always present — an
+empty array when the window (or the table) contains nothing — and holds only
+global rules whose own `created_at` falls inside the closed interval, ordered
+by the actual UTC instant of `created_at` and then by `id` (an exact-second
+record sorts before any fractional-second record of the same second). Each
+item carries exactly the persisted `{id, action_type, resource_pattern,
+effect, priority, created_at, updated_at}` values of the policy rule listing:
+missing, illegal, or duplicated stored data is emitted verbatim, never
+filtered out, repaired, or normalized. The endpoint is strictly read-only — it
+never creates, updates, deletes, repairs, recomputes, or normalizes a rule and
+never changes an authorization evaluation — and the body is compact UTF-8 JSON
+in a fixed field order terminated by a single newline, free of any
+floating-point or non-finite value, byte-identical on repeat calls against
+unchanged data, including data persisted across application restarts.
+
 ## Read-only compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/compliance-export`

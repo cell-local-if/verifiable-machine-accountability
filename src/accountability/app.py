@@ -3915,6 +3915,89 @@ def export_machine_accountability(
     )
 
 
+# --- read-only global policy rule compliance export -------------------------
+
+
+@app.get("/policy-rules/compliance-export")
+def export_policy_rules_compliance(
+    params: Annotated[
+        ComplianceExportParams, Depends(validate_accountability_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only compliance export of the global policy rules over a window.
+
+    The caller submits exactly two query parameters — ``from_created_at`` and
+    ``to_created_at``, both required UTC RFC 3339 date-times ending in ``Z``
+    (fractional seconds optional; offset forms, surrounding whitespace, a
+    missing suffix, and out-of-range calendar/time values are rejected), with
+    the lower bound not later than the upper bound (equal bounds allowed). Any
+    other parameter name is a 422 ``invalid_query``; a missing, blank,
+    malformed, or inverted bound is a 422 ``bad_time``. Both rejections happen
+    in the validation stage, before any policy rule is read. Only ``GET`` is
+    routed; other methods return 405 without filtering, sorting, reading rule
+    content, or writing anything.
+
+    On success the response carries ``from_created_at`` and ``to_created_at``
+    echoed exactly as submitted, and ``policy_rules`` — always present, an
+    empty array when the window (or the table) contains nothing. The array
+    holds only global rules whose own ``created_at`` falls inside the closed
+    interval, ordered by the actual UTC instant of ``created_at`` and then by
+    id, so an exact-second record sorts before any fractional-second record of
+    the same second. Each item carries exactly the persisted ``{id,
+    action_type, resource_pattern, effect, priority, created_at, updated_at}``
+    values of the policy rule listing: missing, illegal, or duplicated stored
+    data is emitted verbatim, never filtered out, repaired, or normalized. The
+    export is strictly read-only — it never creates, updates, deletes,
+    repairs, recomputes, or normalizes a rule and never changes an
+    authorization evaluation — and the body is compact UTF-8 JSON in a fixed
+    field order terminated by a single newline, free of any floating-point or
+    non-finite value, byte-identical on repeat calls against unchanged data,
+    including data persisted across application restarts.
+    """
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    # Membership is decided by each rule's own created_at parsed to a UTC
+    # instant; ordering parses stamps for the same reason as the listing — an
+    # exact-second ISO stamp sorts before a fractional stamp of the same
+    # second only after parsing (lexicographically '.' precedes 'Z').
+    rules = session.scalars(select(PolicyRule)).all()
+    in_window = [
+        rule
+        for rule in rules
+        if window_start <= parse_utc_z_datetime(rule.created_at) <= window_end
+    ]
+    records = order_by_created_at_instant(in_window)
+
+    payload = {
+        "from_created_at": params.from_created_at,
+        "to_created_at": params.to_created_at,
+        "policy_rules": [
+            {
+                "id": rule.id,
+                "action_type": rule.action_type,
+                "resource_pattern": rule.resource_pattern,
+                "effect": rule.effect,
+                "priority": rule.priority,
+                "created_at": rule.created_at,
+                "updated_at": rule.updated_at,
+            }
+            for rule in records
+        ],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- read-only machine-level integrity summary ------------------------------
 
 
