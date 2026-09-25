@@ -1149,6 +1149,144 @@ async def preview_policy_rule_decision(request: Request):
     return Response(content=body, media_type="application/json")
 
 
+@app.post("/policy-rules/decision-preview/batch")
+async def preview_policy_rule_decision_batch(request: Request):
+    """Read-only batch preview of global policy decisions for many requests.
+
+    The body is a JSON object carrying exactly one field, ``requests``, an
+    array whose items each carry exactly the string fields ``action`` and
+    ``resource``; the empty array is legal and yields an empty result. Every
+    check runs entirely before any rule is read, and any single illegal item
+    rejects the whole batch with no partial analysis:
+
+    - any query parameter is ``422 invalid_query`` first of all;
+    - a body that is not a JSON object, that lacks or adds a top-level field,
+      whose ``requests`` is not an array, or whose items are not objects with
+      exactly ``action`` and ``resource`` is ``422 invalid_batch``;
+    - an item whose action or resource is not a string, or is empty after
+      trimming, is ``422 invalid_value``.
+
+    Non-POST methods return ``405`` without reading rules. All items are
+    analyzed against one same-instant snapshot of the global rule table, read
+    once; no input can change another item's result, and a failure that
+    prevents reading the rules returns ``500 internal_error`` with no partial
+    analysis. Each item applies the single-preview matching, conflict, winner,
+    override, and final-decision semantics unchanged, including the relation
+    annotations.
+
+    The response is ``{batch_count, analyses, summary, decisions}`` in this
+    fixed field order. ``batch_count`` is the number of submitted requests.
+    ``analyses`` has one ``{input, result}`` entry per request in input
+    order, where ``input`` echoes the trimmed ``{action, resource}`` and
+    ``result`` is exactly the single-preview payload for that pair.
+    ``summary`` counts, in the fixed key order ``no_match``, ``allow``,
+    ``deny``, ``conflict``, ``override``: inputs with no matching candidate,
+    inputs decided allow, inputs decided deny, inputs reporting a conflict
+    group, and inputs with at least one overridden candidate. ``decisions``
+    counts final decisions under the three existing reason keys
+    ``no_matching_policy``, ``allowed_by_policy``, ``denied_by_policy``; empty
+    categories stay present with the JSON integer zero. The query is strictly
+    read-only — it never creates, updates, deletes, repairs, recomputes, or
+    normalizes anything — and the body is compact UTF-8 JSON terminated by a
+    single newline, free of floating-point or non-finite values,
+    byte-identical on repeat calls against unchanged data, including data
+    persisted across restarts.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_batch")
+    if not isinstance(payload, dict) or set(payload) != {"requests"}:
+        return error_response(422, "invalid_batch")
+    requests_raw = payload["requests"]
+    if isinstance(requests_raw, bool) or not isinstance(requests_raw, list):
+        return error_response(422, "invalid_batch")
+
+    # Structural item failures are invalid_batch; a well-shaped item whose
+    # action/resource fails the value domain is invalid_value. Structure is
+    # checked for every item before any value is (the single preview's
+    # structural-before-value precedence, applied batch-wide), and either
+    # failure rejects the whole batch before any rule is read.
+    for item in requests_raw:
+        if not isinstance(item, dict) or set(item) != {"action", "resource"}:
+            return error_response(422, "invalid_batch")
+
+    items: list[tuple[str, str]] = []
+    for item in requests_raw:
+        action_raw, resource_raw = item["action"], item["resource"]
+        if isinstance(action_raw, bool) or not isinstance(action_raw, str):
+            return error_response(422, "invalid_value")
+        if isinstance(resource_raw, bool) or not isinstance(resource_raw, str):
+            return error_response(422, "invalid_value")
+        action = action_raw.strip()
+        resource = resource_raw.strip()
+        if not action or not resource:
+            return error_response(422, "invalid_value")
+        items.append((action, resource))
+
+    try:
+        with Session(request.app.state.engine) as session:
+            # One snapshot of the rule table decides the whole batch, so no
+            # item can observe or cause a change in another item's analysis.
+            stored_rules = policy_preview.load_rules(session)
+            results = [
+                policy_preview.build_preview(action, resource, stored_rules)
+                for action, resource in items
+            ]
+    except Exception:
+        # Never emit a partial analysis when the rules cannot be read.
+        return error_response(500, "internal_error")
+
+    analyses = [
+        {
+            "input": {"action": action, "resource": resource},
+            "result": result,
+        }
+        for (action, resource), result in zip(items, results)
+    ]
+
+    summary = {"no_match": 0, "allow": 0, "deny": 0, "conflict": 0, "override": 0}
+    decisions = {
+        "no_matching_policy": 0,
+        "allowed_by_policy": 0,
+        "denied_by_policy": 0,
+    }
+    for result in results:
+        decision = result["decision"]
+        decisions[decision["reason"]] += 1
+        if decision["reason"] == "no_matching_policy":
+            summary["no_match"] += 1
+        if decision["allowed"]:
+            summary["allow"] += 1
+        else:
+            summary["deny"] += 1
+        if result["conflicts"]:
+            summary["conflict"] += 1
+        if any(rule["relation"] == "overridden" for rule in result["rules"]):
+            summary["override"] += 1
+
+    batch_payload = {
+        "batch_count": len(items),
+        "analyses": analyses,
+        "summary": summary,
+        "decisions": decisions,
+    }
+    # Serialize by hand so the body is compact UTF-8 JSON in a fixed field
+    # order, terminated by a single newline, and free of floating-point or
+    # non-finite values (allow_nan=False).
+    body = (
+        json.dumps(
+            batch_payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 class KeyRotationComplianceExportOut(BaseModel):
     machine_id: str
     from_created_at: str

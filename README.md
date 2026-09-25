@@ -658,6 +658,51 @@ creation, the rule listing, the window export, authorization evaluation, the
 machine interfaces, the event chain, and the existing compliance exports are
 unchanged.
 
+## Read-only batch global policy rule decision preview
+
+`POST /policy-rules/decision-preview/batch` runs the single-preview analysis
+for a whole batch of hypothetical `(action, resource)` requests against one
+same-instant snapshot of the global rule table, read once. It is a pure
+read-only audit entry: it consults no machine status, behavior declarations,
+or authorization decision events, writes nothing, and no input can change
+another input's result. The body is a JSON object carrying exactly one field,
+`requests`, an array whose items each carry exactly the string fields
+`action` and `resource`; the empty array is legal and yields an empty result.
+Validation runs entirely before any rule is read, and any single illegal item
+rejects the whole batch with no partial analysis:
+
+- any query parameter is `422 {"error":{"code":"invalid_query"}}`, checked
+  before the body is even parsed;
+- a body that is not a JSON object, that lacks or adds a top-level field,
+  whose `requests` is not an array, or whose items are not objects with
+  exactly `action` and `resource` is
+  `422 {"error":{"code":"invalid_batch"}}`;
+- an item whose `action` or `resource` is not a string, or is empty after
+  trimming, is `422 {"error":{"code":"invalid_value"}}`.
+
+The path accepts `POST` only; other methods return `405` without reading
+rules. A failure that prevents reading the rules returns
+`500 {"error":{"code":"internal_error"}}` with no partial analysis.
+
+On success the response is `{batch_count, analyses, summary, decisions}` in
+this fixed field order. `batch_count` is the number of submitted requests.
+`analyses` has one `{input, result}` entry per request in input order, where
+`input` echoes the trimmed `{action, resource}` and `result` is exactly the
+single-preview payload for that pair — the same matching, conflict, winner,
+override, relation-annotation, and final-decision semantics, unchanged.
+`summary` counts, in the fixed key order `no_match`, `allow`, `deny`,
+`conflict`, `override`: inputs with no matching candidate, inputs decided
+allow, inputs decided deny, inputs reporting a conflict group, and inputs
+with at least one overridden candidate. `decisions` counts final decisions
+under the three existing reason keys `no_matching_policy`,
+`allowed_by_policy`, `denied_by_policy`; empty categories stay present with
+the JSON integer zero. The body is compact UTF-8 JSON terminated by a single
+newline, free of floating-point, `-0.0`, or non-finite values, byte-identical
+on repeat calls against unchanged data, including data persisted across
+application restarts. The single preview, rule creation, the rule listing,
+the window export, the integrity chain, and authorization evaluation are
+unchanged.
+
 ## Read-only compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/compliance-export`
