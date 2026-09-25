@@ -788,6 +788,63 @@ and empty databases need no migration. The existing create queries, hash
 chains, diagnostics terminal state, integrity summary, and other compliance
 exports are unchanged.
 
+## Read-only desensitized authorization decision event privacy export
+
+`GET /machines/{machine_id}/authorization-decision-events/privacy-export`
+returns a deterministic, read-only, machine-level privacy view of the machine's
+authorization decision events. It submits only the machine id and the time
+window; both query parameters are required and validated before the machine or
+any event is read, so an invalid query never touches machine or event data and
+still reports `422` when the machine does not exist:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); `from_created_at` must not be later than `to_created_at` (equal
+  bounds are allowed). A missing, blank, offset, malformed, or inverted bound
+  returns `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`.
+- The path accepts `GET` only; other methods return `405` without reading
+  events, computing digests, or writing anything.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}` with no event data.
+
+The response is `{machine_id, from_created_at, to_created_at, events}`; the
+bounds are echoed verbatim and `events` is always present, an empty array when
+the window contains nothing (including an empty database). The array contains
+only events whose stored `machine_id` is the path machine and whose own
+`created_at` falls inside the closed interval `[from_created_at,
+to_created_at]`. Records are ordered by the actual UTC instant of `created_at`
+and then by record id, so an exact-second record sorts before any
+fractional-second record of the same second.
+
+Each item keeps the existing visible and chain fields exactly as stored —
+`{id, machine_id, allowed, reason, created_at, previous_event_id,
+content_hash, chain_hash}`. The raw `action_type` and `resource` values are
+never emitted; their positions carry `action_ref` and `resource_ref` instead:
+
+- `action_ref` = lowercase-hex `SHA-256(UTF-8("privacy:v1|action" +
+  machine_id + action_with_surrounding_whitespace_removed))`;
+- `resource_ref` follows the same order and digest with the
+  `privacy:v1|resource` prefix.
+
+When the stored value is not a string or is empty after trimming surrounding
+whitespace, the corresponding ref is `null`; the event is still included.
+Corrupted, missing, misowned, or duplicated data likewise never causes an
+event to be filtered out, rewritten, or repaired (a `created_at` that no longer
+parses sorts after every parseable instant and can never fall inside a finite
+window, while its stored text is left untouched), and another machine's events
+can never enter the result. The endpoint issues no writes, repairs,
+deletions, recomputations, or normalizations, produces byte-identical compact
+UTF-8 JSON (terminated by a single newline, with no floating-point, `-0.0`, or
+non-finite value and a stable field order) for identical data and parameters
+on repeat calls, reads events persisted across application restarts, and adds
+no schema — old and empty databases need no migration. Event registration,
+the event list, the other compliance exports, the hash chains, and the
+integrity audits are unchanged.
+
 ## Machine-level privacy access registration and read-only query
 
 Two machine-scoped entries provide a machine-level audit of privacy data

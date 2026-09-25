@@ -2081,6 +2081,160 @@ def export_key_rotation_events_privacy(
     return Response(content=body, media_type="application/json")
 
 
+# --- read-only desensitized authorization-decision-event privacy export ------
+
+
+# A stored decision-event ``created_at`` that no longer parses is ordered
+# after every parseable record (the same tolerant convention the policy-rule
+# and evidence exports use), so a damaged stamp sorts deterministically last
+# instead of crashing the read-only privacy view; such a degenerate instant
+# can never fall inside a finite window.
+_DECISION_EVENT_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _decision_event_created_instant(value: object) -> datetime:
+    """Parse a stored decision-event ``created_at`` to its UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract; a
+    damaged value sorts after every parseable record instead of raising, so
+    the read-only privacy export neither crashes nor repairs the stored text.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _DECISION_EVENT_FAR_FUTURE
+
+
+def privacy_decision_event_to_dict(
+    record: AuthorizationDecisionEvent,
+) -> dict[str, object]:
+    """Desensitized privacy view of one stored authorization decision event.
+
+    The raw ``action_type`` and ``resource`` never leave the service: their
+    positions carry ``action_ref``/``resource_ref``, the SHA-256 digests of
+    ``privacy:v1|action`` / ``privacy:v1|resource`` concatenated with the
+    machine id and the stored value with surrounding whitespace removed
+    (``null`` when the stored value is not a string or is blank after
+    trimming). Every other field — id, machine id, decision result,
+    created_at, and the chain link/digests — is emitted exactly as stored,
+    in this fixed field order.
+    """
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "allowed": record.allowed,
+        "reason": record.reason,
+        "created_at": record.created_at,
+        "previous_event_id": record.previous_event_id,
+        "content_hash": record.content_hash,
+        "chain_hash": record.chain_hash,
+        "action_ref": privacy_reference_digest(
+            "action", record.machine_id, record.action_type
+        ),
+        "resource_ref": privacy_reference_digest(
+            "resource", record.machine_id, record.resource
+        ),
+    }
+
+
+@app.get("/machines/{machine_id}/authorization-decision-events/privacy-export")
+def export_authorization_decision_events_privacy(
+    machine_id: str,
+    params: Annotated[
+        ComplianceExportParams, Depends(validate_accountability_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only desensitized privacy export of one machine's authorization
+    decision events over a closed time window.
+
+    The caller submits only the path machine id and the two required bounds
+    ``from_created_at``/``to_created_at`` — UTC RFC 3339 date-times ending in
+    ``Z`` (fractional seconds optional, equal bounds allowed); any other
+    query parameter is a 422 ``invalid_query`` and a missing, blank,
+    whitespace-padded, offset, malformed, out-of-range, or inverted bound is
+    a 422 ``bad_time``, both raised during validation before any machine or
+    event data is read. A missing machine is a 404 ``not_found`` carrying no
+    event data. Only ``GET`` is routed; other methods return 405 without
+    reading events, computing digests, or writing anything.
+
+    On success the response carries the machine id, the bounds echoed
+    verbatim, and ``events`` — always present, an empty array when the
+    window contains nothing. The array holds only events owned by the path
+    machine whose own ``created_at`` falls in the inclusive interval,
+    ordered by the actual UTC instant of ``created_at`` and then by id, so an
+    exact-second event sorts before any fractional-second event of the same
+    second. Each item keeps the event's existing visible fields (except the
+    raw action and resource) and chain fields — id, machine id, ``allowed``,
+    ``reason``, ``created_at``, ``previous_event_id``, ``content_hash``,
+    ``chain_hash`` — and the action/resource positions carry
+    ``action_ref``/``resource_ref`` instead: ``SHA-256(UTF-8(
+    "privacy:v1|action" + machine_id + action_with_surrounding_whitespace_
+    removed))`` and the same with the ``privacy:v1|resource`` prefix, 64
+    lowercase hexadecimal characters, or ``null`` when the stored value is
+    not a string or is blank after trimming. Events are exported exactly as
+    stored — corrupted, missing, misowned, or duplicated data never causes
+    an event to be rewritten, filtered out, or repaired, and another
+    machine's events can never enter the result. The query only issues
+    reads; the body is compact UTF-8 JSON with a fixed field order ending in
+    a single newline, contains no floating-point, ``-0.0``, or non-finite
+    value, and is byte-identical on repeat calls against unchanged data,
+    including data persisted across application restarts. It adds no schema.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    # Membership is decided by the event's own machine_id and created_at
+    # only; ordering parses stamps to UTC instants because an exact-second
+    # stamp sorts before a fractional stamp of the same second only after
+    # parsing (lexicographically '.' precedes 'Z'). A damaged previous-event
+    # link or chain hash is never consulted and is emitted verbatim, and a
+    # damaged created_at sorts last rather than raising (and can never fall
+    # inside a finite window).
+    machine_events = session.scalars(
+        select(AuthorizationDecisionEvent).where(
+            AuthorizationDecisionEvent.machine_id == machine_id
+        )
+    ).all()
+    in_window = [
+        event
+        for event in machine_events
+        if window_start
+        <= _decision_event_created_instant(event.created_at)
+        <= window_end
+    ]
+    records = sorted(
+        in_window,
+        key=lambda event: (
+            _decision_event_created_instant(event.created_at),
+            event.id,
+        ),
+    )
+
+    payload = {
+        "machine_id": machine_id,
+        "from_created_at": params.from_created_at,
+        "to_created_at": params.to_created_at,
+        "events": [privacy_decision_event_to_dict(record) for record in records],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- read-only desensitized machine identity privacy export ------------------
 
 
