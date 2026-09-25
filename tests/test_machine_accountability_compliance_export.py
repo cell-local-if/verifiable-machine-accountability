@@ -17,6 +17,7 @@ from sqlalchemy import text
 
 from accountability.app import app
 from accountability.chain import backfill_chains
+from accountability.evidence_chain import backfill_chains as backfill_evidence_chains
 
 
 @pytest.fixture
@@ -182,6 +183,7 @@ def insert_evidence_row(client, machine_id, evidence_id, event_id, created_at, *
                 "created_at": created_at,
             },
         )
+    backfill_evidence_chains(client.app.state.engine)
 
 
 def insert_incident_row(client, machine_id, incident_id, event_id, created_at, *,
@@ -279,6 +281,8 @@ EVIDENCE_KEYS = {
     "evidence_type",
     "content_hash",
     "created_at",
+    "previous_evidence_id",
+    "chain_hash",
 }
 INCIDENT_KEYS = {
     "id",

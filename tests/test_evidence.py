@@ -83,7 +83,12 @@ def test_create_evidence_returns_201_with_full_record(client):
         "evidence_type",
         "content_hash",
         "created_at",
+        "previous_evidence_id",
+        "chain_hash",
     }
+    assert body["previous_evidence_id"] is None
+    assert isinstance(body["chain_hash"], str)
+    assert len(body["chain_hash"]) == 64
 
 
 def test_create_evidence_strips_evidence_type_whitespace(client):

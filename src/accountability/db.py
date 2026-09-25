@@ -141,6 +141,11 @@ class AuthorizationDecisionEvidence(Base):
     evidence_type: Mapped[str] = mapped_column(String, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
+    # Per-machine hash chain over every evidence record of one machine.
+    # Nullable so databases created before the chain feature keep working; the
+    # startup migration backfills any missing values.
+    previous_evidence_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class AuthorizationDecisionIncident(Base):

@@ -254,6 +254,71 @@ normalizes evidence, events, hash chains, or causal links — gives identical
 results on repeat calls against unchanged data, and audits data persisted
 across application restarts.
 
+## Per-machine evidence hash chain and read-only chain verification
+
+Beyond the fingerprint and the independent audit above, every machine's
+evidence records also form their own per-machine, tamper-evident hash chain.
+Every evidence record returned by the registration, list, and evidence
+compliance-export endpoints carries the same two new fields in the same
+positions:
+
+- `previous_evidence_id` — `null` for the machine's first evidence record,
+  otherwise the id of the immediately preceding record in `(created_at, id)`
+  order (records sort by the actual UTC instant, then by record id);
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first
+  record and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))`
+  thereafter.
+
+The content digest follows the same compact form as the other chains:
+`SHA-256(UTF-8(compact key-sorted JSON of {id, machine_id, event_id,
+evidence_type, content_hash, created_at}))`. The evidence fingerprint keeps
+its existing `content_hash` name and participates in the digest as one of the
+six content fields; it is not replaced or duplicated. All hashes are
+64-character lowercase hexadecimal strings. Each machine chains
+independently: the first record of a machine has a `null` predecessor and no
+two records of one machine point at the same predecessor or across machines.
+
+Registration keeps the existing machine-event evidence path and call
+contract: an illegal body is `422` (before any path lookup), a missing
+machine/event or a foreign-owned event is `404 not_found`, and a fingerprint
+already registered on the same event is `409 duplicate_evidence` and writes
+nothing. On success the machine/event ownership lookup, duplicate check,
+insert, and chain-tail append commit together in one locked write
+transaction, so concurrent registrations cannot lose records, skip a link,
+repeat a predecessor, or fork the chain; the result is equivalent to one
+definite serial order. Registration never modifies events, the event hash
+chain, incidents, or causal links.
+
+On startup the service adds the two new columns to pre-existing databases and
+backfills missing chain data per machine in `(created_at, id)` order; the
+recomputation is deterministic, so restarting with an already complete
+database performs no writes, and an empty database is fully usable for
+registration and queries.
+
+`GET /machines/{machine_id}/authorization-decision-events/evidence-chain/integrity`
+verifies the whole evidence chain read-only and returns the existing
+`{valid, checked_count, broken_evidence_id}` shape: it applies the existing
+audit conclusions (the event resolves to an event of the same machine, the
+evidence type is non-blank after trimming, and the fingerprint is exactly 64
+lowercase hexadecimal characters compared as stored) and additionally checks
+the compact content digest, the previous-evidence link, and the chain digest.
+A well-formed `created_at` is required as well: a damaged timestamp is itself
+an anomaly and its record still enters the total. A complete or empty chain
+reports `true`, the total count, and `null` (an empty chain reports `true`,
+`0`, `null`); otherwise it reports `false`, the machine's total evidence
+count, and the first record that fails — never a partial conclusion. A
+record whose associated event is missing is retained and counted. Only the
+path machine's records are examined, so damage under another machine never
+affects the result. The path accepts `GET` only; other methods return `405`
+without reading records. Any query parameter is
+`422 {"error":{"code":"invalid_query"}}` raised before the machine is looked
+up; after validation a missing machine returns
+`404 {"error":{"code":"not_found"}}`. The query produces no writes, reports
+only the first error, never repairs anything, and returns byte-identical
+results on repeat calls and across restarts. The existing evidence audit,
+events, rotations, incidents, diagnostics, and export filtering semantics are
+unchanged.
+
 ## Persistent exception-handling incident registrations
 
 `POST /machines/{machine_id}/authorization-decision-events/{event_id}/incidents`

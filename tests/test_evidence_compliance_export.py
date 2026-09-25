@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 from accountability.app import app
 from accountability.chain import backfill_chains
+from accountability.evidence_chain import backfill_chains as backfill_evidence_chains
 
 
 @pytest.fixture
@@ -106,6 +107,7 @@ def insert_evidence_row(
                 "created_at": created_at,
             },
         )
+    backfill_evidence_chains(client.app.state.engine)
 
 
 def eid(n):
