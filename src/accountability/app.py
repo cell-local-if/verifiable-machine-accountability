@@ -580,6 +580,28 @@ def list_policy_rules(session: SessionDep):
     return [policy_rule_to_out(rule) for rule in order_by_created_at_instant(rules)]
 
 
+# A stored ``created_at`` that no longer parses is ordered after every
+# parseable record (the same tolerant convention the evidence chain uses), so
+# a damaged stamp sorts deterministically last instead of crashing a read-only
+# audit; such a degenerate instant can never fall inside a finite window.
+_POLICY_RULE_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _policy_rule_created_instant(value: object) -> datetime:
+    """Parse a stored policy-rule ``created_at`` to its UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract; a
+    damaged value sorts after every parseable record instead of raising, so the
+    read-only window export neither crashes nor repairs the stored text.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _POLICY_RULE_FAR_FUTURE
+
+
 class AuthorizationEvaluationCreate(BaseModel):
     action_type: NonEmptyStr
     resource: NonEmptyStr
@@ -830,6 +852,87 @@ def validate_accountability_export_params(
         from_created_at=raw_from,  # type: ignore[arg-type]
         to_created_at=raw_to,  # type: ignore[arg-type]
     )
+
+
+@app.get("/policy-rules/compliance-export")
+def export_policy_rules_compliance(
+    params: Annotated[
+        ComplianceExportParams, Depends(validate_accountability_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only compliance export of global policy rules over a time window.
+
+    The query accepts exactly the two required bounds ``from_created_at``/
+    ``to_created_at`` — UTC RFC 3339 date-times ending in ``Z`` (fractional
+    seconds optional, equal bounds allowed); any other query parameter is a
+    422 ``invalid_query`` and a missing, blank, offset, whitespace-padded,
+    malformed, out-of-range, or inverted bound is a 422 ``bad_time``. Both
+    checks run during validation, before any policy rule is read and without
+    any database access. Only ``GET`` is routed; other methods return 405
+    without filtering, ordering, reading rule content, or writing anything.
+
+    On success the response carries exactly ``{from_created_at,
+    to_created_at, policy_rules}`` in this fixed field order; the bounds are
+    echoed verbatim and ``policy_rules`` is always present, an empty array when
+    the window contains nothing (including an empty database). The array holds
+    only global rules whose own ``created_at`` falls in the closed UTC
+    interval, ordered by the actual UTC instant of ``created_at`` and then by
+    id, so an exact-second rule sorts before any fractional-second rule of the
+    same second. Each item exposes exactly the policy-rule list fields ``{id,
+    action_type, resource_pattern, effect, priority, created_at,
+    updated_at}`` with stored values verbatim — never filtered, repaired, or
+    normalized for missing, illegal, or duplicated data — and no key, secret,
+    or extra policy text is added. A stored ``created_at`` that no longer
+    parses never crashes the export: it deterministically sorts after every
+    parseable instant (and so never falls inside a finite window) while its
+    stored text is left untouched. The query is strictly read-only — it never
+    creates, updates, deletes, repairs, recomputes, or normalizes a rule and
+    never changes an authorization-evaluation result; the body is compact
+    UTF-8 JSON with a single trailing newline, contains no floating-point,
+    ``-0.0``, or non-finite value, is byte-identical on repeat calls against
+    unchanged data, and reads rules persisted across application restarts.
+    """
+    window_start = parse_utc_z_datetime(params.from_created_at)
+    window_end = parse_utc_z_datetime(params.to_created_at)
+
+    rules = session.scalars(select(PolicyRule)).all()
+    in_window = [
+        rule
+        for rule in rules
+        if window_start <= _policy_rule_created_instant(rule.created_at) <= window_end
+    ]
+    records = sorted(
+        in_window,
+        key=lambda rule: (_policy_rule_created_instant(rule.created_at), rule.id),
+    )
+
+    payload = {
+        "from_created_at": params.from_created_at,
+        "to_created_at": params.to_created_at,
+        "policy_rules": [
+            {
+                "id": rule.id,
+                "action_type": rule.action_type,
+                "resource_pattern": rule.resource_pattern,
+                "effect": rule.effect,
+                "priority": rule.priority,
+                "created_at": rule.created_at,
+                "updated_at": rule.updated_at,
+            }
+            for rule in records
+        ],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a fixed
+    # field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 class KeyRotationComplianceExportOut(BaseModel):

@@ -492,6 +492,49 @@ normalizes, or repairs a rule — takes no part in authorization evaluation,
 returns identical results on repeat calls against unchanged data, and reads
 rules persisted across application restarts.
 
+## Read-only global policy rule compliance export
+
+`GET /policy-rules/compliance-export` returns a deterministic, read-only slice
+of the global policy rules over a closed UTC creation-time window. It is a
+separate audit entry point under the global policy rules: the policy rule
+listing and the authorization evaluation entry point are unchanged, and this
+endpoint never participates in an evaluation.
+
+Both query parameters are required and validated before any rule is read, so
+an invalid query never reads policy-rule data:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); `from_created_at` must not be later than `to_created_at` (equal
+  bounds are allowed). A missing, blank, malformed, or inverted bound returns
+  `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`, rejected in the validation phase.
+- The path accepts `GET` only; other methods return `405` without filtering,
+  ordering, reading rule content, or writing anything.
+
+The response is `{from_created_at, to_created_at, policy_rules}`; the bounds
+are echoed verbatim and `policy_rules` is always present, an empty array when
+the window contains nothing (including an empty database). The array contains
+only global rules whose own `created_at` falls inside the closed interval
+`[from_created_at, to_created_at]`. Each item has exactly the policy-rule list
+endpoint fields `{id, action_type, resource_pattern, effect, priority,
+created_at, updated_at}`, emitted exactly as stored with no filtering,
+repair, or normalization of missing, illegal, or duplicated data, and adds no
+privacy field, key content, or policy text. Rules are ordered by the actual
+UTC instant of `created_at` and then by id, so an exact-second rule sorts
+before any fractional-second rule of the same second. A stored `created_at`
+that no longer parses never crashes the export: it deterministically sorts
+after every parseable instant and therefore never falls inside a finite
+window, while its stored text is left untouched.
+
+The endpoint issues no writes, repairs, recomputations, or normalizations,
+never changes an authorization result, produces byte-identical compact UTF-8
+JSON (terminated by a single newline, with no floating-point, `-0.0`, or
+non-finite value and a stable field order) for identical data and parameters
+on repeat calls, and reads rules persisted across application restarts.
+
 ## Read-only compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/compliance-export`
