@@ -653,8 +653,9 @@ exports are unchanged.
 
 ## Machine-level privacy access registration and read-only query
 
-Two machine-scoped entries provide a machine-level audit of privacy data
-access: `privacy-accesses` registration and its `compliance-export` query. They
+Machine-scoped entries provide a machine-level audit of privacy data
+access: `privacy-accesses` registration, its `compliance-export` query, and
+its incremental `changes` paging. They
 follow the existing machine event paths and never change the desensitized
 responsibility export (its response, digest, and filtering semantics are
 unchanged), `GET /health`, the hash chains, diagnostics, or the other
@@ -823,6 +824,48 @@ the time bounds, and the three totals — never a responsible-party rawtext or
 key material — and changes nothing about single registration, batch
 registration, duplicate detection, the integrity audits, the compliance
 exports, or query ordering.
+
+### Paging accesses incrementally
+
+`GET /machines/{machine_id}/privacy-accesses/changes` returns a stable,
+read-only incremental page of the machine's registered accesses. It submits
+the machine id, a required page size, and an optional cursor; validation
+completes before the machine or any access record is read:
+
+- `limit` — required; a non-boolean integer in `1..100`. Decimal forms such
+  as `3.0`, the literals `true`/`false`, and out-of-range or missing values
+  return `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional; when present it must be a string of the form
+  `<accessed_at>|<id>`: the access time exactly as a record carries it (a UTC
+  RFC 3339 date-time ending in `Z`), a vertical bar, and the record UUID. A
+  damaged, non-string, or malformed cursor returns
+  `422 {"error":{"code":"invalid_cursor"}}` and no machine query runs.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`.
+- All checks complete before the machine is looked up, so an invalid query
+  against a non-existent machine is still `422`; after validation a missing
+  machine returns `404 {"error":{"code":"not_found"}}` with no access data.
+- The path accepts `GET` only; other methods return `405` without reading
+  records or computing pages.
+
+The response is `{machine_id, limit, records, next_cursor, has_more}`.
+`records` holds only records owned by the path machine, ordered by the actual
+UTC instant of `accessed_at` and then by record id ascending (an exact-second
+record sorts before any fractional-second record of the same second); an
+empty page is an empty array. Each item exposes exactly `{id, machine_id,
+accessed_at, window_start, window_end, result, matches_count}` — never a
+responsible party, key, policy text, or identity material.
+
+The cursor is exclusive: it names the `(accessed_at, id)` position of the
+last record already returned, and only records strictly after that position
+enter the next page. `next_cursor` points just after this page's last record
+when further records exist and is `null` on the last page; `has_more` is true
+only when records remain after the current position (an empty page reports
+`false`). With unchanged data, repeating a request with the same cursor
+returns the identical next page byte for byte; records inserted behind an old
+cursor never re-enter its pages, while records after it appear in order. The
+query is strictly read-only, reads records persisted across application
+restarts, and needs no migration on an empty or old database.
 
 
 ## Read-only machine-level integrity summary

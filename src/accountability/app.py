@@ -2301,6 +2301,164 @@ def check_privacy_access_integrity(
     )
 
 
+# --- read-only incremental privacy access changes query --------------------
+
+
+# A UUID in the canonical dashed hexadecimal form (either case), exactly as the
+# record ids are stored. Anything else in the cursor's id segment is rejected.
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+class PrivacyAccessChangesParams(BaseModel):
+    limit: int
+    cursor_instant: datetime | None
+    cursor_id: str | None
+
+
+def validate_privacy_access_changes_params(
+    request: Request,
+) -> PrivacyAccessChangesParams:
+    """Validate the privacy-access changes query string before any lookup.
+
+    Exactly two parameters are accepted: ``limit`` (required) and ``cursor``
+    (optional). Any other parameter name is a 422 ``invalid_query``. ``limit``
+    must be a non-boolean integer in 1..100 — query values arrive as strings,
+    so integer-ness is checked against the raw text: decimal forms such as
+    ``3.0`` and the literals ``true``/``false`` are rejected instead of being
+    coerced; a missing or invalid value is a 422 ``bad_limit``. ``cursor``,
+    when present, must be a string of the form ``<accessed_at>|<id>``: the
+    access-time segment exactly as a record carries it (a UTC RFC 3339
+    date-time ending in ``Z``) followed by a vertical bar and the record UUID;
+    a damaged or malformed cursor is a 422 ``invalid_cursor``. All checks run
+    before the machine is looked up and issue no database access, so an
+    invalid query against a non-existent machine still reports 422 rather
+    than 404.
+    """
+    allowed = {"limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    raw_limit = request.query_params.get("limit")
+    if raw_limit is None or not _INTEGER_QUERY_RE.fullmatch(raw_limit):
+        raise QueryError("bad_limit")
+    limit = int(raw_limit)
+    if limit < 1 or limit > 100:
+        raise QueryError("bad_limit")
+
+    cursor_instant: datetime | None = None
+    cursor_id: str | None = None
+    raw_cursor = request.query_params.get("cursor")
+    if raw_cursor is not None:
+        stamp, separator, record_id = raw_cursor.rpartition("|")
+        if (
+            not separator
+            or not _RFC3339_Z_DATETIME_RE.fullmatch(stamp)
+            or not _UUID_RE.fullmatch(record_id)
+        ):
+            raise QueryError("invalid_cursor")
+        try:
+            cursor_instant = parse_utc_z_datetime(stamp)
+        except ValueError:
+            # The shape matched but the calendar/time values are out of range
+            # (e.g. month 13, hour 24).
+            raise QueryError("invalid_cursor") from None
+        cursor_id = record_id
+
+    return PrivacyAccessChangesParams(
+        limit=limit, cursor_instant=cursor_instant, cursor_id=cursor_id
+    )
+
+
+class PrivacyAccessChangesOut(BaseModel):
+    machine_id: str
+    limit: int
+    records: list[PrivacyAccessOut]
+    next_cursor: str | None
+    has_more: bool
+
+
+@app.get(
+    "/machines/{machine_id}/privacy-accesses/changes",
+    response_model=PrivacyAccessChangesOut,
+)
+def list_privacy_access_changes(
+    machine_id: str,
+    params: Annotated[
+        PrivacyAccessChangesParams, Depends(validate_privacy_access_changes_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only stable incremental page of one machine's privacy accesses.
+
+    The caller submits the path machine id, a required page size ``limit``
+    (1..100), and an optional ``cursor``; query validation (``invalid_query``
+    for unknown parameters, ``bad_limit`` for a missing/non-integer/
+    out-of-range limit, ``invalid_cursor`` for a damaged or malformed cursor)
+    completes before the machine is looked up, so an invalid query against a
+    non-existent machine still reports 422. A missing machine is a
+    ``404 not_found`` carrying no access records.
+
+    On success the response carries the machine id, the applied ``limit``,
+    ``records``, ``next_cursor``, and ``has_more``. ``records`` holds only
+    records owned by the path machine, ordered by the actual UTC instant of
+    ``accessed_at`` and then by id ascending (an exact-second record sorts
+    before any fractional-second record of the same second), each exposing
+    exactly ``{id, machine_id, accessed_at, window_start, window_end, result,
+    matches_count}`` — never a responsible party, key, policy text, or
+    identity material. The cursor is exclusive: it names the
+    ``(accessed_at, id)`` position of the last record already returned, and
+    only records strictly after that position enter the page, so resuming
+    from an old cursor never re-reads an already-returned record and records
+    inserted behind the cursor stay invisible to it. ``next_cursor`` points
+    just after this page's last record when further records exist and is
+    ``null`` on the last page; ``has_more`` is true only when records remain
+    after the current position (an empty page reports ``false`` and an empty
+    ``records`` array). With unchanged data, repeating a request with the
+    same cursor returns the identical next page byte for byte. The query only
+    issues reads — it never creates, updates, deletes, repairs, or normalizes
+    a record — and reads records persisted across application restarts; an
+    empty or old database needs no migration. The path accepts ``GET`` only;
+    other methods return ``405`` without reading records or computing pages.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    rows = session.scalars(
+        select(PrivacyAccess).where(PrivacyAccess.machine_id == machine_id)
+    ).all()
+    ordered = sorted(
+        rows,
+        key=lambda row: (parse_utc_z_datetime(row.accessed_at), row.id),
+    )
+
+    if params.cursor_instant is not None:
+        position = (params.cursor_instant, params.cursor_id)
+        ordered = [
+            row
+            for row in ordered
+            if (parse_utc_z_datetime(row.accessed_at), row.id) > position
+        ]
+
+    page = ordered[: params.limit]
+    has_more = len(ordered) > params.limit
+    next_cursor = (
+        f"{page[-1].accessed_at}|{page[-1].id}" if has_more and page else None
+    )
+
+    return PrivacyAccessChangesOut(
+        machine_id=machine_id,
+        limit=params.limit,
+        records=[privacy_access_to_out(record) for record in page],
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
+
+
 class IncidentIntegrityOut(BaseModel):
     valid: bool
     checked_count: int
