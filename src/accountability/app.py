@@ -6,7 +6,7 @@ import uuid
 from collections import deque
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Query, Request
@@ -2107,6 +2107,144 @@ def summarize_privacy_accesses(
         success_count=success_count,
         failed_count=failed_count,
         matches_count=matches_count,
+    )
+
+
+# Fixed summary bucket width: 900 seconds = one UTC quarter hour. Bucket edges
+# are the absolute UTC quarter-hour boundaries (``...:00``/``:15``/``:30``/
+# ``:45``), independent of the request window, and each bucket is the
+# half-open interval ``[bucket_start, bucket_end)``.
+PRIVACY_ACCESS_BUCKET_WIDTH_SECONDS = 900
+
+
+def _floor_to_access_bucket(instant: datetime) -> datetime:
+    """Floor a UTC instant to its fixed 900-second quarter-hour bucket edge."""
+    # 900 seconds divides the day evenly, so flooring to UTC quarter-hour edges
+    # is plain calendar arithmetic on hour/minute; seconds and fractional
+    # seconds truncate toward the earlier edge.
+    minute_of_day = instant.hour * 60 + instant.minute
+    floored_minute = (minute_of_day // 15) * 15
+    return instant.replace(
+        hour=floored_minute // 60,
+        minute=floored_minute % 60,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _format_bucket_edge(instant: datetime) -> str:
+    return instant.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class PrivacyAccessSummaryBucketOut(BaseModel):
+    bucket_start: str
+    bucket_end: str
+    success_count: int
+    failed_count: int
+    matches_count: int
+
+
+class PrivacyAccessBucketSummaryOut(BaseModel):
+    machine_id: str
+    from_accessed_at: str
+    to_accessed_at: str
+    bucket_width_seconds: int
+    summary_buckets: list[PrivacyAccessSummaryBucketOut]
+
+
+@app.get(
+    "/machines/{machine_id}/privacy-accesses/summary/buckets",
+    response_model=PrivacyAccessBucketSummaryOut,
+)
+def summarize_privacy_access_buckets(
+    machine_id: str,
+    params: Annotated[
+        PrivacyAccessExportParams, Depends(validate_privacy_access_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only fixed-width bucketed summary of one machine's privacy accesses.
+
+    A bucketed view alongside — never part of — the per-machine privacy-access
+    audit chain. The caller submits only the path machine id and the same
+    closed UTC window over access time as the summary; query validation
+    (``invalid_query`` for unknown parameters, ``bad_time`` for missing/blank/
+    offset/missing-``Z``/malformed/inverted bounds) completes before the
+    machine or any access record is read. A missing machine is a
+    ``404 not_found`` with no bucket data.
+
+    On success the response carries the machine id, the bounds echoed verbatim,
+    the fixed ``bucket_width_seconds`` of 900, and ``summary_buckets`` — always
+    present, an empty array when the window contains nothing. Only records
+    owned by the path machine whose own ``accessed_at`` falls in the inclusive
+    request interval are examined; each record is then assigned to the fixed
+    UTC quarter-hour bucket (edges at ``:00``/``:15``/``:30``/``:45``) that
+    contains its actual access instant, with buckets half-open
+    (``[bucket_start, bucket_end)``): an access exactly on an edge belongs to
+    the bucket starting there, never the preceding one. Bucket edges are
+    independent of the request window. Only buckets containing at least one
+    in-window record appear, ordered ascending by ``bucket_start``; each bucket
+    carries ``bucket_start``, ``bucket_end``, ``success_count`` (records whose
+    ``result`` is ``success``), ``failed_count`` (records whose ``result`` is
+    ``failed``), and ``matches_count`` (the sum of every bucketed record's
+    stored ``matches_count``, counted independently of the result). The query
+    only issues reads — it never creates, updates, deletes, repairs, or
+    normalizes an access record — never buckets another machine's records,
+    gives byte-identical results on repeat calls against unchanged data, and
+    reads records persisted across application restarts. It exposes no
+    responsible-party rawtext or key material. Non-GET methods return ``405``
+    without reading access records.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_accessed_at)
+    window_end = parse_utc_z_datetime(params.to_accessed_at)
+    records = _machine_accesses_in_window(
+        session, machine_id, window_start, window_end
+    )
+
+    # ``records`` is already ordered by (accessed-at instant, id), so buckets
+    # are first encountered in ascending start order; the dict preserves that
+    # order, making the output stable without a second sort.
+    totals_by_bucket: dict[datetime, dict[str, int]] = {}
+    for record in records:
+        accessed_instant = parse_utc_z_datetime(record.accessed_at)
+        bucket_start = _floor_to_access_bucket(accessed_instant)
+        totals = totals_by_bucket.setdefault(
+            bucket_start,
+            {"success_count": 0, "failed_count": 0, "matches_count": 0},
+        )
+        if record.result == "success":
+            totals["success_count"] += 1
+        elif record.result == "failed":
+            totals["failed_count"] += 1
+        # The hit total is an independent sum over every bucketed record,
+        # including failed records whose stored count is zero; it is never
+        # derived from the success/failure tallies.
+        totals["matches_count"] += record.matches_count
+
+    summary_buckets = [
+        PrivacyAccessSummaryBucketOut(
+            bucket_start=_format_bucket_edge(bucket_start),
+            bucket_end=_format_bucket_edge(
+                bucket_start
+                + timedelta(seconds=PRIVACY_ACCESS_BUCKET_WIDTH_SECONDS)
+            ),
+            success_count=totals["success_count"],
+            failed_count=totals["failed_count"],
+            matches_count=totals["matches_count"],
+        )
+        for bucket_start, totals in totals_by_bucket.items()
+    ]
+
+    return PrivacyAccessBucketSummaryOut(
+        machine_id=machine_id,
+        from_accessed_at=params.from_accessed_at,
+        to_accessed_at=params.to_accessed_at,
+        bucket_width_seconds=PRIVACY_ACCESS_BUCKET_WIDTH_SECONDS,
+        summary_buckets=summary_buckets,
     )
 
 
