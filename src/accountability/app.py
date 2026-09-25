@@ -2,6 +2,7 @@ import os
 import bisect
 import hashlib
 import json
+import math
 import re
 import uuid
 from collections import deque
@@ -613,14 +614,14 @@ def list_policy_rules(session: SessionDep):
 
 
 def validate_policy_rule_chain_query_params(request: Request) -> None:
-    """Validate the policy-rule chain/integrity query string before any read.
+    """Validate the policy-rule chain/integrity/conflicts query string.
 
-    Both read-only chain endpoints are keyed on the global rule table alone
-    and accept no filter parameters; any parameter name is a 422
-    ``invalid_query``. The check runs during validation, before any rule is
-    read and without any database access, so an extra parameter is rejected
-    identically against an empty database and never changes into another
-    error type.
+    The read-only chain, integrity, and conflict-analysis endpoints are keyed
+    on the global rule table alone and accept no filter parameters; any
+    parameter name is a 422 ``invalid_query``. The check runs during
+    validation, before any rule is read and without any database access, so an
+    extra parameter is rejected identically against an empty database and
+    never changes into another error type.
     """
     if request.query_params:
         raise QueryError("invalid_query")
@@ -1074,6 +1075,180 @@ def check_policy_rule_integrity(
         checked_count=checked_count,
         broken_policy_rule_id=broken_policy_rule_id,
     )
+
+
+def _json_safe_stored_value(value: object) -> object:
+    """Surface one stored field value in the analysis details.
+
+    JSON-native stored values (string, integer, boolean, ``None``, finite
+    float) are emitted exactly as stored. A damaged record can hold a value
+    JSON cannot represent — raw bytes or a non-finite float — and must still
+    never crash the read-only query, so such a value is surfaced in a
+    deterministic textual form (UTF-8 with replacement for bytes, ``str`` for
+    anything else) instead of raising.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return str(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _policy_rule_analysis_valid(rule: PolicyRule) -> bool:
+    """Whether a stored rule takes part in conflict/override matching.
+
+    A rule is matchable only when its stored action type and resource pattern
+    are strings, its stored effect is exactly ``allow`` or ``deny``, and its
+    stored priority is a non-boolean, non-negative integer. Any other stored
+    shape — a non-string action type or resource pattern, an illegal effect,
+    or a boolean, non-integer, or negative priority — is an invalid rule: it
+    still appears in the rule details exactly as stored, but it never produces
+    a conflict or an override.
+    """
+    return (
+        isinstance(rule.action_type, str)
+        and isinstance(rule.resource_pattern, str)
+        and rule.effect in ("allow", "deny")
+        and isinstance(rule.priority, int)
+        and not isinstance(rule.priority, bool)
+        and rule.priority >= 0
+    )
+
+
+@app.get("/policy-rules/conflicts")
+def analyze_policy_rule_conflicts(
+    _: Annotated[None, Depends(validate_policy_rule_chain_query_params)],
+    session: SessionDep,
+):
+    """Read-only conflict and override analysis over the global policy rules.
+
+    The caller submits no machine path and no filter parameters; any query
+    parameter is a 422 ``invalid_query`` raised during validation before any
+    rule is read, and non-GET methods return 405 without reading rules,
+    computing matches, or writing anything.
+
+    The response is ``{rules, conflicts, overrides}`` — all three arrays
+    always present, all three empty when the rule table is empty. ``rules``
+    holds every stored global rule, ordered by rule id ascending, each item
+    carrying the seven stored fields ``{id, action_type, resource_pattern,
+    effect, priority, created_at, updated_at}`` exactly as stored — illegal
+    values are never repaired, deleted, or normalized — plus ``valid``, which
+    is ``false`` when the stored action type or resource pattern is not a
+    string, the stored effect is not exactly ``allow``/``deny``, or the stored
+    priority is a boolean, a non-integer, or negative. Only valid rules take
+    part in matching; invalid rules never produce a conflict or an override.
+
+    Two valid rules form a conflict group when they share the same action
+    type, their resource patterns intersect (the existing ``*`` semantics: a
+    star matches any text, every other segment matches literally, and the
+    patterns intersect only when some resource string can satisfy both), their
+    priorities are equal, and their effects are opposite. Two valid rules form
+    an override relation when they share the same action type, their resource
+    patterns intersect, and their priorities differ; the smaller priority
+    value has decisive effect and is the overriding side. Each conflict entry
+    is ``{rule_ids, intersection, reason}`` with ``rule_ids`` ascending and
+    ``reason`` ``"same_priority_opposite_effect"``; each override entry is
+    ``{overriding_rule_id, overridden_rule_id, intersection, reason}`` with
+    ``reason`` ``"lower_priority_overrides"``. ``intersection`` is a glob
+    pattern under the same ``*`` semantics describing the intersecting
+    resource scope. ``conflicts`` is ordered by the rule-id pair ascending and
+    ``overrides`` by ``(overriding_rule_id, overridden_rule_id)`` ascending.
+
+    The query is strictly read-only — it never creates, updates, deletes,
+    repairs, recomputes, or normalizes a rule, and the analysis never changes
+    an authorization-evaluation result. A damaged record (for example a stored
+    ``created_at`` that no longer parses) never crashes the query and is never
+    rewritten; a stored value JSON cannot represent at all (raw bytes, a
+    non-finite float) is surfaced in the details in a deterministic textual
+    form rather than raising. The body is compact UTF-8 JSON terminated by a
+    single newline, contains no floating-point, ``-0.0``, or non-finite
+    computed value, is byte-identical on repeat calls against unchanged data,
+    and reads rules persisted across application restarts.
+    """
+    rules = sorted(
+        session.scalars(select(PolicyRule)).all(), key=lambda rule: rule.id
+    )
+    details = []
+    matchable = []
+    for rule in rules:
+        valid = _policy_rule_analysis_valid(rule)
+        details.append(
+            {
+                "id": _json_safe_stored_value(rule.id),
+                "action_type": _json_safe_stored_value(rule.action_type),
+                "resource_pattern": _json_safe_stored_value(
+                    rule.resource_pattern
+                ),
+                "effect": _json_safe_stored_value(rule.effect),
+                "priority": _json_safe_stored_value(rule.priority),
+                "created_at": _json_safe_stored_value(rule.created_at),
+                "updated_at": _json_safe_stored_value(rule.updated_at),
+                "valid": valid,
+            }
+        )
+        if valid:
+            matchable.append(rule)
+
+    conflicts = []
+    overrides = []
+    for index, first in enumerate(matchable):
+        for second in matchable[index + 1:]:
+            if first.action_type != second.action_type:
+                continue
+            intersection = authorization.intersection_pattern(
+                first.resource_pattern, second.resource_pattern
+            )
+            if intersection is None:
+                continue
+            if first.priority == second.priority:
+                if first.effect != second.effect:
+                    conflicts.append(
+                        {
+                            "rule_ids": sorted((first.id, second.id)),
+                            "intersection": intersection,
+                            "reason": "same_priority_opposite_effect",
+                        }
+                    )
+            else:
+                overriding, overridden = (
+                    (first, second)
+                    if first.priority < second.priority
+                    else (second, first)
+                )
+                overrides.append(
+                    {
+                        "overriding_rule_id": overriding.id,
+                        "overridden_rule_id": overridden.id,
+                        "intersection": intersection,
+                        "reason": "lower_priority_overrides",
+                    }
+                )
+
+    conflicts.sort(
+        key=lambda entry: (entry["rule_ids"][0], entry["rule_ids"][1])
+    )
+    overrides.sort(
+        key=lambda entry: (
+            entry["overriding_rule_id"],
+            entry["overridden_rule_id"],
+        )
+    )
+
+    payload = {"rules": details, "conflicts": conflicts, "overrides": overrides}
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite computed value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 class KeyRotationComplianceExportOut(BaseModel):
