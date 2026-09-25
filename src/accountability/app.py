@@ -2040,6 +2040,64 @@ def export_privacy_accesses(
     )
 
 
+class PrivacyAccessSummaryOut(BaseModel):
+    machine_id: str
+    from_accessed_at: str
+    to_accessed_at: str
+    success_count: int
+    failed_count: int
+    matches_count: int
+
+
+@app.get(
+    "/machines/{machine_id}/privacy-accesses/summary",
+    response_model=PrivacyAccessSummaryOut,
+)
+def summarize_privacy_accesses(
+    machine_id: str,
+    params: Annotated[
+        PrivacyAccessExportParams, Depends(validate_privacy_access_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only aggregate summary of one machine's privacy accesses.
+
+    The caller submits only the path machine id and a closed UTC window over
+    access time; query validation (``invalid_query`` for unknown parameters,
+    ``bad_time`` for missing/blank/offset/malformed/inverted bounds) completes
+    before the machine or any access record is read. A missing machine is a
+    404 ``not_found`` with no summary data. On success the response carries
+    the machine id, the bounds echoed verbatim, and three counts computed
+    from the stored records whose own ``accessed_at`` falls in the inclusive
+    interval: ``success_count`` (records with ``result`` exactly
+    ``success``), ``failed_count`` (records with ``result`` exactly
+    ``failed``), and ``matches_count`` (the sum of every in-window record's
+    stored hit count). An empty window still returns the complete shape with
+    all three counts zero. Only the path machine's records are aggregated,
+    the query issues reads only — it never creates, updates, deletes,
+    repairs, or normalizes a record — and identical data and parameters give
+    byte-identical output on repeat calls, including across restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_accessed_at)
+    window_end = parse_utc_z_datetime(params.to_accessed_at)
+    records = _machine_accesses_in_window(
+        session, machine_id, window_start, window_end
+    )
+
+    return PrivacyAccessSummaryOut(
+        machine_id=machine_id,
+        from_accessed_at=params.from_accessed_at,
+        to_accessed_at=params.to_accessed_at,
+        success_count=sum(1 for record in records if record.result == "success"),
+        failed_count=sum(1 for record in records if record.result == "failed"),
+        matches_count=sum(record.matches_count for record in records),
+    )
+
+
 def validate_privacy_access_integrity_params(request: Request) -> None:
     """Validate the privacy-access integrity query string before any lookup.
 
