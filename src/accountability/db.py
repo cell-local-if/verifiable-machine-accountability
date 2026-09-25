@@ -264,7 +264,10 @@ class PrivacyAccess(Base):
     the columns carry only operational access metadata. A repeat registration
     with the same ``(machine_id, accessed_at, window_start, window_end,
     result)`` tuple is a duplicate and is never written; the same access at a
-    different time, window, or result is a distinct record.
+    different time, window, or result is a distinct record. Each row also
+    carries a per-machine tamper-evident hash chain
+    (``previous_access_id``/``content_hash``/``chain_hash``) computed from the
+    seven audit columns only.
     """
 
     __tablename__ = "privacy_accesses"
@@ -288,6 +291,11 @@ class PrivacyAccess(Base):
     window_end: Mapped[str] = mapped_column(String, nullable=False)
     result: Mapped[str] = mapped_column(String, nullable=False)
     matches_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Per-machine hash chain. Nullable so databases created before the chain
+    # feature keep working; the startup migration backfills any missing values.
+    previous_access_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class WriteTransactionDiagnostic(Base):
