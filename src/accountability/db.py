@@ -139,8 +139,22 @@ class AuthorizationDecisionEvidence(Base):
         index=True,
     )
     evidence_type: Mapped[str] = mapped_column(String, nullable=False)
+    # Client-supplied evidence fingerprint: exactly 64 lowercase hexadecimal
+    # characters, compared as stored with no case folding. Distinct from the
+    # per-record chain digest below, which covers this fingerprint together
+    # with the record's other content fields.
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
+    # Per-machine evidence hash chain. Nullable so databases created before
+    # the evidence-chain feature keep working; the startup migration
+    # backfills any missing values.
+    previous_evidence_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    # SHA-256 content digest of the record's six content fields; the name
+    # stays distinct from ``content_hash`` (the evidence fingerprint).
+    content_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class AuthorizationDecisionIncident(Base):

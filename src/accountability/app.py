@@ -32,6 +32,7 @@ from . import (
     authorization,
     chain,
     diagnostics,
+    evidence_chain,
     incidents,
     machines,
     privacy_chain,
@@ -93,6 +94,8 @@ async def lifespan(app: FastAPI):
     assignment_chain.backfill_chains(engine)
     privacy_chain.migrate_schema(engine)
     privacy_chain.backfill_chains(engine)
+    evidence_chain.migrate_schema(engine)
+    evidence_chain.backfill_chains(engine)
     diagnostics.migrate_schema(engine)
     # Finalize joint-write markers left by a crashed previous process from
     # the committed evidence, before serving any request.
@@ -1062,10 +1065,40 @@ class EvidenceOut(BaseModel):
     evidence_type: str
     content_hash: str
     created_at: str
+    previous_evidence_id: str | None
+    # Real registrations always carry a 64-hex chain digest; nullable only so
+    # read-only exports can emit a pre-chain/external row verbatim as stored.
+    chain_hash: str | None
 
 
 def evidence_to_out(record: AuthorizationDecisionEvidence) -> EvidenceOut:
     return EvidenceOut(
+        id=record.id,
+        machine_id=record.machine_id,
+        event_id=record.event_id,
+        evidence_type=record.evidence_type,
+        content_hash=record.content_hash,
+        created_at=record.created_at,
+        previous_evidence_id=record.previous_evidence_id,
+        chain_hash=record.chain_hash,
+    )
+
+
+class AccountabilityEvidenceOut(BaseModel):
+    # The aggregate accountability export keeps the pre-chain evidence shape;
+    # the chain fields appear on the evidence create/list/export surfaces.
+    id: str
+    machine_id: str
+    event_id: str
+    evidence_type: str
+    content_hash: str
+    created_at: str
+
+
+def accountability_evidence_to_out(
+    record: AuthorizationDecisionEvidence,
+) -> AccountabilityEvidenceOut:
+    return AccountabilityEvidenceOut(
         id=record.id,
         machine_id=record.machine_id,
         event_id=record.event_id,
@@ -1089,61 +1122,87 @@ def create_evidence(
     """Attach one immutable evidence fingerprint to a decision event.
 
     Body validation runs before any path lookup, so a malformed payload is a
-    422 even when the machine or event does not exist. The write touches only
-    the evidence table: the event, its hash chain, and causal links are never
-    modified.
+    422 even when the machine or event does not exist. The machine/event
+    ownership lookup, the duplicate-fingerprint check, the insert, and the
+    append to the machine's evidence hash chain
+    (``previous_evidence_id``/``chain_hash``) all commit in a single locked
+    write transaction, so concurrent registrations cannot lose records, fork
+    the chain, skip a link, or point two records at the same predecessor. A
+    missing machine or event, or an event owned by another machine, is a 404
+    ``not_found`` and writes nothing; a repeated fingerprint on the same event
+    is a 409 ``duplicate_evidence`` and writes nothing. The event, its hash
+    chain, and causal links are never modified.
+    """
+    engine = session.get_bind()
+    # Release the read connection before opening the locked write transaction,
+    # matching the other chain appenders: concurrent registrations never hold
+    # two pool connections at once.
+    session.close()
+    result = evidence_chain.append_evidence(
+        engine,
+        machine_id=machine_id,
+        event_id=event_id,
+        evidence_type=body.evidence_type,
+        content_hash=body.content_hash,
+    )
+    if result["status"] == "not_found":
+        return error_response(404, "not_found")
+    if result["status"] == "duplicate_evidence":
+        return error_response(409, "duplicate_evidence")
+    return EvidenceOut(**result["evidence"])
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/evidence",
+)
+def list_evidence(machine_id: str, event_id: str, session: SessionDep):
+    """Read-only list of one decision event's evidence records.
+
+    The event must exist and belong to the path machine; a missing event or an
+    event owned by another machine is a 404 ``not_found``. Returns only the
+    path machine's records for the event, an empty array when there are none,
+    ordered stably by ``created_at`` then ``id``. Each record carries the same
+    chain fields as the registration response (``previous_evidence_id`` and
+    ``chain_hash``) in the same positions. The query only reads, and the body
+    is compact UTF-8 JSON terminated by a single newline, with no
+    floating-point or non-finite values.
     """
     event = get_machine_event(session, machine_id, event_id)
     if event is None:
         return error_response(404, "not_found")
 
-    existing = session.scalar(
+    rows = session.scalars(
         select(AuthorizationDecisionEvidence).where(
-            AuthorizationDecisionEvidence.event_id == event_id,
-            AuthorizationDecisionEvidence.content_hash == body.content_hash,
-        )
-    )
-    if existing is not None:
-        return error_response(409, "duplicate_evidence")
-
-    record = AuthorizationDecisionEvidence(
-        id=str(uuid.uuid4()),
-        machine_id=machine_id,
-        event_id=event_id,
-        evidence_type=body.evidence_type,
-        content_hash=body.content_hash,
-        created_at=utc_now_iso(),
-    )
-    session.add(record)
-    try:
-        session.commit()
-    except IntegrityError:
-        session.rollback()
-        return error_response(409, "duplicate_evidence")
-    return evidence_to_out(record)
-
-
-@app.get(
-    "/machines/{machine_id}/authorization-decision-events/{event_id}/evidence",
-    response_model=list[EvidenceOut],
-)
-def list_evidence(machine_id: str, event_id: str, session: SessionDep):
-    event = get_machine_event(session, machine_id, event_id)
-    if event is None:
-        return error_response(404, "not_found")
-
-    records = session.scalars(
-        select(AuthorizationDecisionEvidence)
-        .where(
             AuthorizationDecisionEvidence.machine_id == machine_id,
             AuthorizationDecisionEvidence.event_id == event_id,
         )
-        .order_by(
-            AuthorizationDecisionEvidence.created_at,
-            AuthorizationDecisionEvidence.id,
-        )
     ).all()
-    return [evidence_to_out(record) for record in records]
+    # Order by the actual UTC instant of created_at, then id — the same chain
+    # order used by the export and chain verification (an exact-second stamp
+    # sorts before a fractional stamp of the same second only after parsing).
+    # The tolerant instant key keeps a tampered stamp sorting last instead of
+    # raising, matching the audit's "count it and flag it" behavior.
+    records = evidence_chain.order_evidence_rows(rows)
+    payload = [
+        {
+            "id": record.id,
+            "machine_id": record.machine_id,
+            "event_id": record.event_id,
+            "evidence_type": record.evidence_type,
+            "content_hash": record.content_hash,
+            "created_at": record.created_at,
+            "previous_evidence_id": record.previous_evidence_id,
+            "chain_hash": record.chain_hash,
+        }
+        for record in records
+    ]
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 class IncidentCreate(BaseModel):
@@ -3060,6 +3119,66 @@ def check_evidence_integrity(machine_id: str, session: SessionDep):
     )
 
 
+def validate_evidence_chain_integrity_params(request: Request) -> None:
+    """Validate the evidence-chain integrity query string before any lookup.
+
+    The check is keyed on the path machine alone and accepts no query
+    parameters; any parameter name is a 422 ``invalid_query``. The check runs
+    before the machine is looked up and issues no database access, so an extra
+    parameter against a non-existent machine still reports 422 rather than 404.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/"
+    "evidence-chain/integrity",
+    response_model=EvidenceIntegrityOut,
+)
+def check_evidence_chain_integrity(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_evidence_chain_integrity_params)],
+    session: SessionDep,
+):
+    """Read-only verification of one machine's tamper-evident evidence chain.
+
+    Returns the same three conclusions as the existing evidence integrity
+    audit — ``{valid, checked_count, broken_evidence_id}`` — while additionally
+    verifying the per-machine hash chain. Records are scanned in
+    ``(created_at, id)`` chain order. A complete or empty chain reports
+    ``true``, the machine's total evidence count, and ``null``; otherwise the
+    first record is reported that fails an existing evidence-audit check (its
+    event reference is missing or foreign-owned, its ``evidence_type`` is
+    blank, or its stored fingerprint is not exactly 64 lowercase hexadecimal
+    characters) or whose recomputed content digest, previous-evidence link, or
+    chain hash does not verify. A record with a corrupted ``created_at`` still
+    enters the total and is reported as broken; a missing associated event
+    never removes the record. Only the path machine's records are examined, so
+    another machine's damage cannot change this result, and only the first
+    broken record is reported.
+
+    Any query parameter is a 422 ``invalid_query`` raised before the machine
+    is looked up; a missing machine is a 404 ``not_found`` carrying no chain
+    conclusion. Only ``GET`` is routed; other methods return 405 without
+    reading records. The query is strictly read-only — it never writes,
+    repairs, deletes, or normalizes evidence, events, chains, or links — and
+    repeated calls against unchanged data return byte-identical results.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    valid, checked_count, broken_evidence_id = evidence_chain.verify_full_chain(
+        session, machine_id
+    )
+    return EvidenceIntegrityOut(
+        valid=valid,
+        checked_count=checked_count,
+        broken_evidence_id=broken_evidence_id,
+    )
+
+
 class EvidenceComplianceExportOut(BaseModel):
     machine_id: str
     from_created_at: str
@@ -3674,7 +3793,7 @@ class AccountabilityComplianceExportOut(BaseModel):
     from_created_at: str
     to_created_at: str
     events: list[AuthorizationDecisionEventOut]
-    evidence: list[EvidenceOut]
+    evidence: list[AccountabilityEvidenceOut]
     incidents: list[IncidentOut]
     status_history: list[IncidentStatusEventOut]
     responsibility_assignments: list[ResponsibilityAssignmentOut]
@@ -3785,7 +3904,7 @@ def export_machine_accountability(
         from_created_at=params.from_created_at,
         to_created_at=params.to_created_at,
         events=[decision_event_to_out(event) for event in events],
-        evidence=[evidence_to_out(record) for record in evidence],
+        evidence=[accountability_evidence_to_out(record) for record in evidence],
         incidents=[incident_to_out(record) for record in incidents],
         status_history=[
             incident_status_event_to_out(record) for record in status_history

@@ -254,6 +254,77 @@ normalizes evidence, events, hash chains, or causal links — gives identical
 results on repeat calls against unchanged data, and audits data persisted
 across application restarts.
 
+## Evidence tamper-evident chain and read-only chain verification
+
+In addition to the standalone evidence fingerprint and the read-only evidence
+integrity audit above, each machine's evidence records form their own
+per-machine, tamper-evident hash chain. The chain sits on the existing
+machine-event evidence path: registering evidence keeps the same request
+shape and, on success, appends the new record to the tail of **this machine's**
+chain. Each record returned by the create, list, and evidence export
+endpoints carries, in the same positions across all three:
+
+- `previous_evidence_id` — `null` for the machine's first evidence record,
+  otherwise the id of the immediately preceding record in `(created_at, id)`
+  order (the actual UTC instant, then id);
+- `chain_hash` — the chain digest;
+- the existing `content_hash` evidence fingerprint, unchanged.
+
+The per-record content digest is
+`SHA-256(UTF-8(compact key-sorted JSON of {id, machine_id, event_id,
+evidence_type, content_hash, created_at}))`, covering the record identifier,
+machine, associated event, evidence type, fingerprint, and creation time. The
+`chain_hash` is `SHA-256(UTF-8("" + ":" + content_digest))` for the first
+record and `SHA-256(UTF-8(previous_chain_hash + ":" + content_digest))`
+thereafter. All hashes are 64-character lowercase hexadecimal strings. Each
+machine is an independent chain: a record never points across machines, the
+first record is rooted at the empty prefix, and no two records share a
+predecessor.
+
+The machine/event ownership lookup, the duplicate-fingerprint check, the
+insert, and the chain-tail append run inside one locked write transaction —
+the same lock the other per-machine chains take — so concurrent registrations
+cannot lose records, skip a link, point two records at the same predecessor,
+or fork the chain; the committed result is equivalent to one definite serial
+order. Validation outcomes are unchanged: an illegal body is
+`422` (before any path lookup), a missing machine/event or an event owned by
+another machine is `404 {"error":{"code":"not_found"}}`, and a repeated
+fingerprint on the same event is `409 {"error":{"code":"duplicate_evidence"}}`
+with nothing written. On startup the service adds the new columns to
+pre-existing databases and backfills missing chain data in stable
+`(created_at, id)` order; the recomputation is deterministic, so restarting
+with an already complete database performs no writes, and an empty database
+can still register and query evidence.
+
+The evidence list returns only the path machine/event's records in stable
+order, an empty array (`[]`) when there are none, as compact UTF-8 JSON
+terminated by a single newline; the body contains no floating-point, `-0.0`,
+or non-finite value, counts stay JSON integers, and field order is stable
+across calls.
+
+`GET /machines/{machine_id}/authorization-decision-events/evidence-chain/integrity`
+verifies the whole evidence chain read-only and returns the existing evidence
+audit's three conclusions,
+`{valid, checked_count, broken_evidence_id}`: it applies the existing checks
+(event ownership, non-blank `evidence_type`, exact lowercase-hex fingerprint
+compared as stored) **and** verifies each record's content digest, its
+`previous_evidence_id` link, and its `chain_hash`. A complete or empty chain
+reports `true`, the total count, and `null` (an empty chain reports `true`,
+`0`, `null`); otherwise it reports `false`, the machine's total evidence
+count, and the first record whose content, link, or chain digest does not
+verify. A record whose `created_at` is corrupted still parses into the total
+and is reported as broken; a missing associated record never removes the
+evidence row; another machine's damaged records never affect this machine's
+conclusion. Only the first error is reported and nothing is repaired. The
+endpoint accepts no query parameters — any parameter is
+`422 {"error":{"code":"invalid_query"}}` raised before the machine is looked
+up — a missing machine returns `404 {"error":{"code":"not_found"}}` with no
+partial chain conclusion, and only `GET` is routed (other methods return
+`405` without reading records). The query produces no writes and repeated
+calls against unchanged data return byte-identical results. Existing events,
+key rotation, incidents, diagnostics, and export filtering semantics are
+unchanged.
+
 ## Persistent exception-handling incident registrations
 
 `POST /machines/{machine_id}/authorization-decision-events/{event_id}/incidents`

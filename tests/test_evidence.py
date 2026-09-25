@@ -76,6 +76,10 @@ def test_create_evidence_returns_201_with_full_record(client):
     assert body["evidence_type"] == "log"
     assert body["content_hash"] == HASH_A
     assert RFC3339_Z_RE.match(body["created_at"])
+    # The first record of a machine roots the chain: null predecessor and a
+    # chain digest alongside the fingerprint.
+    assert body["previous_evidence_id"] is None
+    assert re.match(r"^[0-9a-f]{64}$", body["chain_hash"])
     assert set(body.keys()) == {
         "id",
         "machine_id",
@@ -83,6 +87,8 @@ def test_create_evidence_returns_201_with_full_record(client):
         "evidence_type",
         "content_hash",
         "created_at",
+        "previous_evidence_id",
+        "chain_hash",
     }
 
 
