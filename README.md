@@ -651,6 +651,50 @@ and empty databases need no migration. The existing create queries, hash
 chains, diagnostics terminal state, integrity summary, and other compliance
 exports are unchanged.
 
+## Read-only desensitized machine identity privacy export
+
+`GET /machines/{machine_id}/privacy-export` returns a deterministic, read-only
+privacy view of one machine identity. The caller submits only the path machine
+id — no query parameters, time range, business filter, or request body:
+
+- Any query parameter returns `422 {"error":{"code":"invalid_query"}}`, checked
+  before the machine is read and without any database access, so an invalid
+  query against a non-existent machine is still `422`.
+- After validation, a missing machine returns
+  `404 {"error":{"code":"not_found"}}` with no partial identity data; an empty
+  database queried for any id returns that same `404` ("currently no
+  identity").
+- The path accepts `GET` only; other methods return `405` without reading an
+  identity, computing a digest, or executing any write.
+
+The success object is compact UTF-8 JSON in a fixed field order, terminated by
+one newline, and contains exactly `{machine_id, ext_ref, name_ref, key_ref,
+version, status, created_at, updated_at}`. The raw `external_id`,
+`display_name`, and `public_key` never appear; their positions carry the three
+desensitizing digests:
+
+- `ext_ref` = lowercase-hex `SHA-256(UTF-8("privacy:v1|external" + machine_id
+  + external_id_with_surrounding_whitespace_removed))`;
+- `name_ref` follows the same order and digest with the `privacy:v1|display`
+  prefix;
+- `key_ref` follows the same order and digest with the `privacy:v1|public`
+  prefix.
+
+When a stored value is not a string or is empty after trimming surrounding
+whitespace, the corresponding ref is `null`; every other field is still
+returned. `version` is the stored JSON integer (the body contains no
+floating-point value, `-0.0`, or non-finite number), and `status`,
+`created_at`, and `updated_at` are emitted exactly as stored, with no
+normalization. Another machine's identity can never enter the result.
+
+The query is strictly read-only — it never creates, updates, deletes, repairs,
+or normalizes a machine identity — returns byte-identical bodies on repeat
+calls against unchanged data, and reads identities persisted across
+application restarts. It adds no schema. Machine creation, identity query,
+key rotation, the rotation privacy export, `GET /health`, authorization
+decisions, the hash chains, incident handling, and the existing compliance
+exports keep their existing semantics.
+
 ## Machine-level privacy access registration and read-only query
 
 Two machine-scoped entries provide a machine-level audit of privacy data

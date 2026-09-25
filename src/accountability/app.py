@@ -1710,6 +1710,86 @@ def export_key_rotation_events_privacy(
     return Response(content=body, media_type="application/json")
 
 
+# --- read-only desensitized machine identity privacy export -----------------
+
+
+def validate_machine_privacy_export_params(request: Request) -> None:
+    """Validate the machine identity privacy-export query string.
+
+    The export is keyed on the path machine alone: the caller submits only
+    the machine id — no time range, business filter, or other request input.
+    Any query parameter name is a 422 ``invalid_query`` raised before the
+    machine is looked up and without any database access, so an extra
+    parameter against a non-existent machine still reports 422 rather than
+    404 and never reads machine identity data.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/privacy-export")
+def export_machine_identity_privacy(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_machine_privacy_export_params)],
+    session: SessionDep,
+):
+    """Read-only desensitized privacy export of one machine's identity.
+
+    The caller submits only the path machine id — no query parameters, time
+    range, business filter, or request body. Any query parameter is a 422
+    ``invalid_query`` raised before the machine is read; a missing machine is
+    a 404 ``not_found`` carrying no partial identity. Only ``GET`` is routed;
+    other methods return 405 without reading an identity, computing a digest,
+    or writing anything.
+
+    On success the object carries exactly the machine id, the three identity
+    digests, and the stored version, status, created_at, and updated_at. The
+    raw ``external_id``, ``display_name``, and ``public_key`` never leave the
+    service; their positions carry ``ext_ref``, ``name_ref``, and ``key_ref``
+    — the SHA-256 digests of ``privacy:v1|external`` /
+    ``privacy:v1|display`` / ``privacy:v1|public`` each concatenated with the
+    machine id and the stored value with surrounding whitespace removed
+    (``null`` when the stored value is not a string or is blank after
+    trimming), while every other field is still returned. ``version`` is the
+    stored JSON integer and the stored status/timestamps are echoed verbatim.
+    The query only issues reads — it never creates, updates, deletes,
+    repairs, or normalizes a machine — never returns another machine's
+    identity, and the body is compact UTF-8 JSON in a fixed field order
+    terminated by one newline, containing no floating-point or non-finite
+    value and byte-identical on repeat calls, including across restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    payload = {
+        "machine_id": machine_id,
+        "ext_ref": privacy_reference_digest(
+            "external", machine_id, machine.external_id
+        ),
+        "name_ref": privacy_reference_digest(
+            "display", machine_id, machine.display_name
+        ),
+        "key_ref": privacy_reference_digest(
+            "public", machine_id, machine.public_key
+        ),
+        "version": machine.version,
+        "status": machine.status,
+        "created_at": machine.created_at,
+        "updated_at": machine.updated_at,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- machine-level privacy access registration and read-only query ---------
 
 
