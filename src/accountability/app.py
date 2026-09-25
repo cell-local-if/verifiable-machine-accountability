@@ -2110,6 +2110,129 @@ def summarize_privacy_accesses(
     )
 
 
+# Fixed width of the summary buckets: 900 seconds, so bucket boundaries fall
+# exactly on UTC quarter-hour marks.
+_PRIVACY_ACCESS_BUCKET_WIDTH_SECONDS = 900
+
+_RFC3339_Z_SECOND_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+class PrivacyAccessSummaryBucketOut(BaseModel):
+    bucket_start: str
+    bucket_end: str
+    success_count: int
+    failed_count: int
+    matches_count: int
+
+
+class PrivacyAccessSummaryBucketsOut(BaseModel):
+    machine_id: str
+    from_accessed_at: str
+    to_accessed_at: str
+    bucket_width_seconds: int
+    summary_buckets: list[PrivacyAccessSummaryBucketOut]
+
+
+def _bucket_start_epoch(accessed_at: datetime) -> int:
+    """Epoch second of the UTC quarter-hour bucket containing an instant.
+
+    Buckets are the half-open intervals ``[k*900, (k+1)*900)`` seconds since
+    the epoch, so a record belongs to the bucket whose start is the greatest
+    multiple of 900 not after its access instant. Access instants are never
+    before the epoch, so truncating the float timestamp floors it.
+    """
+    epoch_second = int(accessed_at.timestamp())
+    return (epoch_second // _PRIVACY_ACCESS_BUCKET_WIDTH_SECONDS) * (
+        _PRIVACY_ACCESS_BUCKET_WIDTH_SECONDS
+    )
+
+
+def _format_bucket_epoch(epoch_second: int) -> str:
+    # Bucket boundaries are exact seconds, so the formatted stamp never
+    # carries a fractional part and is byte-stable across calls.
+    return datetime.fromtimestamp(epoch_second, tz=timezone.utc).strftime(
+        _RFC3339_Z_SECOND_FORMAT
+    )
+
+
+@app.get(
+    "/machines/{machine_id}/privacy-accesses/summary/buckets",
+    response_model=PrivacyAccessSummaryBucketsOut,
+)
+def summarize_privacy_accesses_by_bucket(
+    machine_id: str,
+    params: Annotated[
+        PrivacyAccessExportParams, Depends(validate_privacy_access_export_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only fixed-bucket breakdown of one machine's privacy accesses.
+
+    A bucketed view alongside — never part of — the per-machine privacy-access
+    audit chain and the flat summary. The caller submits only the path machine
+    id and the same closed UTC window over access time as the summary; query
+    validation (``invalid_query`` for unknown parameters, ``bad_time`` for
+    missing/blank/offset/missing-``Z``/malformed/inverted bounds) completes
+    before the machine or any access record is read. A missing machine is a
+    ``404 not_found`` with no bucket data.
+
+    On success the response carries the machine id, the bounds echoed
+    verbatim, the fixed ``bucket_width_seconds`` (900), and
+    ``summary_buckets``: one element per UTC quarter-hour bucket
+    ``[bucket_start, bucket_end)`` that contains at least one in-window record
+    of the path machine, ordered by ``bucket_start`` ascending. Each element
+    carries ``bucket_start``/``bucket_end`` and the same three totals as the
+    flat summary computed over exactly the records whose own ``accessed_at``
+    falls in that bucket: ``success_count``, ``failed_count``, and
+    ``matches_count`` (an independent sum of the stored hit counts). A window
+    containing no record yields an empty ``summary_buckets`` array. The query
+    only issues reads — it never creates, updates, deletes, repairs, or
+    normalizes an access record — never buckets another machine's records,
+    gives byte-identical results on repeat calls against unchanged data, and
+    reads records persisted across application restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    window_start = parse_utc_z_datetime(params.from_accessed_at)
+    window_end = parse_utc_z_datetime(params.to_accessed_at)
+    records = _machine_accesses_in_window(
+        session, machine_id, window_start, window_end
+    )
+
+    buckets: dict[int, PrivacyAccessSummaryBucketOut] = {}
+    for record in records:
+        start_epoch = _bucket_start_epoch(parse_utc_z_datetime(record.accessed_at))
+        bucket = buckets.get(start_epoch)
+        if bucket is None:
+            bucket = PrivacyAccessSummaryBucketOut(
+                bucket_start=_format_bucket_epoch(start_epoch),
+                bucket_end=_format_bucket_epoch(
+                    start_epoch + _PRIVACY_ACCESS_BUCKET_WIDTH_SECONDS
+                ),
+                success_count=0,
+                failed_count=0,
+                matches_count=0,
+            )
+            buckets[start_epoch] = bucket
+        if record.result == "success":
+            bucket.success_count += 1
+        elif record.result == "failed":
+            bucket.failed_count += 1
+        # The hit total is an independent sum over every record in the bucket,
+        # never derived from the success/failure tallies.
+        bucket.matches_count += record.matches_count
+
+    return PrivacyAccessSummaryBucketsOut(
+        machine_id=machine_id,
+        from_accessed_at=params.from_accessed_at,
+        to_accessed_at=params.to_accessed_at,
+        bucket_width_seconds=_PRIVACY_ACCESS_BUCKET_WIDTH_SECONDS,
+        summary_buckets=[buckets[key] for key in sorted(buckets)],
+    )
+
+
 def validate_privacy_access_integrity_params(request: Request) -> None:
     """Validate the privacy-access integrity query string before any lookup.
 
