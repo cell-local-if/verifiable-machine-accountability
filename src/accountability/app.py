@@ -7,11 +7,12 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -23,7 +24,7 @@ from pydantic import (
     model_validator,
 )
 from sqlalchemy import create_engine, event, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from . import (
@@ -1731,6 +1732,183 @@ def create_privacy_access(
     if result["status"] == "duplicate_access":
         return error_response(409, "duplicate_access")
     return PrivacyAccessOut(**result["access"])
+
+
+class BatchValidationError(Exception):
+    """A batch request failure reported as ``422 {"error":{"code": ...}}``.
+
+    Codes distinguish only what the spec separates: ``invalid_batch`` for
+    structural/JSON-type failures, ``bad_time`` for timestamp and window
+    failures, and ``invalid_value`` for the result/count value domain.
+    """
+
+    def __init__(self, code: str):
+        self.code = code
+
+
+def _validate_batch_item(item: Any) -> dict[str, Any]:
+    """Validate one array element, returning its five business fields.
+
+    Shape problems (non-object, missing field, wrong JSON type) raise
+    ``invalid_batch``; well-typed but malformed timestamps or an inverted
+    window raise ``bad_time``; an out-of-domain ``result`` or negative count
+    raises ``invalid_value``.
+    """
+    if not isinstance(item, dict):
+        raise BatchValidationError("invalid_batch")
+
+    fields = ("accessed_at", "window_start", "window_end", "result", "matches_count")
+    if any(field not in item for field in fields):
+        raise BatchValidationError("invalid_batch")
+
+    timestamps = {field: item[field] for field in fields[:3]}
+    result = item["result"]
+    matches_count = item["matches_count"]
+
+    # Every business field must arrive with its JSON type; bool is neither a
+    # valid timestamp string nor a valid hit count.
+    if not all(isinstance(value, str) for value in timestamps.values()):
+        raise BatchValidationError("invalid_batch")
+    if isinstance(matches_count, bool) or not isinstance(matches_count, int):
+        raise BatchValidationError("invalid_batch")
+    if not isinstance(result, str):
+        raise BatchValidationError("invalid_batch")
+
+    # A well-typed string that is not a ``Z``-suffixed UTC date-time, carries
+    # an offset or whitespace, or names an out-of-range calendar/time value is
+    # a time failure rather than a shape failure.
+    for value in timestamps.values():
+        if not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+            raise BatchValidationError("bad_time")
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            raise BatchValidationError("bad_time") from None
+
+    if parse_utc_z_datetime(timestamps["window_start"]) > parse_utc_z_datetime(
+        timestamps["window_end"]
+    ):
+        raise BatchValidationError("bad_time")
+
+    if result not in ("success", "failed"):
+        raise BatchValidationError("invalid_value")
+    if matches_count < 0:
+        raise BatchValidationError("invalid_value")
+    # A failed access returns no data, so its hit count is always zero.
+    if result == "failed" and matches_count != 0:
+        raise BatchValidationError("invalid_value")
+
+    return {**timestamps, "result": result, "matches_count": matches_count}
+
+
+def _parse_privacy_access_batch(raw: Any) -> list[dict[str, Any]]:
+    """Validate a whole batch body before any machine lookup or write.
+
+    The request must be an object carrying a ``privacy_accesses`` array; each
+    element is validated by :func:`_validate_batch_item`. An empty array is
+    legal. Anything malformed raises :class:`BatchValidationError` with the
+    spec's error code, so the caller can map it to a 422 without consulting
+    the database.
+    """
+    if not isinstance(raw, dict):
+        raise BatchValidationError("invalid_batch")
+    raw_items = raw.get("privacy_accesses")
+    if not isinstance(raw_items, list) or isinstance(raw_items, bool):
+        raise BatchValidationError("invalid_batch")
+    return [_validate_batch_item(item) for item in raw_items]
+
+
+@app.exception_handler(BatchValidationError)
+def _batch_validation_error_handler(
+    request: Request, exc: BatchValidationError
+) -> JSONResponse:
+    return error_response(422, exc.code)
+
+
+def validate_privacy_access_batch_query(request: Request) -> None:
+    """Validate the batch query string before the body or the machine lookup.
+
+    The batch entry is keyed on the path machine alone and accepts no query
+    parameters; any parameter name is a 422 ``invalid_query``. The check
+    issues no database access, so an extra parameter against a non-existent
+    machine still reports 422 rather than 404.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.post(
+    "/machines/{machine_id}/privacy-accesses/batch",
+)
+async def create_privacy_accesses_batch(
+    machine_id: str,
+    request: Request,
+    _: Annotated[None, Depends(validate_privacy_access_batch_query)],
+):
+    """Register a batch of machine-level privacy data accesses at once.
+
+    The query string is validated first (any parameter is a 422
+    ``invalid_query``), then the whole body: a non-object request, a missing
+    or non-array ``privacy_accesses``, a non-object item, a missing field, or
+    a business value of the wrong JSON type is a 422 ``invalid_batch``; a
+    malformed/offset/whitespace/out-of-range timestamp or an inverted window
+    is a 422 ``bad_time``; a ``result`` other than ``success``/``failed`` or a
+    negative integer hit count (including a non-zero count on a ``failed``
+    item) is a 422 ``invalid_value``. Validation of the entire batch finishes
+    before the machine is looked up, so an invalid batch against a
+    non-existent machine is still a 422 and writes nothing; an empty array is
+    valid and returns an empty ``results``.
+
+    After validation a missing machine is a 404 ``not_found`` and writes
+    nothing. Otherwise the whole batch — machine lookup, every duplicate
+    check, every insert, and the chain relink — runs in one locked write
+    transaction, the same lock the single registration takes, so batches and
+    single registrations are serialized against each other and can never
+    leave partial records or fork the chain. Items are handled in request
+    order: the first occurrence of an identity
+    ``(accessed_at, window_start, window_end, result)`` already stored or
+    appearing earlier in the batch succeeds, and every later occurrence
+    returns ``duplicate_access`` with the submitted fields echoed and no new
+    row; the hit count is not part of the identity. Duplicates never abort the
+    other items. Success returns 200 with a position-aligned ``results``
+    array: each ``success`` item carries the full new record and each
+    ``duplicate_access`` item carries only the five submitted fields. Any
+    persistence failure rolls the whole batch back and returns 500
+    ``internal_error``. The path accepts ``POST`` only; other methods return
+    ``405`` and never register anything.
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        return error_response(422, "invalid_batch")
+
+    accesses = _parse_privacy_access_batch(raw)
+
+    engine = request.app.state.engine
+    try:
+        result = await run_in_threadpool(
+            privacy_chain.append_accesses_batch,
+            engine,
+            machine_id=machine_id,
+            accesses=accesses,
+        )
+    except SQLAlchemyError:
+        # The locked transaction rolls back on any driver/engine failure, so
+        # no row of the batch can survive a failed request.
+        return error_response(500, "internal_error")
+
+    if result["status"] == "not_found":
+        return error_response(404, "not_found")
+
+    results: list[dict[str, Any]] = []
+    for entry in result["results"]:
+        if entry["outcome"] == "success":
+            results.append(
+                {"outcome": "success", **PrivacyAccessOut(**entry["access"]).model_dump()}
+            )
+        else:
+            results.append({"outcome": "duplicate_access", **entry["submitted"]})
+    return JSONResponse(status_code=200, content={"results": results})
 
 
 class PrivacyAccessExportParams(BaseModel):

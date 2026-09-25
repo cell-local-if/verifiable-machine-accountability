@@ -653,12 +653,12 @@ exports are unchanged.
 
 ## Machine-level privacy access registration and read-only query
 
-Two machine-scoped entries provide a machine-level audit of privacy data
-access: `privacy-accesses` registration and its `compliance-export` query. They
-follow the existing machine event paths and never change the desensitized
-responsibility export (its response, digest, and filtering semantics are
-unchanged), `GET /health`, the hash chains, diagnostics, or the other
-compliance exports.
+Three machine-scoped entries provide a machine-level audit of privacy data
+access: single `privacy-accesses` registration, its machine-level `batch`
+registration, and its `compliance-export` query. They follow the existing
+machine event paths and never change the desensitized responsibility export
+(its response, digest, and filtering semantics are unchanged), `GET /health`,
+the hash chains, diagnostics, or the other compliance exports.
 
 ### Registering an access
 
@@ -692,6 +692,66 @@ for the same machine returns `409 {"error":{"code":"duplicate_access"}}` and
 writes nothing — the hit count is not part of the access identity, so even a
 different count is a duplicate; a different access time, window, or result is a
 distinct record. The path accepts `POST` only; other methods return `405`.
+
+### Registering a batch of accesses
+
+`POST /machines/{machine_id}/privacy-accesses/batch` registers a whole batch
+of privacy data accesses in one machine-level request. It accepts `POST`
+only; other methods return `405` and never register anything, and the path
+accepts no query parameters (any parameter is
+`422 {"error":{"code":"invalid_query"}}`). The request body must be a JSON
+object carrying a `privacy_accesses` array; each array item carries the same
+four field groups as a single registration — `accessed_at`, `window_start`,
+`window_end`, `result`, and `matches_count` — under the same rules:
+
+- timestamps are UTC RFC 3339 date-times ending in `Z` (fractional seconds
+  optional; offset forms, surrounding whitespace, a missing suffix, and
+  out-of-range calendar/time values are rejected), and `window_start` must not
+  be later than `window_end` (equal bounds allowed);
+- `result` is exactly `success` or `failed`;
+- `matches_count` is a non-negative integer, and a `failed` item must carry
+  `0`.
+
+Validation of the whole batch finishes before the machine is looked up, so an
+invalid batch against a non-existent machine is still a 422 and leaves no
+record. Error codes separate the failure classes: a request that is not an
+object, a missing or non-array `privacy_accesses`, an array item that is not
+an object or misses a field, or a business value of the wrong JSON type
+returns `422 {"error":{"code":"invalid_batch"}}`; an illegal timestamp
+(format, offset, whitespace, out-of-range date) or an inverted window returns
+`422 {"error":{"code":"bad_time"}}`; a `result` outside the two allowed
+values, a negative integer hit count, or a non-zero count on a `failed` item
+returns `422 {"error":{"code":"invalid_value"}}`. An empty array is a legal
+batch and returns `200` with `{"results": []}` without touching access rows.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}` and writes nothing. Otherwise the whole
+batch — the machine lookup, every duplicate check, every insert, and the
+chain relink — runs inside one locked write transaction, the same lock the
+single registration takes, so batches and single registrations are fully
+serialized against each other and can never lose rows, fork the chain, or
+leave a partial batch: any persistence failure rolls the transaction back and
+returns `500 {"error":{"code":"internal_error"}}`.
+
+Items are processed strictly in request-array order and the `results` array
+is position-aligned with the request. An access identity is still
+`(accessed_at, window_start, window_end, result)` — the hit count is not part
+of it. The first occurrence of an identity already stored or appearing
+earlier in the same batch succeeds; every later occurrence returns a
+duplicate result, adds no row, and never aborts the other items. Each result
+carries `outcome` plus the corresponding fields:
+
+- `{"outcome": "success", id, machine_id, accessed_at, window_start,
+  window_end, result, matches_count}` — the full newly registered record
+  (a fresh UUID, the machine id, and the submitted fields verbatim);
+- `{"outcome": "duplicate_access", accessed_at, window_start, window_end,
+  result, matches_count}` — only the five submitted fields echoed back, no
+  `id` or `machine_id`.
+
+Batch-registered records are ordinary privacy accesses: they are visible to
+the query endpoint, participate in the same per-machine integrity chain, are
+isolated by machine, and persist across application restarts. The single
+registration and query endpoints are unchanged.
 
 ### Querying accesses
 
