@@ -221,6 +221,67 @@ def build_preview(action: str, resource: str, stored_rules: list[dict[str, Any]]
     }
 
 
+def build_batch(
+    items: list[tuple[str, str]], stored_rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Compute the batch audit payload from one shared rule snapshot.
+
+    Pure: no database access, no writes. Every item is decided against the
+    same ``stored_rules`` list — one read-time snapshot — so no input can
+    influence a later result, and per-item semantics are exactly those of
+    :func:`build_preview`. ``items`` holds the caller-trimmed, non-empty
+    ``(action, resource)`` pairs in request order.
+
+    The summary counts inputs, not rules: ``no_match``/``allow``/``deny``
+    partition the batch by decision reason, ``conflict`` counts inputs whose
+    preview carries a conflict group, and ``override`` counts inputs whose
+    preview lists at least one overridden candidate. ``decisions`` counts the
+    three decision reasons directly; every counter is always present, even
+    when zero.
+    """
+    analyses: list[dict[str, Any]] = []
+    summary = {
+        "no_match": 0,
+        "allow": 0,
+        "deny": 0,
+        "conflict": 0,
+        "override": 0,
+    }
+    decisions = {
+        "allowed_by_policy": 0,
+        "denied_by_policy": 0,
+        "no_matching_policy": 0,
+    }
+
+    for action, resource in items:
+        result = build_preview(action, resource, stored_rules)
+        reason = result["decision"]["reason"]
+        decisions[reason] += 1
+        if reason == "no_matching_policy":
+            summary["no_match"] += 1
+        elif reason == "allowed_by_policy":
+            summary["allow"] += 1
+        else:
+            summary["deny"] += 1
+        if result["conflicts"]:
+            summary["conflict"] += 1
+        if any(rule["relation"] == "overridden" for rule in result["rules"]):
+            summary["override"] += 1
+        analyses.append(
+            {
+                "input": {"action": action, "resource": resource},
+                "result": result,
+            }
+        )
+
+    return {
+        "batch_count": len(items),
+        "analyses": analyses,
+        "summary": summary,
+        "decisions": decisions,
+    }
+
+
 def _detail(stored: dict[str, Any], relation: str) -> dict[str, Any]:
     """Emit one stored rule verbatim with its preview relation appended."""
     detail = {field: stored.get(field) for field in _DETAIL_FIELDS}

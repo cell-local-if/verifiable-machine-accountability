@@ -1149,6 +1149,99 @@ async def preview_policy_rule_decision(request: Request):
     return Response(content=body, media_type="application/json")
 
 
+@app.post("/policy-rules/decision-preview/batch")
+async def preview_policy_rule_decisions_batch(request: Request):
+    """Read-only batch audit of hypothetical global policy decisions.
+
+    The body is a JSON object carrying exactly one field, ``requests``: an
+    array whose items each carry exactly two string fields, ``action`` and
+    ``resource``. Every check completes before any rule is read:
+
+    - any query parameter is ``422 invalid_query`` first of all;
+    - a body that is not a JSON object, that lacks or adds a field, whose
+      ``requests`` is not an array, or whose items are not objects with
+      exactly ``action``/``resource`` is ``422 invalid_batch``;
+    - an action or resource that is not a string (booleans included) is
+      ``422 invalid_value`` — the value-domain check is distinct here, with
+      no single-endpoint ``invalid_request`` family;
+    - an action or resource empty after trimming is ``422 invalid_value``.
+
+    Any one illegal item rejects the whole batch with no partial analysis; an
+    empty array is legal and returns an empty result without needing rules.
+    Non-POST methods return ``405`` without processing data.
+
+    On success the whole batch is decided against one global rule snapshot
+    read at a single point: no input can change a later result, and each item
+    reuses the single-preview matching, conflict, winner, override, and
+    decision semantics with its relation annotations unchanged. The response
+    carries ``batch_count``, ``analyses`` (one ``{input, result}`` per request
+    in input order; ``result`` has the single-preview shape), ``summary`` with
+    the ``no_match``, ``allow``, ``deny``, ``conflict``, ``override`` counts
+    in that order (``conflict`` counts inputs with a conflict group and
+    ``override`` inputs with an overridden candidate), and ``decisions``
+    keyed by the three existing decision reasons, each always an integer. A
+    failure that prevents reading the rules returns ``500 internal_error``
+    with no partial analysis. The query issues reads only, and the body is
+    compact UTF-8 JSON with one trailing newline, byte-identical on repeat
+    calls and stable across restarts.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_batch")
+    if not isinstance(payload, dict) or set(payload) != {"requests"}:
+        return error_response(422, "invalid_batch")
+    raw_requests = payload["requests"]
+    if not isinstance(raw_requests, list):
+        return error_response(422, "invalid_batch")
+
+    # Item shape is the structural family (invalid_batch); the string type and
+    # trim domain is invalid_value, matching the single endpoint's value
+    # failure for blank actions/resources.
+    items: list[tuple[str, str]] = []
+    for raw_item in raw_requests:
+        if not isinstance(raw_item, dict) or set(raw_item) != {
+            "action",
+            "resource",
+        }:
+            return error_response(422, "invalid_batch")
+        action_raw, resource_raw = raw_item["action"], raw_item["resource"]
+        if isinstance(action_raw, bool) or not isinstance(action_raw, str):
+            return error_response(422, "invalid_value")
+        if isinstance(resource_raw, bool) or not isinstance(resource_raw, str):
+            return error_response(422, "invalid_value")
+        action = action_raw.strip()
+        resource = resource_raw.strip()
+        if not action or not resource:
+            # Empty-after-trim is a value-domain failure, reported without
+            # ever reading the rule table.
+            return error_response(422, "invalid_value")
+        items.append((action, resource))
+
+    try:
+        with Session(request.app.state.engine) as session:
+            # One read for the whole batch: every analysis shares this
+            # snapshot, so inputs are isolated from each other by construction.
+            stored_rules = policy_preview.load_rules(session)
+            result = policy_preview.build_batch(items, stored_rules)
+    except Exception:
+        # Never emit partial analyses when the rules cannot be read.
+        return error_response(500, "internal_error")
+
+    # Serialize by hand so the body is compact UTF-8 JSON in a fixed field
+    # order, terminated by a single newline, and free of floating-point or
+    # non-finite values (allow_nan=False).
+    body = (
+        json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 class KeyRotationComplianceExportOut(BaseModel):
     machine_id: str
     from_created_at: str
