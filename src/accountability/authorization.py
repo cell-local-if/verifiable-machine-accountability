@@ -1,7 +1,7 @@
 """Authorization decision computation.
 
-The decision rule is the single source of truth for both the non-persisting
-evaluation endpoint and the decision-event write path:
+The decision rule is the single source of truth for the non-persisting
+evaluation endpoints (single and batch) and the decision-event write path:
 
 * a ``suspended`` machine is denied with ``machine_suspended`` before any
   behavior declaration or policy rule is consulted;
@@ -234,7 +234,103 @@ def decide(
     if status == "suspended":
         return False, "machine_suspended"
 
-    declarations = executor.execute(
+    declarations = _enabled_declaration_patterns(executor, machine_id, action_type)
+    if not any(pattern_matches(pattern, resource) for pattern in declarations):
+        return False, "no_enabled_declaration"
+
+    rules = _policy_rules(executor, action_type)
+    return _decide_against_rules(rules, resource)
+
+
+def decide_from_snapshot(
+    status: str,
+    declarations_by_action: dict[str, list[str]] | None,
+    rules_by_action: dict[str, list[tuple[str, str, int]]] | None,
+    action_type: str,
+    resource: str,
+) -> tuple[bool, str]:
+    """Compute ``(allowed, reason)`` from an already-loaded snapshot.
+
+    Pure counterpart of :func:`decide` over data read at one earlier instant:
+    a suspended machine is denied with ``machine_suspended`` without touching
+    declarations or rules; otherwise the enabled-declaration check and the
+    priority-first policy judgement use exactly the single-evaluation
+    semantics. The snapshot maps group declaration resource patterns and
+    ``(resource_pattern, effect, priority)`` rule rows by action type.
+    """
+    if status == "suspended":
+        return False, "machine_suspended"
+
+    patterns = (declarations_by_action or {}).get(action_type, [])
+    if not any(pattern_matches(pattern, resource) for pattern in patterns):
+        return False, "no_enabled_declaration"
+
+    return _decide_against_rules(
+        (rules_by_action or {}).get(action_type, []), resource
+    )
+
+
+def evaluate_batch(
+    executor: Execution, machine_id: str, items: list[tuple[str, str]]
+) -> list[tuple[bool, str]] | None:
+    """Evaluate many ``(action_type, resource)`` pairs on one read snapshot.
+
+    The machine's status is read once; when it exists every enabled
+    declaration and policy rule is read at that same instant and shared by
+    every item, so no input can observe or influence another input's result.
+    A suspended machine reads neither declarations nor rules: every item is
+    ``machine_suspended``. Returns ``None`` when the machine does not exist
+    (the caller then answers ``404`` without emitting any item result). The
+    per-item judgement is identical to :func:`decide`.
+    """
+    status = machine_status(executor, machine_id)
+    if status is None:
+        return None
+
+    if status == "suspended":
+        # No declaration or policy read happens for a suspended machine.
+        return [(False, "machine_suspended") for _ in items]
+
+    declarations_rows = executor.execute(
+        BehaviorDeclaration.__table__.select()
+        .where(
+            BehaviorDeclaration.__table__.c.machine_id == machine_id,
+            BehaviorDeclaration.__table__.c.enabled.is_(True),
+        )
+        .with_only_columns(
+            BehaviorDeclaration.__table__.c.action_type,
+            BehaviorDeclaration.__table__.c.resource_pattern,
+        )
+    ).all()
+    declarations_by_action: dict[str, list[str]] = {}
+    for row in declarations_rows:
+        declarations_by_action.setdefault(row[0], []).append(row[1])
+
+    rules_rows = executor.execute(
+        PolicyRule.__table__.select().with_only_columns(
+            PolicyRule.__table__.c.action_type,
+            PolicyRule.__table__.c.resource_pattern,
+            PolicyRule.__table__.c.effect,
+            PolicyRule.__table__.c.priority,
+        )
+    ).all()
+    rules_by_action: dict[str, list[tuple[str, str, int]]] = {}
+    for row in rules_rows:
+        rules_by_action.setdefault(row[0], []).append((row[1], row[2], row[3]))
+
+    return [
+        decide_from_snapshot(
+            status, declarations_by_action, rules_by_action, action_type, resource
+        )
+        for action_type, resource in items
+    ]
+
+
+def _enabled_declaration_patterns(
+    executor: Execution, machine_id: str, action_type: str
+) -> list[str]:
+    """The resource patterns of a machine's enabled declarations for an action."""
+    rows = executor.execute(
         BehaviorDeclaration.__table__.select()
         .where(
             BehaviorDeclaration.__table__.c.machine_id == machine_id,
@@ -243,10 +339,14 @@ def decide(
         )
         .with_only_columns(BehaviorDeclaration.__table__.c.resource_pattern)
     ).all()
-    if not any(pattern_matches(row[0], resource) for row in declarations):
-        return False, "no_enabled_declaration"
+    return [row[0] for row in rows]
 
-    rules = executor.execute(
+
+def _policy_rules(
+    executor: Execution, action_type: str
+) -> list[tuple[str, str, int]]:
+    """All global rules for an action as ``(pattern, effect, priority)`` rows."""
+    rows = executor.execute(
         PolicyRule.__table__.select()
         .where(PolicyRule.__table__.c.action_type == action_type)
         .with_only_columns(
@@ -255,6 +355,13 @@ def decide(
             PolicyRule.__table__.c.priority,
         )
     ).all()
+    return [(row[0], row[1], row[2]) for row in rows]
+
+
+def _decide_against_rules(
+    rules: list[tuple[str, str, int]], resource: str
+) -> tuple[bool, str]:
+    """The priority-first policy judgement over already-loaded rule rows."""
     matching = [row for row in rules if pattern_matches(row[0], resource)]
     if not matching:
         return False, "no_matching_policy"

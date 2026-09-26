@@ -703,6 +703,68 @@ application restarts. The single preview, rule creation, the rule listing,
 the window export, the integrity chain, and authorization evaluation are
 unchanged.
 
+## Read-only batch machine authorization evaluation
+
+`POST /machines/{machine_id}/authorization-evaluations/batch` evaluates a
+whole batch of hypothetical `(action_type, resource)` requests for one machine
+against one same-instant snapshot of that machine's enabled behavior
+declarations and the global policy rules, read once. It is a pure read-only
+audit entry: it consults machine status, that machine's declarations, and the
+global rules only, writes nothing, appends no authorization decision event,
+and no input can change another input's result. The body is a JSON object
+carrying exactly one field, `requests`, an array whose items each carry
+exactly the string fields `action_type` and `resource`; both stay non-empty
+after surrounding whitespace is stripped. The empty array is legal and
+returns a complete empty result. Validation runs entirely before any machine,
+declaration, or rule is read, and any single illegal item rejects the whole
+batch with no partial evaluation:
+
+- any query parameter is `422 {"error":{"code":"invalid_query"}}`, checked
+  before the body is even parsed;
+- a missing body, a body that is not a JSON object, a body that lacks or adds
+  a top-level field, or a `requests` that is not an array is
+  `422 {"error":{"code":"invalid_batch"}}`;
+- an item that is not an object, that lacks or adds a field, whose
+  `action_type` or `resource` is not a string, or that is empty after
+  trimming is `422 {"error":{"code":"invalid_value"}}`.
+
+When the parameters and body are legal but the machine does not exist, the
+response is `404 {"error":{"code":"not_found"}}` with no partial results, even
+for an empty array. The path accepts `POST` only; other methods return `405`
+without reading anything. A failure that prevents reading the machine's
+declarations or the rules returns
+`500 {"error":{"code":"internal_error"}}` with no partial analysis.
+
+Every item uses the single-evaluation semantics unchanged, with the existing
+reason codes and no new synonyms:
+
+- a `suspended` machine returns `{"allowed": false,
+  "reason": "machine_suspended"}` for every item without reading declarations
+  or policy rules;
+- an active machine with no enabled declaration matching the action/resource
+  returns `no_enabled_declaration`;
+- otherwise a request with no matching policy rule returns
+  `no_matching_policy`;
+- among the matching rules the lowest priority decides, a deny at that
+  priority wins over same-priority allows (`denied_by_policy`), otherwise the
+  result is `allowed_by_policy`.
+
+On success the response is `{batch_count, results, summary, decisions}` in
+this fixed field order. `batch_count` is the number of submitted requests.
+`results` has one `{action_type, resource, allowed, reason}` entry per
+request, in the fixed order of the input array, echoing the trimmed pair.
+`summary` counts the five outcome categories under the keys
+`machine_suspended`, `no_enabled_declaration`, `no_matching_policy`,
+`denied_by_policy`, `allowed_by_policy`; empty categories stay present with
+the JSON integer zero. `decisions` counts the final outcomes under `allowed`
+and `denied`, and the two always sum to `batch_count`. Only the path
+machine's data enters the result. The body is compact UTF-8 JSON terminated
+by a single newline, free of floating-point, `-0.0`, or non-finite values,
+byte-identical on repeat calls against unchanged data, evaluable against an
+empty database, and valid against data persisted across application restarts.
+The single evaluation, behavior-declaration creation and listing, the rule
+previews, and decision-event accounting are unchanged.
+
 ## Read-only global policy rule conflict and override audit
 
 `GET /policy-rules/conflicts` is a separate, strictly read-only audit entry

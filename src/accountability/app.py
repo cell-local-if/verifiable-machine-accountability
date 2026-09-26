@@ -817,6 +817,142 @@ def evaluate_authorization(
     return AuthorizationEvaluationOut(allowed=allowed, reason=reason)
 
 
+@app.post("/machines/{machine_id}/authorization-evaluations/batch")
+async def evaluate_authorization_batch(machine_id: str, request: Request):
+    """Read-only batch authorization evaluation for one machine.
+
+    The body is a JSON object carrying exactly one field, ``requests``, an
+    array whose items each carry exactly the string fields ``action_type``
+    and ``resource``; both stay non-empty after surrounding whitespace is
+    stripped. The empty array is legal and yields a complete empty result.
+    Every check runs entirely before any machine, declaration, or rule is
+    read, and any single illegal item rejects the whole batch with no partial
+    evaluation:
+
+    - any query parameter is ``422 invalid_query`` first of all, before the
+      body is even parsed;
+    - a missing body, a body that is not a JSON object, a body that lacks or
+      adds a top-level field, or a ``requests`` that is not an array is
+      ``422 invalid_batch``;
+    - an item that is not an object, that lacks or adds a field, whose
+      action/resource is not a string, or that is empty after trimming is
+      ``422 invalid_value``.
+
+    A missing machine is ``404 not_found`` with no partial results, and
+    non-POST methods return ``405`` without reading anything. All items are
+    evaluated against one same-instant snapshot of the machine's enabled
+    declarations and the global policy rules, read once; no input can change
+    another input's result, and a failure that prevents reading the data
+    returns ``500 internal_error`` with no partial analysis. A suspended
+    machine short-circuits every item to ``machine_suspended`` without
+    reading declarations or rules; otherwise each item applies the
+    single-evaluation semantics unchanged — enabled-declaration check first,
+    then the priority-first policy judgement — reusing the existing reason
+    codes ``no_enabled_declaration``, ``no_matching_policy``,
+    ``denied_by_policy``, and ``allowed_by_policy``.
+
+    The response is ``{batch_count, results, summary, decisions}`` in this
+    fixed field order. ``batch_count`` is the number of submitted requests.
+    ``results`` has one ``{action_type, resource, allowed, reason}`` entry
+    per request in input order, echoing the trimmed pair. ``summary`` counts
+    the five outcomes under the existing reason keys ``machine_suspended``,
+    ``no_enabled_declaration``, ``no_matching_policy``, ``denied_by_policy``,
+    ``allowed_by_policy``; empty categories stay present with the JSON
+    integer zero. ``decisions`` counts the final outcomes under ``allowed``
+    and ``denied``; the two always sum to ``batch_count``. The query is
+    strictly read-only — it never creates, updates, deletes, repairs,
+    recomputes, or normalizes anything, and another machine's data never
+    enters the result — and the body is compact UTF-8 JSON terminated by a
+    single newline, free of floating-point or non-finite values,
+    byte-identical on repeat calls against unchanged data, including data
+    persisted across application restarts.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_batch")
+    if not isinstance(payload, dict) or set(payload) != {"requests"}:
+        return error_response(422, "invalid_batch")
+    requests_raw = payload["requests"]
+    if isinstance(requests_raw, bool) or not isinstance(requests_raw, list):
+        return error_response(422, "invalid_batch")
+
+    # Every item-level failure — a non-object item, a missing or extra field,
+    # a non-string value, or a value blank after trimming — is invalid_value
+    # and rejects the whole batch before any machine, declaration, or rule is
+    # read.
+    items: list[tuple[str, str]] = []
+    for item in requests_raw:
+        if not isinstance(item, dict) or set(item) != {"action_type", "resource"}:
+            return error_response(422, "invalid_value")
+        action_raw, resource_raw = item["action_type"], item["resource"]
+        if isinstance(action_raw, bool) or not isinstance(action_raw, str):
+            return error_response(422, "invalid_value")
+        if isinstance(resource_raw, bool) or not isinstance(resource_raw, str):
+            return error_response(422, "invalid_value")
+        action = action_raw.strip()
+        resource = resource_raw.strip()
+        if not action or not resource:
+            return error_response(422, "invalid_value")
+        items.append((action, resource))
+
+    try:
+        with Session(request.app.state.engine) as session:
+            # One snapshot of the machine's declarations and the global rules
+            # decides the whole batch, so no item can observe or cause a
+            # change in another item's evaluation.
+            outcomes = authorization.evaluate_batch(session, machine_id, items)
+    except Exception:
+        # Never emit a partial evaluation when the data cannot be read.
+        return error_response(500, "internal_error")
+
+    if outcomes is None:
+        return error_response(404, "not_found")
+
+    results = [
+        {
+            "action_type": action,
+            "resource": resource,
+            "allowed": allowed,
+            "reason": reason,
+        }
+        for (action, resource), (allowed, reason) in zip(items, outcomes, strict=True)
+    ]
+
+    summary = {
+        "machine_suspended": 0,
+        "no_enabled_declaration": 0,
+        "no_matching_policy": 0,
+        "denied_by_policy": 0,
+        "allowed_by_policy": 0,
+    }
+    decisions = {"allowed": 0, "denied": 0}
+    for allowed, reason in outcomes:
+        summary[reason] += 1
+        decisions["allowed" if allowed else "denied"] += 1
+
+    batch_payload = {
+        "batch_count": len(items),
+        "results": results,
+        "summary": summary,
+        "decisions": decisions,
+    }
+    # Serialize by hand so the body is compact UTF-8 JSON in a fixed field
+    # order, terminated by a single newline, and free of floating-point or
+    # non-finite values (allow_nan=False).
+    body = (
+        json.dumps(
+            batch_payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 class AuthorizationDecisionEventOut(BaseModel):
     id: str
     machine_id: str
