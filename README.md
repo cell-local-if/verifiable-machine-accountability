@@ -927,6 +927,65 @@ compact UTF-8 JSON on repeat calls (terminated by a single newline, with no
 floating-point, `-0.0`, or non-finite value and a stable field order),
 including data persisted across application restarts; it adds no schema.
 
+## Stable incremental authorization decision event changes query
+
+`GET /machines/{machine_id}/authorization-decision-events/privacy-export/changes`
+is a stable, keyset-paginated incremental view of one machine's authorization
+decision events in the desensitized privacy-export shape. It is a sub-entry
+under the machine authorization decision event privacy export; the event
+registration, list, windowed privacy export, hash chain, integrity audit, and
+authorization evaluation semantics are unchanged. It submits only the machine
+id, a page size, and an optional cursor — no business filter parameters or
+request body. Validation completes before the machine or any event is read:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, decimal (`3.0`), boolean (`true`/`false`), non-decimal text, or
+  out-of-range value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque string shaped
+  `<created_at original text>|<event uuid>` and returned by a previous page.
+  An empty, non-string, shape-mismatching, or unparseable value (a missing
+  separator, a non-UUID event segment, a missing-`Z`, offset, or
+  out-of-range timestamp segment) returns
+  `422 {"error":{"code":"invalid_cursor"}}` without querying the machine.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`; the unknown-parameter check runs
+  first, ahead of `limit`/`cursor` validation and the machine lookup, so an
+  invalid query against a non-existent machine is still `422`.
+- After validation, a missing machine returns
+  `404 {"error":{"code":"not_found"}}` with no records.
+- The path accepts `GET` only; other methods return `405` without reading
+  events, computing a page, summarizing data, or writing anything.
+
+The response is `{machine_id, limit, records, next_cursor, has_more}` in a
+fixed field order; `records` contains only records owned by the path machine,
+ordered by the actual UTC instant of `created_at` and then by event id
+ascending (an exact-second record sorts before any fractional-second record of
+the same second), and is an empty array on an empty page. Each record exposes
+exactly the ten privacy-export fields `{id, machine_id, action_ref,
+resource_ref, allowed, reason, created_at, previous_event_id, content_hash,
+chain_hash}`: the stored identifier, machine, decision result, reason,
+creation time, previous-event link, and both chain digests are emitted exactly
+as stored, while the raw action and resource are never returned, their
+positions carrying the same machine-scoped desensitizing digests (or `null`
+for a non-string or blank value). Missing, misowned, or chain-damaged events
+are kept verbatim — never filtered out, repaired, recomputed, or normalized.
+
+The cursor is an exclusive position over `(created_at, event id)`: it points
+just after a page's last record, so a page returns only records strictly
+after the cursor. Repeating the same cursor against unchanged data returns the
+byte-identical page, and an event newly inserted (even at an earlier creation
+time) never causes an already-returned record to resurface; the current page
+is still ordered by the stable `(instant, id)` order. `next_cursor` is the
+position after the page's last record when at least one record follows and
+`null` on the last page; `has_more` is `true` exactly when a record exists
+after the current position and `false` otherwise (including on an empty page
+and the last page, which return empty `records` and `false`). Cursors are
+stateless and add no schema: the endpoint issues only reads, never writes,
+repairs, or normalizes an event, keeps strict machine isolation on every page,
+reads events persisted across application restarts, and returns compact
+UTF-8 JSON terminated by a single newline, free of floating-point, `-0.0`, or
+non-finite values.
+
 ## Read-only causal-link compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/causal-links/compliance-export`
