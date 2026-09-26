@@ -117,6 +117,58 @@ contains no floating-point or non-finite values. The query only reads: it
 never creates, updates, deletes, repairs, or normalizes status, history, or
 any other record, and another machine's records never enter the result.
 
+## Read-only behavior-declaration completeness audit
+
+`GET /machines/{machine_id}/behavior-declarations/integrity` is a read-only
+completeness check over one machine's behavior declarations, sitting under the
+existing declaration path. It returns exactly
+`{valid, checked_count, broken_declaration_id}` in this fixed field order.
+
+- The caller submits only the path machine id; the endpoint accepts no
+  business filter parameters. Any query parameter is
+  `422 {"error":{"code":"invalid_query"}}` raised during validation before
+  the machine is looked up and before any declaration is read.
+- A missing machine is `404 {"error":{"code":"not_found"}}` carrying no
+  integrity conclusion.
+- Only `GET` is routed; other methods return `405` without reading
+  declarations, computing a check, or writing anything.
+- A machine with no declarations reports `true`, `0`, and `null`.
+- `checked_count` is always the total number of declarations stored under the
+  path machine — every record is counted, including broken ones — and stays a
+  JSON integer.
+
+Declarations are examined in the order of the actual UTC instant of
+`created_at` and then by `id` ascending, so an exact-second record sorts
+before a fractional-second record of the same second. Each record passes only
+when:
+
+- its `machine_id` equals the path machine;
+- its `id` is the canonical textual form of a UUID;
+- `action_type` and `resource_pattern` are strings that stay non-empty after
+  surrounding whitespace is stripped;
+- `enabled` is a stored boolean;
+- `created_at` and `updated_at` are UTC date-times ending in `Z` (fractional
+  seconds optional);
+- the whitespace-stripped `(action_type, resource_pattern)` combination is
+  unique within the machine; when a combination repeats, the earliest record
+  of the duplicate group in audit order is the anomaly.
+
+The first record failing any field or uniqueness condition sets `valid` to
+`false` and is reported by its stored id verbatim; when every record passes,
+`valid` is `true` and `broken_declaration_id` is `null`. Stored values are
+read exactly as persisted and never normalized, so a tampered value is seen
+as stored and surfaced rather than coerced. Another machine's damaged
+declarations never enter the check and can never change this machine's
+conclusion. The query is strictly read-only — it never creates, updates,
+deletes, repairs, recomputes, or normalizes a declaration and never affects an
+authorization evaluation — repeated calls against unchanged data return
+byte-identical results, declarations persisted across application restarts
+are audited unchanged, an empty database serves the endpoint, and older
+databases keep reading their existing declaration data with no new storage
+format. The existing declaration creation and listing, machine identity, key
+rotation, policy rules, event chains, and compliance export semantics are
+unchanged.
+
 ## Read-only joint-write transaction diagnostics
 
 `GET /machines/{machine_id}/diag` exposes read-only observability over the

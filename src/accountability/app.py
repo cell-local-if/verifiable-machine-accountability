@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from . import (
     assignment_chain,
     authorization,
+    behavior_declaration_integrity,
     chain,
     diagnostics,
     evidence_chain,
@@ -513,6 +514,95 @@ def list_behavior_declarations(machine_id: str, session: SessionDep):
         .order_by(BehaviorDeclaration.created_at, BehaviorDeclaration.id)
     ).all()
     return [declaration_to_out(d) for d in declarations]
+
+
+def validate_behavior_declaration_integrity_params(request: Request) -> None:
+    """Validate the behavior-declaration integrity query string.
+
+    The read-only audit is keyed on the path machine alone and accepts no
+    business filter parameters; any parameter name is a 422
+    ``invalid_query``. The check runs during validation, before any
+    declaration is read and without database access, so an extra parameter
+    against a non-existent machine still reports 422 rather than 404.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+class BehaviorDeclarationIntegrityOut(BaseModel):
+    valid: bool
+    checked_count: int
+    broken_declaration_id: str | None
+
+
+@app.get(
+    "/machines/{machine_id}/behavior-declarations/integrity",
+    response_model=BehaviorDeclarationIntegrityOut,
+)
+def check_behavior_declaration_integrity(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_behavior_declaration_integrity_params)],
+    session: SessionDep,
+):
+    """Read-only completeness audit of one machine's behavior declarations.
+
+    The caller submits only the path machine id — no filter or business query
+    parameter; any query parameter is a 422 ``invalid_query`` raised during
+    validation before the machine is looked up and before any declaration is
+    read. A missing machine is a 404 ``not_found`` carrying no integrity
+    conclusion. Only ``GET`` is routed; other methods return 405 without
+    reading declarations, computing a result, or writing anything.
+
+    On success the response carries exactly
+    ``{valid, checked_count, broken_declaration_id}``. A machine with no
+    declarations reports ``true``, ``0``, and ``null``; otherwise
+    ``checked_count`` is the total number of declarations stored under the
+    path machine (every record is counted, including broken ones). Declarations
+    are examined in the order of the actual UTC instant of ``created_at`` and
+    then ``id`` ascending, so an exact-second record sorts before any
+    fractional-second record of the same second. Each record must keep
+    ``machine_id`` equal to the path machine, an ``id`` in canonical UUID
+    form, ``action_type`` and ``resource_pattern`` strings that stay non-empty
+    after surrounding whitespace is stripped, ``enabled`` a stored boolean,
+    and ``created_at`` and ``updated_at`` UTC date-times ending in ``Z``; the
+    whitespace-stripped ``(action_type, resource_pattern)`` combination must be
+    unique within the machine, and the earliest-sorted record of a repeated
+    combination is the duplicate-group anomaly. The first record failing any
+    field or uniqueness condition makes ``valid`` ``false`` and is reported by
+    its stored id verbatim; when every record passes, ``valid`` is ``true``
+    and ``broken_declaration_id`` is ``null``. Stored values are read raw and
+    never normalized, so a tampered value is seen as stored.
+
+    Another machine's damaged declarations never enter the audit and can
+    never change this machine's conclusion. The query is strictly read-only —
+    it never creates, updates, deletes, repairs, recomputes, or normalizes a
+    declaration and never affects an authorization evaluation — and repeated
+    calls against unchanged data return byte-identical results, including
+    declarations persisted across application restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    rows = behavior_declaration_integrity.load_declarations(session, machine_id)
+    valid, checked_count, broken_declaration_id = (
+        behavior_declaration_integrity.audit_declarations(rows, machine_id)
+    )
+    # The broken id is the stored identifier verbatim; a damaged non-text
+    # bucket is surfaced as text rather than crashing the read-only response,
+    # matching the json-safe convention of the other stored-value audits.
+    if not isinstance(broken_declaration_id, str) and broken_declaration_id is not None:
+        if isinstance(broken_declaration_id, bytes):
+            broken_declaration_id = broken_declaration_id.decode(
+                "utf-8", errors="replace"
+            )
+        else:
+            broken_declaration_id = str(broken_declaration_id)
+    return BehaviorDeclarationIntegrityOut(
+        valid=valid,
+        checked_count=checked_count,
+        broken_declaration_id=broken_declaration_id,
+    )
 
 
 class PolicyRuleCreate(BaseModel):
