@@ -4461,6 +4461,136 @@ def check_privacy_access_integrity(
     return Response(content=body, media_type="application/json")
 
 
+def validate_privacy_access_diagnostics_params(request: Request) -> None:
+    """Validate the privacy-access diagnostics query string before any lookup.
+
+    The per-record diagnostics entry is keyed on the path machine alone: it
+    accepts no filter parameters, no time bounds, no business conditions, and
+    no request body. Any query parameter name or a carried body is a 422
+    ``invalid_query``. The check runs before the machine is looked up and
+    issues no database access — it never reads an access record — so an extra
+    parameter or body against a non-existent machine still reports 422 rather
+    than 404.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+    # A body on a GET is an unknown-shape request rejected in the validation
+    # phase, before any machine or access record is read. A present non-zero
+    # Content-Length, or a chunked request without one, means a body is being
+    # carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/privacy-accesses/diagnostics")
+def get_privacy_access_diagnostics(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_privacy_access_diagnostics_params)],
+    session: SessionDep,
+):
+    """Read-only per-record diagnosis of one machine's privacy access chain.
+
+    The real entry point is the ``diagnostics`` sub-entry under
+    ``privacy-accesses``; only ``GET`` is routed, so non-GET methods return
+    ``405`` without reading records, computing positions, or summarizing any
+    data. The caller submits only the path machine id — no filter parameters,
+    no time bounds, no request body, and no business conditions; any query
+    parameter or carried body is a 422 ``invalid_query`` raised during
+    validation before the machine is ever looked up and without reading any
+    access record. A missing machine is a 404 ``not_found`` carrying no
+    diagnostic data and no partial chain conclusion. A failure while reading
+    the machine or its access records is a 500 ``internal_error`` with no
+    partial diagnosis.
+
+    On success the response carries exactly ``{machine_id, valid,
+    checked_count, records}`` in this fixed field order. ``checked_count`` is
+    the total number of records owned by the path machine, including records
+    after the first anomaly and ones whose stored values no longer parse; an
+    empty machine reports ``valid`` ``true``, zero, and an empty ``records``
+    array. The records are listed in the chain order — the actual UTC instant
+    of ``accessed_at`` and then record id ascending, so an exact-second record
+    sorts before any fractional-second record of the same second, and a
+    damaged stamp sorts after every parseable instant instead of crashing the
+    audit. ``position`` numbers the records in that order starting at one with
+    no gaps.
+
+    Each record carries exactly ``{id, position, previous_access_id,
+    content_hash, chain_hash, errors}`` in this fixed field order: the record's
+    actual stored identifier, its chain position, its stored predecessor
+    identifier (``null`` on the first record, the immediately preceding
+    record's id otherwise, and the stored value verbatim when a link is
+    damaged), the stored content digest, and the stored chain digest,
+    followed by an array of anomaly codes. The seven fixed codes, in order,
+    are ``missing_previous`` (a non-first record with no predecessor),
+    ``bad_previous`` (the stored link does not name the immediate predecessor,
+    including a foreign, repeated, or skipped pointer, or a first record that
+    carries one), ``bad_content_hash`` (the stored content digest differs from
+    the SHA-256 of the compact key-sorted JSON of the seven business fields),
+    ``bad_chain_hash`` (the stored chain digest differs from
+    ``sha256("<previous expected chain digest>:<content digest>")`` from the
+    empty-prefix root), ``bad_time`` (the stored ``accessed_at`` does not parse
+    as a UTC RFC 3339 date-time), ``bad_id`` (the stored identifier is not a
+    well-formed unique UUID), and ``bad_ownership`` (the stored machine
+    identifier is not the path machine). A sound record carries an empty
+    array; the array keeps every problem found on that record. The first
+    anomalous record makes the overall ``valid`` false; later records are
+    still listed exactly as stored.
+
+    The query is strictly read-only: it never creates, updates, deletes,
+    repairs, recomputes, or normalizes a record, and another machine's
+    records, sound or damaged, never enter the result or change this
+    machine's conclusion. Damaged stored values never crash the query and are
+    never rewritten. The body is compact UTF-8 JSON terminated by a single
+    newline, with no floating-point, ``-0.0``, or non-finite value,
+    byte-identical on repeat calls against unchanged data, including data
+    persisted across application restarts.
+    """
+    # A failure while *reading* the machine or its access records is an
+    # internal read-layer fault: answer 500 internal_error with no partial
+    # machine object and no partial diagnosis. Damaged stored values are not a
+    # read failure — rows read successfully are diagnosed as chain anomalies,
+    # never misclassified as an internal error.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        result = privacy_chain.diagnose_chain(session, machine_id)
+    except Exception:
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": result["machine_id"],
+        "valid": result["valid"],
+        "checked_count": result["checked_count"],
+        "records": [
+            {
+                "id": record["id"],
+                "position": record["position"],
+                # Verbatim stored value: null for a sound first record (the
+                # per-machine chain convention) and for a damaged null link.
+                "previous_access_id": record["previous_access_id"],
+                "content_hash": record["content_hash"],
+                "chain_hash": record["chain_hash"],
+                "errors": record["errors"],
+            }
+            for record in result["records"]
+        ],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 class IncidentIntegrityOut(BaseModel):
     valid: bool
     checked_count: int

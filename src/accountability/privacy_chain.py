@@ -25,6 +25,7 @@ is a no-op for the common tail-append case.
 
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -389,3 +390,206 @@ def verify_chain(session, machine_id: str) -> tuple[bool, int, str | None]:
         previous_chain_hash = chain_hash
 
     return True, len(rows), None
+
+
+# --- read-only per-record chain diagnostics ---------------------------------
+#
+# The seven stable per-record anomaly codes, emitted on each record in this
+# fixed order (the order the codes are documented in). A sound record carries
+# an empty array.
+ERROR_MISSING_PREVIOUS = "missing_previous"
+ERROR_BAD_PREVIOUS = "bad_previous"
+ERROR_BAD_CONTENT_HASH = "bad_content_hash"
+ERROR_BAD_CHAIN_HASH = "bad_chain_hash"
+ERROR_BAD_TIME = "bad_time"
+ERROR_BAD_ID = "bad_id"
+ERROR_BAD_OWNERSHIP = "bad_ownership"
+
+_ERROR_CODE_ORDER = (
+    ERROR_MISSING_PREVIOUS,
+    ERROR_BAD_PREVIOUS,
+    ERROR_BAD_CONTENT_HASH,
+    ERROR_BAD_CHAIN_HASH,
+    ERROR_BAD_TIME,
+    ERROR_BAD_ID,
+    ERROR_BAD_OWNERSHIP,
+)
+
+# A stored privacy access id is a 36-character UUID string; a tampered id of
+# another shape is a record-identifier anomaly rather than a crash.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+# RFC 3339 date-time in UTC with a literal ``Z`` suffix.
+_RFC3339_Z_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
+)
+
+
+def _is_parseable_stamp(value: object) -> bool:
+    """Whether a stored ``accessed_at`` is a parseable RFC 3339 ``Z`` instant."""
+    if not isinstance(value, str) or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        return False
+    try:
+        datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return True
+
+
+def _diagnostic_order(rows: list[Any]) -> list[Any]:
+    """Chain order for a diagnostic scan, tolerant of a damaged identifier.
+
+    Same (accessed-at instant, id) ordering as :func:`_chain_order`, but a
+    stored id that is no longer a string never crashes the comparison: such
+    ids deterministically sort after string ids within one instant (stable
+    sort keeps database order among them), and damaged stamps already sort
+    after every parseable instant.
+    """
+    def key(row: Any) -> tuple[Any, int, str]:
+        record_id = row._mapping["id"]
+        instant = _accessed_instant(row._mapping["accessed_at"])
+        if isinstance(record_id, str):
+            return (instant, 0, record_id)
+        return (instant, 1, "")
+
+    return sorted(rows, key=key)
+
+
+def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
+    """Diagnose one machine's privacy access chain, record by record, read-only.
+
+    Only the path machine's records are examined, in the same chain order used
+    to build and verify the chain: the actual UTC instant of ``accessed_at``
+    and then ``id``. A stored ``accessed_at`` that no longer parses sorts after
+    every parseable record (the tolerant audit convention) instead of crashing
+    and is flagged on that record; other damaged stored values are judged as
+    anomalies, never repaired or normalized.
+
+    Every record is returned — including records after the first anomaly. The
+    overall ``valid`` flag is false once any record carries at least one
+    anomaly; each record's ``errors`` array keeps every anomaly that applies
+    to it, in the fixed error-code order. Content and chain digests follow the
+    existing chain rules exactly: the content digest is the SHA-256 of the
+    compact key-sorted JSON of the seven business fields, and the chain digest
+    is ``sha256("<previous expected chain digest>:<content digest>")`` running
+    from the empty prefix in chain order, so a damaged record also breaks the
+    expected chain continuation for its successors.
+
+    Returns ``{"machine_id", "valid", "checked_count", "records"}``; each
+    record is ``{"id", "position", "previous_access_id", "content_hash",
+    "chain_hash", "errors"}`` with ``position`` numbered from one. Issues no
+    writes.
+    """
+    rows = _diagnostic_order(
+        list(
+            session.execute(
+                _TABLE.select().where(_TABLE.c.machine_id == machine_id)
+            )
+        )
+    )
+
+    records: list[dict[str, Any]] = []
+    overall_valid = True
+    previous_chain_hash = ""
+    seen_ids: set[str] = set()
+
+    for position, row in enumerate(rows, start=1):
+        mapping = row._mapping
+        record_id = mapping["id"]
+        stored_previous = mapping["previous_access_id"]
+        stored_content_hash = mapping["content_hash"]
+        stored_chain_hash = mapping["chain_hash"]
+
+        errors: list[str] = []
+
+        # Ownership: a row whose stored machine id no longer names the path
+        # machine does not belong to this machine's chain.
+        if mapping["machine_id"] != machine_id:
+            errors.append(ERROR_BAD_OWNERSHIP)
+
+        # Record identifier: a UUID-shaped string, unique within the machine.
+        if not isinstance(record_id, str) or not _UUID_RE.fullmatch(record_id):
+            errors.append(ERROR_BAD_ID)
+        elif record_id in seen_ids:
+            errors.append(ERROR_BAD_ID)
+        if isinstance(record_id, str):
+            seen_ids.add(record_id)
+
+        # Access instant: must parse as an RFC 3339 Z date-time. Damaged
+        # stamps sort last via the tolerant ordering; flag them here too.
+        if not _is_parseable_stamp(mapping["accessed_at"]):
+            errors.append(ERROR_BAD_TIME)
+
+        # Predecessor link: null only on the first record; every later record
+        # must name exactly its immediate predecessor in chain order. A null
+        # link on a non-first record is a missing predecessor; any other
+        # mismatch (foreign, repeated, skipped, or malformed pointer) is a
+        # wrong predecessor. The two cannot co-occur on one record.
+        if position == 1:
+            if stored_previous is not None:
+                errors.append(ERROR_BAD_PREVIOUS)
+        else:
+            expected_previous_id = records[-1]["id"]
+            if stored_previous is None:
+                errors.append(ERROR_MISSING_PREVIOUS)
+            elif stored_previous != expected_previous_id:
+                errors.append(ERROR_BAD_PREVIOUS)
+
+        # Content digest over the seven stored business fields, then the chain
+        # digest running from the empty prefix in chain order — the same
+        # recomputation the integrity audit uses. A damaged business field
+        # (e.g. a non-string or non-integer stored value) makes the digest
+        # uncomputable; that is a content-digest anomaly, never a crash, and
+        # such a record also cannot extend the chain continuation.
+        try:
+            expected_content_hash = compute_content_hash(
+                **{key: mapping[key] for key in _CONTENT_COLUMNS}
+            )
+        except (TypeError, ValueError):
+            expected_content_hash = None
+        if (
+            expected_content_hash is None
+            or stored_content_hash != expected_content_hash
+        ):
+            errors.append(ERROR_BAD_CONTENT_HASH)
+        if expected_content_hash is not None:
+            expected_chain_hash = compute_chain_hash(
+                previous_chain_hash, expected_content_hash
+            )
+        else:
+            expected_chain_hash = None
+        if (
+            expected_chain_hash is None
+            or stored_chain_hash != expected_chain_hash
+        ):
+            errors.append(ERROR_BAD_CHAIN_HASH)
+        previous_chain_hash = (
+            expected_chain_hash if expected_chain_hash is not None else ""
+        )
+
+        errors = [code for code in _ERROR_CODE_ORDER if code in errors]
+        if errors:
+            overall_valid = False
+
+        records.append(
+            {
+                "id": record_id,
+                "position": position,
+                # Emitted exactly as stored (including a damaged null on a
+                # non-first record); only a sound first record is null.
+                "previous_access_id": stored_previous,
+                "content_hash": stored_content_hash,
+                "chain_hash": stored_chain_hash,
+                "errors": errors,
+            }
+        )
+
+    return {
+        "machine_id": machine_id,
+        "valid": overall_valid,
+        "checked_count": len(records),
+        "records": records,
+    }

@@ -1499,6 +1499,50 @@ key material — and changes nothing about single registration, batch
 registration, duplicate detection, the integrity audits, the compliance
 exports, or query ordering.
 
+### Per-record chain diagnostics
+
+`GET /machines/{machine_id}/privacy-accesses/diagnostics` is the read-only,
+per-record diagnostic entry for one machine's privacy access chain. It adds a
+new query only; registration, batch registration, the changes query, the
+summary, buckets, the export, and the existing audits are unchanged. The caller
+submits only the path machine id — no filter parameters, time bounds, business
+conditions, or request body:
+
+- any query parameter, or a body carried on the GET, returns
+  `422 {"error":{"code":"invalid_query"}}` before the machine is looked up and
+  without reading any access record;
+- a missing machine returns `404 {"error":{"code":"not_found"}}` with no
+  diagnostic data and no partial chain conclusion;
+- a failure while reading the machine or its access records returns
+  `500 {"error":{"code":"internal_error"}}` with no partial diagnosis;
+- the path accepts `GET` only; other methods return `405` without reading
+  records, computing positions, or summarizing data.
+
+A successful response is exactly `{machine_id, valid, checked_count,
+records}` in this field order. Records are ordered by the actual UTC instant
+of `accessed_at` and then by record id (an exact-second record precedes any
+fractional-second record of the same second), with `position` numbered from 1
+with no gaps; a damaged `accessed_at` that no longer parses sorts after every
+parseable instant instead of crashing. An empty machine returns `valid`
+`true`, `checked_count` `0`, and an empty `records` array.
+
+Each record is exactly `{id, position, previous_access_id, content_hash,
+chain_hash, errors}`: the actual stored record id, its position, its stored
+predecessor id (`null` on the first record and the immediately preceding
+record otherwise, emitted verbatim even when a link is damaged), the stored
+content digest, the stored chain digest, and an array of anomaly codes. The seven fixed codes, in order, are
+`missing_previous`, `bad_previous`, `bad_content_hash`, `bad_chain_hash`,
+`bad_time`, `bad_id`, and `bad_ownership`; a sound record carries an empty
+array and each record keeps every problem found on it. The first anomalous
+record makes `valid` `false`; later records are still listed exactly as
+stored. Content and chain digests follow the existing privacy access chain
+rules. The query never creates, updates, deletes, repairs, recomputes, or
+normalizes a record, damaged values never crash it or are rewritten, and
+another machine's damaged records never affect this machine's result. The body
+is compact UTF-8 JSON terminated by a single newline, contains no
+floating-point or non-finite value, and is byte-identical on repeat calls and
+across application restarts.
+
 
 ## Read-only machine-level integrity summary
 
