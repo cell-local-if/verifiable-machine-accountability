@@ -2697,6 +2697,186 @@ def export_authorization_decision_events_privacy(
     return Response(content=body, media_type="application/json")
 
 
+# --- read-only incremental change query over the decision-event privacy view -
+
+
+class DecisionEventChangesParams(BaseModel):
+    limit: int
+    cursor: str | None = None
+
+
+def validate_decision_event_changes_params(
+    request: Request,
+) -> DecisionEventChangesParams:
+    """Validate the decision-event ``changes`` query string before any lookup.
+
+    Exactly two parameters are accepted: the required ``limit`` and the
+    optional ``cursor``. ``limit`` must be a non-boolean integer in 1..100; a
+    missing, non-integer (``3.0``, ``true``, blank, non-decimal text),
+    out-of-range, or boolean value is a 422 ``bad_limit``. ``cursor``, when
+    present, must be a string shaped ``<created_at original text>|<event
+    uuid>``; a null, empty, non-string, shape-mismatching, or unparseable
+    cursor is a 422 ``invalid_cursor`` and the machine is never queried. Any
+    other parameter name is a 422 ``invalid_query``. All three checks run
+    before the machine is looked up and issue no database access, so an
+    invalid query against a non-existent machine still reports 422 rather
+    than 404.
+    """
+    allowed = {"limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``limit=1&limit=2`` rather than silently taking one occurrence.
+    if len(request.query_params.getlist("limit")) != 1:
+        raise QueryError("bad_limit")
+    if len(request.query_params.getlist("cursor")) > 1:
+        raise QueryError("invalid_cursor")
+
+    raw_limit = request.query_params.get("limit")
+    if raw_limit is None or not _INTEGER_QUERY_RE.fullmatch(raw_limit):
+        raise QueryError("bad_limit")
+    limit = int(raw_limit)
+    if not 1 <= limit <= 100:
+        raise QueryError("bad_limit")
+
+    cursor = request.query_params.get("cursor")
+    if cursor is not None:
+        # Query parameters arrive as strings; an empty value carries no
+        # separator and fails the shape check below. The split is on the first
+        # separator, so the timestamp segment may itself contain ``|``; the
+        # event-id segment must be exactly a UUID.
+        parts = cursor.split("|", 1)
+        if len(parts) != 2 or not parts[0] or not _UUID_RE.fullmatch(parts[1]):
+            raise QueryError("invalid_cursor")
+        # The position segment is the original ``created_at`` text, always a
+        # UTC RFC 3339 date-time ending in ``Z``; a damaged value is rejected
+        # here rather than failing later while parsing the position.
+        cursor_created_at = parts[0]
+        if not _RFC3339_Z_DATETIME_RE.fullmatch(cursor_created_at):
+            raise QueryError("invalid_cursor")
+        try:
+            parse_utc_z_datetime(cursor_created_at)
+        except ValueError:
+            raise QueryError("invalid_cursor") from None
+
+    return DecisionEventChangesParams(limit=limit, cursor=cursor)
+
+
+def _encode_decision_event_cursor(created_at: str, event_id: str) -> str:
+    return f"{created_at}|{event_id}"
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/privacy-export/changes"
+)
+def get_authorization_decision_event_changes(
+    machine_id: str,
+    params: Annotated[
+        DecisionEventChangesParams,
+        Depends(validate_decision_event_changes_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only incremental, keyset-paginated query over the desensitized
+    authorization decision events of one machine.
+
+    The real entry point is the ``changes`` sub-entry of the machine event
+    privacy export; only ``GET`` is routed, so non-GET methods return ``405``
+    without reading events, computing a page, digesting a field, or writing
+    anything. The caller submits the path machine id, a required ``limit`` (a
+    non-boolean integer from 1 to 100), and an optional opaque ``cursor``
+    returned by a previous page — no business filter parameters and no
+    request body. Query validation (``invalid_query`` for unknown parameters,
+    checked before the machine; ``bad_limit`` for a missing, fractional,
+    boolean, or out-of-range ``limit``; ``invalid_cursor`` for a null, empty,
+    non-string, shape-mismatching, or unparseable ``cursor``) completes before
+    the machine or any event is read. A missing machine is a ``404
+    not_found`` carrying no events.
+
+    On success the response carries exactly ``{machine_id, limit, records,
+    next_cursor, has_more}`` in this fixed, stable key order. ``records``
+    contains only events owned by the path machine, presented through the
+    same desensitized privacy-export view (raw action/resource never leave
+    the service — only their ``action_ref``/``resource_ref`` digests), each
+    record keeping its stored id, machine, result, reason, created time,
+    previous-event id, and chain digest. Records are ordered by the actual
+    UTC instant of ``created_at`` and then by event id ascending, so an
+    exact-second record sorts before any fractional-second record of the same
+    second; the array is empty on an empty or past-the-end page.
+
+    The cursor is the exclusive position ``<created_at original text>|<event
+    id>`` pointing just after a page's last record, so it returns only records
+    strictly after it: repeating the same cursor against unchanged data
+    returns the byte-identical page, and a newly inserted event with an
+    earlier timestamp never makes an already-returned record resurface.
+    ``next_cursor`` carries the position after the page's last record only
+    when a record follows (``null`` otherwise), and ``has_more`` is true
+    exactly in that case — false on an empty or last page. The endpoint adds
+    no schema (cursors are stateless), is strictly read-only and machine
+    isolated, keeps damaged or misowned records exactly as stored, and reads
+    events persisted across application restarts. The body is compact UTF-8
+    JSON terminated by a single newline, free of any floating-point,
+    ``-0.0``, or non-finite value.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    rows = session.scalars(
+        select(AuthorizationDecisionEvent).where(
+            AuthorizationDecisionEvent.machine_id == machine_id
+        )
+    ).all()
+    # Ordering parses stamps to UTC instants because an exact-second stamp
+    # sorts before a fractional stamp of the same second only after parsing
+    # (lexicographically '.' precedes 'Z'). Registered rows always parse, so
+    # a cursor built by this endpoint lands exactly at its record.
+    ordered = sorted(
+        rows,
+        key=lambda row: (parse_utc_z_datetime(row.created_at), row.id),
+    )
+
+    start = 0
+    if params.cursor is not None:
+        cursor_created_at, cursor_id = params.cursor.split("|", 1)
+        # Exclusive keyset position: the first record strictly after
+        # (cursor-instant, cursor-id).
+        start = bisect.bisect_right(
+            ordered,
+            (parse_utc_z_datetime(cursor_created_at), cursor_id),
+            key=lambda row: (parse_utc_z_datetime(row.created_at), row.id),
+        )
+
+    remaining = ordered[start:]
+    page = remaining[: params.limit]
+    has_more = len(remaining) > len(page)
+    next_cursor = (
+        _encode_decision_event_cursor(page[-1].created_at, page[-1].id)
+        if page and has_more
+        else None
+    )
+
+    payload = {
+        "machine_id": machine_id,
+        "limit": params.limit,
+        "records": [privacy_decision_event_to_dict(record) for record in page],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- read-only desensitized machine identity privacy export ------------------
 
 
