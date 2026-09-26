@@ -94,6 +94,59 @@ append either commit together or leave no trace. Body validation (`422`) and
 the missing-machine/path-resource (`404 not_found`) outcomes are unchanged by
 this serialization and never flip error types under a status race.
 
+## Read-only batch machine authorization evaluation
+
+`POST /machines/{machine_id}/authorization-evaluations/batch` evaluates a
+whole batch of hypothetical `(action_type, resource)` requests for one
+machine against one same-instant snapshot of the machine's status, its
+enabled behavior declarations, and the global policy rules. It is a pure
+read-only evaluation entry: it writes nothing, records no decision events,
+and no input can change another input's result. The body is a JSON object
+carrying a `requests` array; each item submits an `action_type` and a
+`resource`, both strings that stay non-empty after surrounding whitespace is
+stripped. The empty array is legal and yields a complete empty result.
+Validation runs entirely before any machine, declaration, or rule is read,
+and any single illegal item rejects the whole batch with no partial
+analysis:
+
+- any query parameter is `422 {"error":{"code":"invalid_query"}}`, checked
+  before the body is even parsed;
+- a missing body, a body that is not a JSON object, a missing `requests`,
+  or a `requests` that is not an array is
+  `422 {"error":{"code":"invalid_batch"}}`;
+- an item that is not an object, that lacks `action_type` or `resource`,
+  that types either wrongly, or whose value is empty after trimming is
+  `422 {"error":{"code":"invalid_value"}}`.
+
+After validation a missing machine is `404 {"error":{"code":"not_found"}}`
+with no partial results. The path accepts `POST` only; other methods return
+`405` without reading anything. A failure that prevents reading the machine,
+the declarations, or the rules returns
+`500 {"error":{"code":"internal_error"}}` with no partial analysis.
+
+A suspended machine short-circuits every item to
+`{"allowed": false, "reason": "machine_suspended"}` without consulting
+declarations or rules; otherwise each item applies the single-evaluation
+semantics unchanged — an enabled declaration must match, then the
+lowest-priority matching rule decides — reusing the existing reason codes
+`no_enabled_declaration`, `no_matching_policy`, `denied_by_policy`, and
+`allowed_by_policy` with no new synonymous values.
+
+On success the response is `{batch_count, results, summary, decisions}` in
+this fixed field order. `batch_count` is the number of submitted requests.
+`results` has one `{action_type, resource, allowed, reason}` entry per
+request in input order, echoing the trimmed pair. `summary` counts the five
+reason categories in the fixed key order `machine_suspended`,
+`no_enabled_declaration`, `no_matching_policy`, `denied_by_policy`,
+`allowed_by_policy`; empty categories stay present with the JSON integer
+zero. `decisions` counts final allows and denies under `allow`/`deny`, and
+the two always sum to `batch_count`. The body is compact UTF-8 JSON
+terminated by a single newline, free of floating-point, `-0.0`, or
+non-finite values, byte-identical on repeat calls against unchanged data,
+including data persisted across application restarts. The single evaluation,
+declaration creation and listing, the rule previews, and decision-event
+accounting are unchanged.
+
 ## Machine status history
 
 Every accepted status change appends exactly one immutable record to the
