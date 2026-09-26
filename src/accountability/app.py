@@ -24,7 +24,7 @@ from pydantic import (
     model_validator,
 )
 from sqlalchemy import create_engine, event, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from . import (
@@ -41,6 +41,7 @@ from . import (
     policy_rule_chain,
     privacy_chain,
     rotation_chain,
+    status_event_chain,
 )
 from .db import (
     AuthorizationDecisionCausalLink,
@@ -102,6 +103,8 @@ async def lifespan(app: FastAPI):
     evidence_chain.backfill_chains(engine)
     policy_rule_chain.migrate_schema(engine)
     policy_rule_chain.backfill_chains(engine)
+    status_event_chain.migrate_schema(engine)
+    status_event_chain.backfill_chains(engine)
     diagnostics.migrate_schema(engine)
     # Finalize joint-write markers left by a crashed previous process from
     # the committed evidence, before serving any request.
@@ -2286,6 +2289,31 @@ def incident_status_event_to_out(
     )
 
 
+class IncidentStatusEventChainOut(IncidentStatusEventOut):
+    # The status-history listing adds the tamper-evident chain fields; the
+    # compliance exports keep the 7-field shape above.
+    previous_status_event_id: str | None
+    content_hash: str | None
+    chain_hash: str | None
+
+
+def incident_status_event_to_chain_out(
+    record: IncidentStatusEvent,
+) -> IncidentStatusEventChainOut:
+    return IncidentStatusEventChainOut(
+        id=record.id,
+        machine_id=record.machine_id,
+        event_id=record.event_id,
+        incident_id=record.incident_id,
+        from_status=record.from_status,
+        to_status=record.to_status,
+        created_at=record.created_at,
+        previous_status_event_id=record.previous_status_event_id,
+        content_hash=record.content_hash,
+        chain_hash=record.chain_hash,
+    )
+
+
 @app.post(
     "/machines/{machine_id}/authorization-decision-events/{event_id}/incidents/"
     "{incident_id}/status",
@@ -2331,7 +2359,7 @@ def transition_incident_status(
 @app.get(
     "/machines/{machine_id}/authorization-decision-events/{event_id}/incidents/"
     "{incident_id}/status-history",
-    response_model=list[IncidentStatusEventOut],
+    response_model=list[IncidentStatusEventChainOut],
 )
 def list_incident_status_history(
     machine_id: str,
@@ -2344,8 +2372,11 @@ def list_incident_status_history(
     The machine, event, and incident must all exist and belong together; a
     missing one or an ownership mismatch returns 404 ``not_found``. Entries are
     returned in ``created_at``, then ``id`` order (``[]`` for an incident that
-    has never moved). The query only reads: history records are never updated
-    or deleted, and no other table is touched.
+    has never moved). Each entry carries the transition fields plus the
+    per-machine chain fields ``previous_status_event_id`` (``null`` on the
+    machine's first record), ``content_hash``, and ``chain_hash``. The query
+    only reads: history records are never updated or deleted, and no other
+    table is touched.
     """
     incident = incidents.get_machine_event_incident(
         session, machine_id, event_id, incident_id
@@ -2354,7 +2385,7 @@ def list_incident_status_history(
         return error_response(404, "not_found")
 
     records = incidents.list_status_history(session, machine_id, event_id, incident_id)
-    return [incident_status_event_to_out(record) for record in records]
+    return [incident_status_event_to_chain_out(record) for record in records]
 
 
 class ResponsibilityAssignmentCreate(BaseModel):
@@ -4633,6 +4664,85 @@ def export_incident_status_history_compliance(
         to_created_at=params.to_created_at,
         status_history=[incident_status_event_to_out(record) for record in records],
     )
+
+
+def validate_incident_status_event_integrity_params(request: Request) -> None:
+    """Validate the incident-status-event integrity query before any lookup.
+
+    The integrity check is keyed on the path machine alone and accepts no
+    business filter parameters and no request body; any parameter name or a
+    carried body is a 422 ``invalid_query``. The check runs before the machine
+    is looked up and issues no database access, so an extra parameter or a
+    body against a non-existent machine still reports 422 rather than 404 and
+    no status history is read.
+    """
+    # A present non-zero Content-Length, or a chunked request without one,
+    # means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/incident-status-events/integrity")
+def check_incident_status_event_integrity(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_incident_status_event_integrity_params)],
+    session: SessionDep,
+):
+    """Read-only verification of one machine's incident-status-event chain.
+
+    The caller submits only the path machine id — no business filter
+    parameters and no request body; any query parameter or carried body is a
+    422 ``invalid_query`` raised during validation before the machine is
+    looked up and before any status history is read. A missing machine is a
+    404 ``not_found`` carrying no integrity conclusion. Only ``GET`` is
+    routed; other methods return 405 without reading records, computing a
+    conclusion, or writing anything. A failure while reading the records is a
+    500 ``internal_error`` with no partial conclusion.
+
+    On success the response carries exactly ``{valid, checked_count,
+    broken_status_event_id}`` in this fixed field order. An empty or fully
+    sound chain reports ``true``, the machine's total status-event count
+    (``0`` when empty), and ``null``; otherwise ``false``, the total count,
+    and the first record — in (created-at instant, id) order, an exact-second
+    record before any fractional-second record of the same second — whose
+    creation moment, identifier, previous-record link, content hash, or chain
+    hash does not verify. Only the path machine's records are examined, so
+    another machine's damaged records never change this conclusion, and the
+    query never writes, repairs, or deletes, so repeated calls and restarts
+    return stable results. The body is compact UTF-8 JSON terminated by a
+    single newline.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        valid, checked_count, broken_status_event_id = (
+            status_event_chain.verify_machine_chain(session, machine_id)
+        )
+    except SQLAlchemyError:
+        # Never emit a partial conclusion when the records cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "valid": valid,
+        "checked_count": checked_count,
+        "broken_status_event_id": broken_status_event_id,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 # Evidence fingerprints are checked exactly as stored: 64 characters drawn

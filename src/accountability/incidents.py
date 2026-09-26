@@ -4,16 +4,19 @@ An incident moves ``open -> acknowledged -> resolved`` only. Every accepted
 transition updates the incident row and appends one immutable history record
 inside a single locked write transaction, so the new status and its history
 entry are committed together or not at all, and concurrent transitions cannot
-both observe the same prior status. Rejected transitions write nothing.
+both observe the same prior status. Rejected transitions write nothing. The
+history record is appended to the machine's tamper-evident status-event hash
+chain in the same transaction, so the status, the record, and its chain link
+commit together or leave no trace.
 """
 
-import uuid
 from typing import Any
 
 from sqlalchemy import Connection, Engine, select
 from sqlalchemy.orm import Session
 
-from .chain import _run_with_lock_retry, _utc_now_iso
+from . import status_event_chain
+from .chain import _run_with_lock_retry
 from .db import (
     AuthorizationDecisionEvent,
     AuthorizationDecisionIncident,
@@ -22,7 +25,6 @@ from .db import (
 )
 
 _INCIDENT_TABLE = AuthorizationDecisionIncident.__table__
-_HISTORY_TABLE = IncidentStatusEvent.__table__
 
 # The only legal edges of the incident state machine.
 _ALLOWED_TRANSITIONS = {
@@ -108,23 +110,21 @@ def change_incident_status(
         if _ALLOWED_TRANSITIONS.get(from_status) != to_status:
             return {"status": "invalid_status_transition"}
 
-        now = _utc_now_iso()
-        history_id = str(uuid.uuid4())
         conn.execute(
             _INCIDENT_TABLE.update()
             .where(_INCIDENT_TABLE.c.id == incident_id)
             .values(status=to_status)
         )
-        conn.execute(
-            _HISTORY_TABLE.insert().values(
-                id=history_id,
-                machine_id=machine_id,
-                event_id=event_id,
-                incident_id=incident_id,
-                from_status=from_status,
-                to_status=to_status,
-                created_at=now,
-            )
+        # Append the history record to the machine's status-event chain tail
+        # inside the same locked transaction: the incident status, the record,
+        # and its chain link commit together or not at all.
+        history = status_event_chain.mint_tail_link(
+            conn,
+            machine_id=machine_id,
+            event_id=event_id,
+            incident_id=incident_id,
+            from_status=from_status,
+            to_status=to_status,
         )
         return {
             "status": "ok",
@@ -137,15 +137,7 @@ def change_incident_status(
                 "status": to_status,
                 "created_at": incident["created_at"],
             },
-            "history": {
-                "id": history_id,
-                "machine_id": machine_id,
-                "event_id": event_id,
-                "incident_id": incident_id,
-                "from_status": from_status,
-                "to_status": to_status,
-                "created_at": now,
-            },
+            "history": history,
         }
 
     return _run_with_lock_retry(engine, _work)

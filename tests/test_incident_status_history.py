@@ -282,6 +282,9 @@ def test_successful_transition_atomically_updates_status_and_history(
         "from_status",
         "to_status",
         "created_at",
+        "previous_status_event_id",
+        "content_hash",
+        "chain_hash",
     }
     assert UUID_RE.match(entry["id"])
     assert entry["machine_id"] == machine_id
@@ -290,6 +293,9 @@ def test_successful_transition_atomically_updates_status_and_history(
     assert entry["from_status"] == "open"
     assert entry["to_status"] == "acknowledged"
     assert RFC3339_Z_RE.match(entry["created_at"])
+    assert entry["previous_status_event_id"] is None
+    assert re.fullmatch(r"[0-9a-f]{64}", entry["content_hash"])
+    assert re.fullmatch(r"[0-9a-f]{64}", entry["chain_hash"])
 
 
 def test_full_lifecycle_records_two_ordered_history_entries(client, incident):

@@ -194,7 +194,10 @@ class IncidentStatusEvent(Base):
     """One immutable incident status transition (``open -> acknowledged`` or
     ``acknowledged -> resolved``). Rows are append-only: they are never updated
     or deleted, so the table is a complete, tamper-evident-by-construction
-    history of every status change.
+    history of every status change. Each row also carries a per-machine
+    tamper-evident hash chain
+    (``previous_status_event_id``/``content_hash``/``chain_hash``) computed
+    from the record, ownership, status-edge, and creation-moment columns.
     """
 
     __tablename__ = "incident_status_events"
@@ -218,6 +221,11 @@ class IncidentStatusEvent(Base):
     from_status: Mapped[str] = mapped_column(String, nullable=False)
     to_status: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
+    # Per-machine hash chain. Nullable so databases created before the chain
+    # feature keep working; the startup migration backfills any missing values.
+    previous_status_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class IncidentResponsibilityAssignment(Base):

@@ -373,22 +373,62 @@ belong to one another; a missing one or an ownership mismatch returns
 `409 {"error":{"code":"invalid_status_transition"}}` and writes nothing. On
 success the incident's `status` is updated and one history record is appended
 inside a single transaction (so the two can never diverge, and concurrent
-transitions cannot both observe the same prior status); the response is `200`
-with the full updated incident (the same fields as the incident create/list
-endpoints).
+transitions cannot both observe the same prior status); the record is linked
+into the machine's incident-status-event hash chain in the same transaction,
+so the status, the record, and its chain link commit together or not at all.
+The response is `200` with the full updated incident (the same fields as the
+incident create/list endpoints).
 
 `GET .../incidents/{incident_id}/status-history` returns the incident's
 immutable transition records in `created_at`, then `id` order (`[]` for an
 incident that has never moved). The machine, event, and incident are validated
 exactly as for the POST, including the same `404 not_found` outcomes. Each
 entry contains exactly `{id, machine_id, event_id, incident_id, from_status,
-to_status, created_at}`: a fresh UUID `id` and `created_at` a UTC RFC 3339
-date-time ending in `Z`. History rows are append-only — they are never updated
-or deleted, so a rejected transition leaves the incident status and the history
-both untouched, and neither endpoint ever writes or modifies events, evidence,
-hash chains, or causal links. History is strictly isolated to its own incident
-(another incident, event, or machine can never read it) and persists across
-application restarts.
+to_status, created_at, previous_status_event_id, content_hash, chain_hash}`:
+a fresh UUID `id`, `created_at` a UTC RFC 3339 date-time ending in `Z`, and
+the per-machine chain fields described below. History rows are append-only —
+they are never updated or deleted, so a rejected transition leaves the
+incident status and the history both untouched, and neither endpoint ever
+writes or modifies events, evidence, hash chains, or causal links. History is
+strictly isolated to its own incident (another incident, event, or machine
+can never read it) and persists across application restarts.
+
+## Incident status event integrity chain
+
+Each machine's incident status events form a per-machine, tamper-evident hash
+chain. Every record returned by the status-history endpoint carries:
+
+- `previous_status_event_id` — `null` for the machine's first record,
+  otherwise the id of the preceding record in `(created_at, id)` order;
+- `content_hash` — `SHA-256(UTF-8(compact key-sorted JSON of {id, machine_id,
+  event_id, incident_id, from_status, to_status, created_at}))`;
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first
+  record and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))`
+  thereafter.
+
+All hashes are 64-character lowercase hexadecimal strings. A successful
+status transition updates the incident's `status`, appends the history
+record, and links it to the machine's chain tail inside one locked write
+transaction, so the status, the record, and its chain link commit together or
+leave no trace, and concurrent transitions cannot lose records, fork the
+chain, or break a link. On startup the service adds the new columns to
+pre-existing databases and backfills missing chain data in `(created_at, id)`
+order; the recomputation is deterministic, so restarting with an already
+complete database performs no writes.
+
+`GET /machines/{machine_id}/incident-status-events/integrity` verifies the
+chain read-only and returns `{valid, checked_count,
+broken_status_event_id}`: a complete or empty chain reports `true`, the total
+count, and `null`; otherwise it reports `false`, the total count, and the
+first record whose creation moment, id, previous-record link, content hash,
+or chain hash does not verify. The endpoint accepts no query parameters and
+no request body — either is a `422 {"error":{"code":"invalid_query"}}`
+reported before the machine is looked up — and only `GET` is routed (other
+methods return `405`). A missing machine returns
+`404 {"error":{"code":"not_found"}}`, and a read failure returns
+`500 {"error":{"code":"internal_error"}}`; none of these carries a partial
+conclusion. Only the path machine's records are examined, so another
+machine's damaged records never change the result.
 
 ## Incident responsibility assignments
 

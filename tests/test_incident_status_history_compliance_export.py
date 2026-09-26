@@ -401,8 +401,9 @@ def test_export_items_match_status_history_endpoint_fields(client):
     response = client.get(export_url(machine_id, FROM_WIDE, TO_WIDE))
 
     assert response.status_code == 200
-    assert response.json()["status_history"] == listed
-    assert set(response.json()["status_history"][0].keys()) == {
+    # The export keeps its 7-field shape; the status-history endpoint now also
+    # carries the chain fields, so compare on the export's field set.
+    export_fields = {
         "id",
         "machine_id",
         "event_id",
@@ -411,6 +412,10 @@ def test_export_items_match_status_history_endpoint_fields(client):
         "to_status",
         "created_at",
     }
+    assert response.json()["status_history"] == [
+        {key: item[key] for key in export_fields} for item in listed
+    ]
+    assert set(response.json()["status_history"][0].keys()) == export_fields
 
 
 def test_export_aggregates_history_across_incidents(client):
