@@ -41,6 +41,7 @@ from . import (
     policy_rule_chain,
     privacy_chain,
     rotation_chain,
+    status_event_chain,
 )
 from .db import (
     AuthorizationDecisionCausalLink,
@@ -100,6 +101,8 @@ async def lifespan(app: FastAPI):
     privacy_chain.backfill_chains(engine)
     evidence_chain.migrate_schema(engine)
     evidence_chain.backfill_chains(engine)
+    status_event_chain.migrate_schema(engine)
+    status_event_chain.backfill_chains(engine)
     policy_rule_chain.migrate_schema(engine)
     policy_rule_chain.backfill_chains(engine)
     diagnostics.migrate_schema(engine)
@@ -2270,6 +2273,9 @@ class IncidentStatusEventOut(BaseModel):
     from_status: str
     to_status: str
     created_at: str
+    previous_status_event_id: str | None
+    content_hash: str
+    chain_hash: str
 
 
 def incident_status_event_to_out(
@@ -2283,6 +2289,9 @@ def incident_status_event_to_out(
         from_status=record.from_status,
         to_status=record.to_status,
         created_at=record.created_at,
+        previous_status_event_id=record.previous_status_event_id,
+        content_hash=record.content_hash,
+        chain_hash=record.chain_hash,
     )
 
 
@@ -4633,6 +4642,95 @@ def export_incident_status_history_compliance(
         to_created_at=params.to_created_at,
         status_history=[incident_status_event_to_out(record) for record in records],
     )
+
+
+def validate_status_event_chain_params(request: Request) -> None:
+    """Validate the incident-status-event chain audit query before reads.
+
+    The audit is keyed solely on the path machine and accepts no business
+    filter parameters and no request body; any query parameter name, or a GET
+    carrying a body, is a 422 ``invalid_query``. The check runs during
+    validation, before the machine is looked up and without any database
+    access, so an invalid query against a non-existent machine still reports
+    422 rather than 404 and no status history is read.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/incident-status-events/integrity")
+def check_incident_status_event_chain_integrity(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_status_event_chain_params)],
+    session: SessionDep,
+):
+    """Read-only verification of one machine's incident status event chain.
+
+    The caller submits only the path machine id via ``GET`` — no query
+    parameters and no request body; either is a 422 ``invalid_query`` raised
+    during validation before the machine is looked up or any status history
+    is read. Non-GET methods return 405 without reading records, computing a
+    chain conclusion, or writing anything. A missing machine is a 404
+    ``not_found`` carrying no partial chain conclusion.
+
+    On success the response carries exactly ``{valid, checked_count,
+    broken_status_event_id}`` in this fixed field order. An empty chain
+    reports ``true``, zero, and ``null``. ``checked_count`` always counts the
+    machine's full chain, damaged rows included. Records are examined in the
+    order of the actual UTC instant of ``created_at`` and then by id
+    ascending, so an exact-second record sorts before any fractional-second
+    record of the same second. The first record's previous-status-event id
+    must be empty; each later record's must point at the immediately
+    preceding record, and each record's stored content digest and chain
+    digest must match the digests recomputed under the creation-time rules.
+    The first mismatching record makes ``valid`` ``false`` and is reported by
+    its stored id verbatim; later records cannot change that attribution.
+
+    A damaged ``created_at``, id, digest, or reference never crashes the
+    query and is never repaired, normalized, or recomputed for storage — a
+    record with an unparseable stamp still enters the total and is itself the
+    first anomaly; another machine's damaged records never affect this
+    machine's count, validity, or broken id. A real read failure returns 500
+    ``internal_error`` with no partial conclusion. The query is strictly
+    read-only — it never creates, updates, deletes, repairs, recomputes, or
+    normalizes any record — returns byte-identical results on repeat calls
+    against unchanged data, and reads records persisted across application
+    restarts. The body is compact UTF-8 JSON terminated by a single newline,
+    free of floating-point or non-finite values.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        valid, checked_count, broken_status_event_id = (
+            status_event_chain.verify_machine_chain(session, machine_id)
+        )
+    except Exception:
+        # Never emit a partial chain conclusion when the records cannot be
+        # read; damaged stored values are handled inside the verifier and are
+        # not a read-layer failure.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "valid": valid,
+        "checked_count": checked_count,
+        "broken_status_event_id": broken_status_event_id,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 # Evidence fingerprints are checked exactly as stored: 64 characters drawn

@@ -218,6 +218,13 @@ class IncidentStatusEvent(Base):
     from_status: Mapped[str] = mapped_column(String, nullable=False)
     to_status: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
+    # Per-machine hash chain. Nullable so databases created before the chain
+    # feature keep working; the startup migration backfills any missing values.
+    previous_status_event_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class IncidentResponsibilityAssignment(Base):

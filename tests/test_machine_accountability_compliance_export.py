@@ -209,15 +209,19 @@ def insert_incident_row(client, machine_id, incident_id, event_id, created_at, *
 
 
 def insert_history_row(client, machine_id, history_id, event_id, incident_id,
-                       created_at, *, from_status="open", to_status="acknowledged"):
+                       created_at, *, from_status="open", to_status="acknowledged",
+                       previous_status_event_id=None, content_hash=HASH_A,
+                       chain_hash=HASH_B):
     with client.app.state.engine.begin() as conn:
         conn.execute(
             text(
                 "INSERT INTO incident_status_events "
                 "(id, machine_id, event_id, incident_id, from_status, "
-                "to_status, created_at) "
+                "to_status, created_at, previous_status_event_id, "
+                "content_hash, chain_hash) "
                 "VALUES (:id, :machine_id, :event_id, :incident_id, "
-                ":from_status, :to_status, :created_at)"
+                ":from_status, :to_status, :created_at, "
+                ":previous_status_event_id, :content_hash, :chain_hash)"
             ),
             {
                 "id": history_id,
@@ -227,6 +231,9 @@ def insert_history_row(client, machine_id, history_id, event_id, incident_id,
                 "from_status": from_status,
                 "to_status": to_status,
                 "created_at": created_at,
+                "previous_status_event_id": previous_status_event_id,
+                "content_hash": content_hash,
+                "chain_hash": chain_hash,
             },
         )
 
@@ -297,6 +304,9 @@ HISTORY_KEYS = {
     "from_status",
     "to_status",
     "created_at",
+    "previous_status_event_id",
+    "content_hash",
+    "chain_hash",
 }
 ASSIGNMENT_KEYS = {
     "id",

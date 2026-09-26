@@ -390,6 +390,66 @@ hash chains, or causal links. History is strictly isolated to its own incident
 (another incident, event, or machine can never read it) and persists across
 application restarts.
 
+## Incident status event tamper-evident chain and read-only verification
+
+Each machine's incident status transition records form their own per-machine,
+tamper-evident hash chain, following the same digest rules as the
+authorization event integrity chain. Every record returned by the incident
+status-history list endpoint keeps its existing fields and additionally
+carries:
+
+- `previous_status_event_id` — `null` for the machine's first record,
+  otherwise the id of the immediately preceding record in `(created_at, id)`
+  order (the actual UTC instant, then id);
+- `content_hash` — `SHA-256(UTF-8(compact key-sorted JSON of {id, machine_id,
+  event_id, incident_id, from_status, to_status, created_at}))`, covering the
+  record identifier, its machine/event/incident ownership, the status edge,
+  and the creation time;
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first
+  record and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))`
+  thereafter.
+
+All hashes are 64-character lowercase hexadecimal strings. Each machine is an
+independent chain: a record never points across machines and the first record
+is rooted at the empty prefix. A successful status transition updates the
+incident's `status`, appends exactly one history record, and links it to the
+machine's chain tail inside a single locked write transaction, so the status,
+the history, and the chain fields commit together or not at all — a failed
+transition leaves no half-finished record, and concurrent transitions commit
+in one definite serial order without losing records, forking, or breaking the
+chain. On startup the service adds the new columns to pre-existing databases
+and backfills missing chain data in stable `(created_at, id)` order; the
+recomputation is deterministic, so restarting with an already complete
+database performs no writes, and an empty database is directly usable.
+
+`GET /machines/{machine_id}/incident-status-events/integrity` verifies the
+machine's chain read-only and returns `{valid, checked_count,
+broken_status_event_id}` in the existing three-conclusion shape. The caller
+submits only the path machine id — no query parameters and no request body;
+either is a `422 {"error":{"code":"invalid_query"}}` raised during validation
+before the machine is looked up or any status history is read, and non-`GET`
+methods return `405` without reading records, computing a conclusion, or
+writing anything. A missing machine returns
+`404 {"error":{"code":"not_found"}}` with no partial conclusion, and a read
+failure returns `500 {"error":{"code":"internal_error"}}` likewise.
+
+An empty or fully sound chain reports `true`, the total count, and `null`;
+otherwise it reports `false`, the machine's total record count (damaged rows
+included), and the first record — examined in the order of the actual UTC
+instant of `created_at` and then `id` — whose content digest,
+`previous_status_event_id` link, or chain digest does not recompute. A
+damaged `created_at`, id, digest, or reference never crashes the query and is
+never repaired, normalized, or recomputed for storage: a record with an
+unparseable stamp still enters the total and is itself reported as broken.
+Only the path machine's chain is examined, so another machine's damaged
+records never affect this machine's conclusion and no partial result is
+returned. The query is strictly read-only, returns byte-identical compact
+UTF-8 JSON (terminated by a single newline) on repeat calls against unchanged
+data, and reads records persisted across application restarts. Incident
+creation, transitions, the history list, evidence, responsibility
+assignments, diagnostics, privacy exports, and the health check are
+unchanged.
+
 ## Incident responsibility assignments
 
 `POST /machines/{machine_id}/authorization-decision-events/{event_id}/incidents/{incident_id}/responsibility-assignments`

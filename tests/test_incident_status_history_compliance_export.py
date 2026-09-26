@@ -92,6 +92,9 @@ def insert_status_event_row(
     *,
     from_status="open",
     to_status="acknowledged",
+    previous_status_event_id=None,
+    content_hash="a" * 64,
+    chain_hash="b" * 64,
 ):
     """Insert an incident status event row directly with fixed ids/timestamp."""
     with client.app.state.engine.begin() as conn:
@@ -99,9 +102,11 @@ def insert_status_event_row(
             text(
                 "INSERT INTO incident_status_events "
                 "(id, machine_id, event_id, incident_id, from_status, "
-                "to_status, created_at) "
+                "to_status, created_at, previous_status_event_id, "
+                "content_hash, chain_hash) "
                 "VALUES (:id, :machine_id, :event_id, :incident_id, "
-                ":from_status, :to_status, :created_at)"
+                ":from_status, :to_status, :created_at, "
+                ":previous_status_event_id, :content_hash, :chain_hash)"
             ),
             {
                 "id": status_event_id,
@@ -111,6 +116,9 @@ def insert_status_event_row(
                 "from_status": from_status,
                 "to_status": to_status,
                 "created_at": created_at,
+                "previous_status_event_id": previous_status_event_id,
+                "content_hash": content_hash,
+                "chain_hash": chain_hash,
             },
         )
 
@@ -410,6 +418,9 @@ def test_export_items_match_status_history_endpoint_fields(client):
         "from_status",
         "to_status",
         "created_at",
+        "previous_status_event_id",
+        "content_hash",
+        "chain_hash",
     }
 
 

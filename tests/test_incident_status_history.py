@@ -282,6 +282,9 @@ def test_successful_transition_atomically_updates_status_and_history(
         "from_status",
         "to_status",
         "created_at",
+        "previous_status_event_id",
+        "content_hash",
+        "chain_hash",
     }
     assert UUID_RE.match(entry["id"])
     assert entry["machine_id"] == machine_id
