@@ -43,61 +43,19 @@ def _split_glob(pattern: str) -> tuple[str, tuple[str, ...], str]:
     return parts[0], tuple(parts[1:-1]), parts[-1]
 
 
-def _middle_runs_compatible(
+def _common_supersequence_lengths(
     first_middles: tuple[str, ...], second_middles: tuple[str, ...]
-) -> bool:
-    """Whether two middle literal runs can hold inside a single resource.
+) -> list[list[int]]:
+    """Suffix DP table of shortest common supersequence lengths.
 
-    Each run pins the relative order of the distinct literal fragments it
-    contains: a fragment appearing before another in a pattern must be laid
-    out before it in any common resource. The two runs are compatible exactly
-    when the combined order constraints are acyclic; runs demanding opposite
-    orders for the same pair of fragments (directly, as in ``*a*b*`` against
-    ``*b*a*``, or through a longer cycle) can never be satisfied by one
-    resource, no matter how the remaining text is chosen.
-    """
-    edges: set[tuple[str, str]] = set()
-    fragments: set[str] = set()
-    for middles in (first_middles, second_middles):
-        fragments.update(middles)
-        for index, earlier in enumerate(middles):
-            for later in middles[index + 1 :]:
-                if earlier != later:
-                    edges.add((earlier, later))
-    # Kahn's algorithm: a layout of all fragments exists exactly when the
-    # constraint graph has no cycle.
-    outgoing: dict[str, list[str]] = {fragment: [] for fragment in fragments}
-    indegree: dict[str, int] = {fragment: 0 for fragment in fragments}
-    for earlier, later in edges:
-        outgoing[earlier].append(later)
-        indegree[later] += 1
-    ready = [fragment for fragment in fragments if indegree[fragment] == 0]
-    placed = 0
-    while ready:
-        fragment = ready.pop()
-        placed += 1
-        for later in outgoing[fragment]:
-            indegree[later] -= 1
-            if indegree[later] == 0:
-                ready.append(later)
-    return placed == len(fragments)
-
-
-def _merge_middle_runs(
-    first_middles: tuple[str, ...], second_middles: tuple[str, ...]
-) -> tuple[str, ...]:
-    """Canonical literal run covering both middle runs in order.
-
-    The merge is the lexicographically smallest of the shortest common
-    supersequences of the two runs: it keeps every literal fragment of both
-    patterns in an order both runs can satisfy, shares fragments the runs
-    have in common instead of duplicating them, and is independent of which
-    pattern was passed first, so the reported intersection never varies with
-    the order a pair is examined in.
+    ``length[i][j]`` is the length of a shortest sequence embedding both
+    ``first_middles[i:]`` and ``second_middles[j:]`` as subsequences. Every
+    fragment occurrence advances the embedding on its own: occurrences with
+    the same text are never deduplicated or substituted for one another, and
+    two equal fragments may share one position only when both runs reach them
+    in the same relative order.
     """
     first_len, second_len = len(first_middles), len(second_middles)
-    # length[i][j]: length of a shortest common supersequence of
-    # first_middles[i:] and second_middles[j:].
     length = [[0] * (second_len + 1) for _ in range(first_len + 1)]
     for i in range(first_len - 1, -1, -1):
         length[i][second_len] = first_len - i
@@ -109,6 +67,57 @@ def _merge_middle_runs(
                 length[i][j] = 1 + length[i + 1][j + 1]
             else:
                 length[i][j] = 1 + min(length[i + 1][j], length[i][j + 1])
+    return length
+
+
+def _middle_runs_compatible(
+    first_middles: tuple[str, ...], second_middles: tuple[str, ...]
+) -> bool:
+    """Whether two middle literal runs can hold inside a single resource.
+
+    Each run is a sequence of fragment occurrences: a repeated literal keeps
+    every occurrence, in order, and each occurrence must be laid out
+    separately. A common resource lays both runs out over one shared sequence
+    in which equal fragments coincide, so the runs are compatible exactly when
+    a common supersequence exists that needs no more occurrences of any
+    fragment than the richer of the two runs already carries — that is, when
+    the shortest common supersequence holds exactly ``max`` of each
+    fragment's two occurrence counts. Runs demanding opposite orders for the
+    same fragments (directly, as in ``*a*b*`` against ``*b*a*``, or through a
+    longer contradiction) force an extra, unshareable occurrence and can
+    never be satisfied by one resource, no matter how the remaining text is
+    chosen; a run that merely repeats a fragment (``*a*b*a*`` against
+    ``*b*a*``) still shares every occurrence and stays compatible.
+    """
+    first_counts: dict[str, int] = {}
+    for fragment in first_middles:
+        first_counts[fragment] = first_counts.get(fragment, 0) + 1
+    second_counts: dict[str, int] = {}
+    for fragment in second_middles:
+        second_counts[fragment] = second_counts.get(fragment, 0) + 1
+    shared = sum(
+        max(first_counts.get(fragment, 0), second_counts.get(fragment, 0))
+        for fragment in first_counts.keys() | second_counts.keys()
+    )
+    length = _common_supersequence_lengths(first_middles, second_middles)
+    return length[0][0] == shared
+
+
+def _merge_middle_runs(
+    first_middles: tuple[str, ...], second_middles: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Canonical literal run covering both middle runs in order.
+
+    The merge is the lexicographically smallest of the shortest common
+    supersequences of the two runs: it keeps every literal fragment
+    occurrence of both patterns — repeats included, never deduplicated — in
+    an order both runs can satisfy, shares fragments the runs have in common
+    instead of duplicating them, and is independent of which pattern was
+    passed first, so the reported intersection never varies with the order a
+    pair is examined in.
+    """
+    first_len, second_len = len(first_middles), len(second_middles)
+    length = _common_supersequence_lengths(first_middles, second_middles)
     # best[i][j]: the lexicographically smallest shortest common
     # supersequence of the two suffixes, built bottom-up.
     best: list[list[tuple[str, ...]]] = [
@@ -142,10 +151,11 @@ def patterns_intersect(first: str, second: str) -> bool:
     literal. When both patterns carry a star, a common string exists exactly
     when their prefix literals are prefix-comparable (one starts with the
     other), their suffix literals are suffix-comparable, and their middle
-    literal runs can hold inside one resource: each run pins the relative
-    order of its distinct literal fragments, and runs pinning contradictory
-    orders for the same fragments (such as ``*a*b*`` against ``*b*a*``) share
-    no common match.
+    literal runs can hold inside one resource: each run is a sequence of
+    fragment occurrences (a repeated literal keeps every occurrence, in
+    order) and a common resource lays both runs out over one shared sequence,
+    so runs whose occurrences cannot all line up — such as ``*a*b*`` against
+    ``*b*a*`` — share no common match.
     """
     return intersection_pattern(first, second) is not None
 
@@ -159,11 +169,11 @@ def intersection_pattern(first: str, second: str) -> str | None:
     patterns: the longer of the two prefix literals, the merged middle
     literal runs, and the longer of the two suffix literals, joined by stars.
     The middle runs merge into the canonical common supersequence that keeps
-    every literal fragment of both patterns in an order both can satisfy, so
-    the result never depends on which pattern is examined first. A literal
-    pattern's intersection with a glob it matches is the literal itself, so
-    when one rule uses an exact resource its intersection with any
-    overlapping pattern is that exact resource.
+    every literal fragment occurrence of both patterns — repeats included —
+    in an order both can satisfy, so the result never depends on which
+    pattern is examined first. A literal pattern's intersection with a glob
+    it matches is the literal itself, so when one rule uses an exact resource
+    its intersection with any overlapping pattern is that exact resource.
     """
     if "*" not in first:
         if "*" not in second:

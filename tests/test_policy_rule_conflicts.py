@@ -391,6 +391,98 @@ def test_intersection_does_not_depend_on_insertion_order(client):
     assert conflict["intersection"] == "*a*b*"
 
 
+@pytest.mark.parametrize(
+    "first, second, intersection",
+    [
+        # Repeated fragments are kept by occurrence count on both sides, so
+        # the merged run carries two ``a`` and two ``b`` fragments.
+        ("*a*a*b*", "*a*b*b*", "*a*a*b*b*"),
+        # A repeated fragment in one run does not contradict a disjoint
+        # fragment of the other; every occurrence survives the merge.
+        ("*a*b*a*", "*c*", "*a*b*a*c*"),
+        # The second run's ``b``/``a`` pair lines up with the first run's
+        # later occurrences instead of falsifying the pair.
+        ("*a*b*a*", "*b*a*", "*a*b*a*"),
+        ("*a*b*a*", "*b*a*b*", "*a*b*a*b*"),
+        ("*a*b*a*", "*b*b*a*", "*a*b*b*a*"),
+        # A run already covering the other's repeats is the intersection.
+        ("*a*a*", "*a*", "*a*a*"),
+        ("*a*b*a*", "*a*b*", "*a*b*a*"),
+        ("*x*a*", "*a*x*a*", "*a*x*a*"),
+    ],
+)
+def test_repeated_fragment_intersecting_patterns(client, first, second,
+                                                 intersection):
+    insert_rule_row(client, rid(1), T0, priority=1, effect="allow",
+                    resource_pattern=first)
+    insert_rule_row(client, rid(2), T1, priority=1, effect="deny",
+                    resource_pattern=second)
+
+    [conflict] = client.get(PATH).json()["conflicts"]
+    assert conflict["intersection"] == intersection
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [
+        # Same-text occurrences cannot substitute for one another: the
+        # opposite ``a``/``b`` orders leave no shared layout.
+        ("*a*b*", "*b*a*"),
+        ("*a*a*b*", "*b*a*"),
+        ("*a*a*b*", "*b*a*a*"),
+    ],
+)
+def test_repeated_fragment_non_intersecting_patterns(client, first, second):
+    insert_rule_row(client, rid(1), T0, priority=1, effect="allow",
+                    resource_pattern=first)
+    insert_rule_row(client, rid(2), T1, priority=1, effect="deny",
+                    resource_pattern=second)
+
+    body = client.get(PATH).json()
+    assert body["conflicts"] == []
+    assert body["overrides"] == []
+
+
+def test_repeated_fragment_intersection_is_direction_independent(client):
+    # Swapping which rule holds which pattern changes nothing: same
+    # candidate, same intersection, same relation annotations.
+    insert_rule_row(client, rid(1), T0, priority=1, effect="allow",
+                    resource_pattern="*a*b*b*")
+    insert_rule_row(client, rid(2), T1, priority=1, effect="deny",
+                    resource_pattern="*a*a*b*")
+
+    body = client.get(PATH).json()
+    assert body["conflicts"] == [
+        {
+            "rule_ids": [rid(1), rid(2)],
+            "intersection": "*a*a*b*b*",
+            "reason": "same_priority_opposite_effect",
+        }
+    ]
+    relations = {rule["id"]: rule["relation"] for rule in body["rules"]}
+    assert relations == {rid(1): "conflict", rid(2): "conflict"}
+
+
+def test_repeated_fragment_override_keeps_full_intersection(client):
+    # Different priorities over a repeated-fragment pair report the merged
+    # scope with every occurrence kept.
+    insert_rule_row(client, rid(1), T0, priority=1, effect="allow",
+                    resource_pattern="*a*b*a*")
+    insert_rule_row(client, rid(2), T1, priority=2, effect="deny",
+                    resource_pattern="*b*a*")
+
+    body = client.get(PATH).json()
+    assert body["conflicts"] == []
+    assert body["overrides"] == [
+        {
+            "overriding_rule_id": rid(1),
+            "overridden_rule_id": rid(2),
+            "intersection": "*a*b*a*",
+            "reason": "lower_priority_overrides",
+        }
+    ]
+
+
 def test_reversed_middle_run_forms_no_override_either(client):
     # Different priorities do not rescue a pair whose middle runs contradict.
     insert_rule_row(client, rid(1), T0, priority=1, effect="allow",
