@@ -868,6 +868,65 @@ machine's events or links, produces identical output for identical data and
 parameters on repeat calls, and reads data persisted across application
 restarts.
 
+## Read-only desensitized authorization decision event privacy export
+
+`GET /machines/{machine_id}/authorization-decision-events/privacy-export`
+returns a deterministic, read-only, desensitized privacy view of one machine's
+authorization decision events. It is a separate compliance sub-entry under the
+machine authorization decision event path; the event registration, list,
+compliance export, hash chain, integrity audit, and authorization evaluation
+semantics are unchanged, and this endpoint never participates in an
+evaluation. The caller submits only the path machine id and the two required
+bounds; no business filter parameters or request body are accepted. Validation
+completes before the machine or any event is read:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); the lower bound must not be later than the upper bound (equal
+  bounds are allowed). A missing, blank, offset, missing-`Z`, malformed,
+  out-of-range, or inverted bound returns `422 {"error":{"code":"bad_time"}}`.
+- Any other query parameter returns
+  `422 {"error":{"code":"invalid_query"}}`, rejected in the validation phase
+  before the machine is looked up and without reading any event data.
+- After the parameters validate, a missing machine returns
+  `404 {"error":{"code":"not_found"}}` with no event data.
+- The path accepts `GET` only; other methods return `405` without reading,
+  digesting, or writing anything.
+
+The response is `{machine_id, from_created_at, to_created_at, events}`; the
+bounds are echoed verbatim and `events` is always present, an empty array when
+the window contains nothing (including a machine with no events). The array
+contains only events whose stored `machine_id` is the path machine and whose
+own `created_at` falls inside the closed interval
+`[from_created_at, to_created_at]`; another machine's records can never enter.
+Events are ordered by the actual UTC instant of `created_at` and then by `id`
+ascending, so an exact-second record sorts before any fractional-second record
+of the same second.
+
+Each item keeps the stored identifier, machine, decision result
+(`allowed`, `reason`), creation time, previous-event link, and both chain
+digests exactly as stored: `{id, machine_id, action_ref, resource_ref, allowed,
+reason, created_at, previous_event_id, content_hash, chain_hash}`. The raw
+`action` and `resource` values are never emitted; their positions carry
+`action_ref` and `resource_ref` instead:
+
+- `action_ref` = lowercase-hex `SHA-256(UTF-8("privacy:v1|action" + machine_id
+  + action_with_surrounding_whitespace_removed))`;
+- `resource_ref` follows the same connection order and digest, with only the
+  prefix changed to `privacy:v1|resource`.
+
+Both digests are 64 lowercase hexadecimal characters; when the stored value is
+not a string or is empty after trimming surrounding whitespace, the
+corresponding ref is `null` while the record is still included. Missing,
+misowned, duplicated, or chain-damaged events are likewise exported verbatim —
+never filtered out, repaired, recomputed, or normalized. The query is strictly
+read-only: it never creates, updates, deletes, repairs, recomputes, or
+normalizes any event, and identical data and parameters return byte-identical
+compact UTF-8 JSON on repeat calls (terminated by a single newline, with no
+floating-point, `-0.0`, or non-finite value and a stable field order),
+including data persisted across application restarts; it adds no schema.
+
 ## Read-only causal-link compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/causal-links/compliance-export`
