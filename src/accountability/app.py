@@ -4367,25 +4367,25 @@ def validate_privacy_access_integrity_params(request: Request) -> None:
     """Validate the privacy-access integrity query string before any lookup.
 
     The integrity check is keyed on the path machine alone and accepts no
-    query parameters; any parameter name is a 422 ``invalid_query``. The
-    check runs before the machine is looked up and issues no database access,
-    so an extra parameter against a non-existent machine still reports 422
-    rather than 404.
+    query parameters and no request body; any parameter name or a carried
+    body is a 422 ``invalid_query``. The check runs before the machine is
+    looked up and issues no database access, so an extra parameter or body
+    against a non-existent machine still reports 422 rather than 404.
     """
     if request.query_params:
         raise QueryError("invalid_query")
+    # The entry point accepts only the path machine id: a body on a GET is
+    # an unknown-shape request rejected in the validation phase, before any
+    # machine or access record is read. A present non-zero Content-Length,
+    # or a chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
 
 
-class PrivacyAccessIntegrityOut(BaseModel):
-    valid: bool
-    checked_count: int
-    broken_access_id: str | None
-
-
-@app.get(
-    "/machines/{machine_id}/privacy-accesses/integrity",
-    response_model=PrivacyAccessIntegrityOut,
-)
+@app.get("/machines/{machine_id}/privacy-accesses/integrity")
 def check_privacy_access_integrity(
     machine_id: str,
     _: Annotated[None, Depends(validate_privacy_access_integrity_params)],
@@ -4393,27 +4393,72 @@ def check_privacy_access_integrity(
 ):
     """Read-only verification of one machine's privacy access hash chain.
 
-    Returns ``{valid, checked_count, broken_access_id}``: an empty or fully
-    sound chain reports ``true``, the machine's total access count, and
-    ``null``; otherwise the first record — in (accessed-at instant, id)
-    order, an exact-second record before any fractional-second record of the
-    same second — whose content hash, previous-access link, or chain hash
-    does not verify is reported. Only the path machine's records are
-    examined, and the query never writes, repairs, or deletes, so repeated
-    calls and restarts return stable results.
+    The caller submits only the path machine id — no filter parameters and no
+    request body; any query parameter or carried body is a 422
+    ``invalid_query`` raised during validation before any machine or access
+    record is read. A missing machine is a 404 ``not_found`` carrying no
+    partial chain conclusion. Only ``GET`` is routed; other methods return
+    405 without reading access records, computing a chain conclusion, or
+    writing anything. A failure while reading the access records is a 500
+    ``internal_error`` with no partial check result.
+
+    On success the response carries exactly ``{valid, checked_count,
+    broken_access_id}`` in this fixed field order. ``checked_count`` always
+    counts every record owned by the path machine, including ones whose
+    stored values no longer parse. An empty chain reports ``true``, ``0``,
+    and ``null``. Records are examined in the order of the actual UTC instant
+    of ``accessed_at`` and then ``id`` ascending — an exact-second record
+    before any fractional-second record of the same second, and a damaged
+    stamp sorting after every parseable instant instead of crashing the
+    audit. The first record must point at no predecessor and every later
+    record at its immediate predecessor inside the same machine's chain; each
+    record's content hash is the SHA-256 of the compact key-sorted JSON of
+    its seven business fields, and each chain hash is
+    ``sha256("<previous chain_hash>:<content_hash>")`` from the empty-prefix
+    root. The first record whose previous-access link, content hash, or chain
+    hash does not verify makes ``valid`` ``false`` and is reported by its
+    stored id verbatim; later records never change that attribution, and a
+    fully sound chain reports ``null``. Damaged timestamps, ids, hashes, or
+    references are judged, never repaired, recomputed, or crashed on.
+
+    The query is strictly read-only — it never creates, updates, deletes,
+    repairs, or normalizes a record, and another machine's records, sound or
+    damaged, never enter the checked set or change this machine's conclusion.
+    The body is compact UTF-8 JSON terminated by a single newline, with
+    ``checked_count`` a JSON integer and no floating-point or non-finite
+    value, byte-identical on repeat calls against unchanged data, including
+    data persisted across application restarts.
     """
     machine = session.get(Machine, machine_id)
     if machine is None:
         return error_response(404, "not_found")
 
-    valid, checked_count, broken_access_id = privacy_chain.verify_chain(
-        session, machine_id
+    # A failure while *reading* the access records is an internal read-layer
+    # fault: answer 500 internal_error with no partial check result. Damaged
+    # stored values are not a read failure — rows read successfully are
+    # judged as chain anomalies, never misclassified as an internal error.
+    try:
+        valid, checked_count, broken_access_id = privacy_chain.verify_chain(
+            session, machine_id
+        )
+    except Exception:
+        return error_response(500, "internal_error")
+
+    payload = {
+        "valid": valid,
+        "checked_count": checked_count,
+        "broken_access_id": broken_access_id,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
     )
-    return PrivacyAccessIntegrityOut(
-        valid=valid,
-        checked_count=checked_count,
-        broken_access_id=broken_access_id,
-    )
+    return Response(content=body, media_type="application/json")
 
 
 class IncidentIntegrityOut(BaseModel):

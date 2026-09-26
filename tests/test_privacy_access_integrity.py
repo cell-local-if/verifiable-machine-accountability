@@ -148,10 +148,61 @@ def test_query_validation_runs_before_machine_lookup(client):
     assert response.json() == {"error": {"code": "invalid_query"}}
 
 
+def test_get_with_a_body_is_invalid_query(client):
+    machine_id = create_machine(client)
+    response = client.request(
+        "GET",
+        integrity_url(machine_id),
+        content=b'{"unexpected": true}',
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
+def test_get_with_a_body_is_invalid_query_before_machine_lookup(client):
+    response = client.request(
+        "GET",
+        integrity_url(MISSING_ID),
+        content=b'{"unexpected": true}',
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
 def test_missing_machine_returns_404_without_conclusion(client):
     response = client.get(integrity_url(MISSING_ID))
     assert response.status_code == 404
     assert response.json() == {"error": {"code": "not_found"}}
+
+
+def test_read_failure_is_500_with_no_partial_conclusion(client):
+    machine_id = create_machine(client)
+    register(client, machine_id, accessed_at=T0)
+    with client.app.state.engine.begin() as conn:
+        conn.execute(text("DROP TABLE privacy_accesses"))
+
+    response = client.get(integrity_url(machine_id))
+    assert response.status_code == 500
+    assert response.json() == {"error": {"code": "internal_error"}}
+    assert b"valid" not in response.content
+    assert b"checked_count" not in response.content
+
+
+def test_validation_and_method_errors_do_not_read_accesses(client):
+    # With the table dropped, any record read would 500; validation-phase
+    # and routing errors must still come back as their own codes.
+    machine_id = create_machine(client)
+    with client.app.state.engine.begin() as conn:
+        conn.execute(text("DROP TABLE privacy_accesses"))
+
+    assert client.get(integrity_url(machine_id) + "?x=1").json() == {
+        "error": {"code": "invalid_query"}
+    }
+    assert client.get(integrity_url(MISSING_ID)).status_code == 404
+    for method in ("post", "put", "patch", "delete"):
+        assert getattr(client, method)(integrity_url(machine_id)).status_code == 405
 
 
 # --------------------------------------------------------------------------- #
@@ -449,6 +500,43 @@ def test_integrity_ignores_other_machines(client, tmp_path):
     }
 
 
+def test_integrity_tolerates_unparseable_accessed_at(client, tmp_path):
+    # A damaged stamp sorts after every parseable record and is judged by its
+    # recomputed content hash — never a crash, never a repair.
+    machine_id = create_machine(client)
+    register(client, machine_id, accessed_at=T0)
+    damaged = register(client, machine_id, accessed_at=T1)
+
+    tamper(
+        tmp_path / "test.db",
+        "UPDATE privacy_accesses SET accessed_at = 'not-a-time' WHERE id = ?",
+        (damaged["id"],),
+    )
+
+    assert client.get(integrity_url(machine_id)).json() == {
+        "valid": False,
+        "checked_count": 2,
+        "broken_access_id": damaged["id"],
+    }
+
+
+def test_integrity_tolerates_non_hex_stored_hashes(client, tmp_path):
+    machine_id = create_machine(client)
+    damaged = register(client, machine_id, accessed_at=T0)
+
+    tamper(
+        tmp_path / "test.db",
+        "UPDATE privacy_accesses SET content_hash = 'junk' WHERE id = ?",
+        (damaged["id"],),
+    )
+
+    assert client.get(integrity_url(machine_id)).json() == {
+        "valid": False,
+        "checked_count": 1,
+        "broken_access_id": damaged["id"],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Read-only, concurrent, persistent
 # --------------------------------------------------------------------------- #
@@ -460,10 +548,13 @@ def test_integrity_is_read_only_and_stable(client):
     register(client, machine_id, accessed_at=T1)
     before = fetch_rows(client, machine_id)
 
-    first = client.get(integrity_url(machine_id)).json()
-    second = client.get(integrity_url(machine_id)).json()
+    first_response = client.get(integrity_url(machine_id))
+    second_response = client.get(integrity_url(machine_id))
 
-    assert first == second == {
+    # Repeat calls over unchanged data are byte-identical compact JSON.
+    assert first_response.content == second_response.content
+    assert first_response.content.endswith(b"\n")
+    assert first_response.json() == second_response.json() == {
         "valid": True,
         "checked_count": 2,
         "broken_access_id": None,
