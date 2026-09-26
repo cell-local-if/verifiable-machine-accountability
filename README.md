@@ -419,6 +419,35 @@ incident can never read them), survive application restarts, and neither
 endpoint ever writes or modifies incidents, events, evidence, hash chains, or
 causal links.
 
+## Read-only event-scoped responsibility chain verification
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/responsibility-assignments/integrity`
+verifies the complete responsibility-assignment hash chain owned by the path
+machine, read-only. The caller submits only the machine id and event id in the
+path — no query parameters and no request body; either is a
+`422 {"error":{"code":"invalid_query"}}` raised before the machine is looked
+up or any responsibility record is read, and non-`GET` methods return `405`.
+The event id only confirms the attribution context: a missing machine, a
+missing event, or an event owned by another machine is
+`404 {"error":{"code":"not_found"}}` with no partial chain conclusion.
+
+The response is `{valid, checked_count, broken_assignment_id}`. An empty chain
+reports `true`, `0`, and `null`. `checked_count` always counts the machine's
+full chain, damaged rows included. Records are examined in the order of the
+actual UTC instant of `created_at` and then `id`; the first record's
+`previous_assignment_id` must be empty, each later record's must point at the
+immediately preceding record, and each record's stored `content_hash` and
+`chain_hash` must match the digests recomputed under the creation-time rules.
+The first mismatching record makes `valid` `false` and is reported by its
+stored id verbatim; later records cannot change that attribution. A damaged
+`created_at`, id, digest, or reference never crashes the query and is never
+repaired, normalized, or recomputed for storage; another machine's damaged
+records never affect this machine's result. A real read failure returns
+`500 {"error":{"code":"internal_error"}}` with no partial conclusion. The
+query never creates, updates, deletes, repairs, recomputes, or normalizes any
+record, returns byte-identical results on repeat calls against unchanged data,
+and reads records persisted across application restarts.
+
 ## Read-only incident lifecycle and responsibility-closure audit
 
 `GET /machines/{machine_id}/authorization-decision-events/incidents/integrity`

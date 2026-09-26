@@ -20,6 +20,7 @@ the chain, or break a link.
 import hashlib
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import Connection, Engine, inspect, text
@@ -333,6 +334,130 @@ def verify_chain(session, machine_id: str) -> tuple[bool, int, str | None]:
             **{key: mapping[key] for key in _CONTENT_COLUMNS}
         )
         chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+        if (
+            mapping["content_hash"] != content_hash
+            or mapping["previous_assignment_id"] != previous_assignment_id
+            or mapping["chain_hash"] != chain_hash
+        ):
+            return False, len(rows), mapping["id"]
+        previous_assignment_id = mapping["id"]
+        previous_chain_hash = chain_hash
+
+    return True, len(rows), None
+
+
+_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _created_instant(value: object) -> datetime:
+    """Parse a stored assignment ``created_at`` to its actual UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract, so
+    parsing cannot fail for them; a damaged value that no longer parses sorts
+    after every parseable record (its content hash cannot verify anyway)
+    instead of crashing the read-only audit.
+    """
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            pass
+    return _FAR_FUTURE
+
+
+def _created_at_parseable(value: object) -> bool:
+    """Whether a stored ``created_at`` still parses to a UTC instant."""
+    if isinstance(value, str):
+        try:
+            datetime.fromisoformat(value[:-1] + "+00:00")
+            return True
+        except ValueError:
+            pass
+    return False
+
+
+def _first_unparseable_created_at_id(rows: list[Any]) -> str | None:
+    """Id of the first row in chain order whose ``created_at`` cannot parse.
+
+    A corrupted stamp sorts its record after every parseable one, so the
+    record's chain successor would otherwise be blamed for the broken link;
+    reporting the corrupted record itself keeps the audit pointed at the
+    actual damage. ``None`` when every row parses.
+    """
+    for row in rows:
+        if not _created_at_parseable(row._mapping["created_at"]):
+            return row._mapping["id"]
+    return None
+
+
+def _chain_order(rows: list[Any]) -> list[Any]:
+    """Order assignment rows by the actual UTC instant of ``created_at``.
+
+    Ordering is by the parsed UTC instant and then by ``id``, so an
+    exact-second stamp sorts before any fractional-second stamp of the same
+    second (ISO text alone cannot express that, since ``.`` precedes ``Z``).
+    A stamp that no longer parses sorts deterministically last, and a damaged
+    non-string id sorts as empty rather than crashing the comparison.
+    """
+    return sorted(
+        rows,
+        key=lambda row: (
+            _created_instant(row._mapping["created_at"]),
+            row._mapping["id"] if isinstance(row._mapping["id"], str) else "",
+        ),
+    )
+
+
+def verify_machine_chain(
+    session, machine_id: str
+) -> tuple[bool, int, str | None]:
+    """Read-only verification of one machine's assignment chain for audit.
+
+    Like :func:`verify_chain`, but tolerant of damaged stored values so a
+    corrupted ``created_at``, ``id``, digest, or reference never crashes the
+    query, is never repaired or recomputed for storage, and never removes the
+    record from the total. Returns ``(valid, checked_count,
+    broken_assignment_id)``.
+
+    Records are examined in the order of the actual UTC instant of
+    ``created_at`` and then ``id`` (an exact-second stamp precedes any
+    fractional-second stamp of the same second). A record whose ``created_at``
+    no longer parses still enters the total and is itself reported as the
+    first broken record, instead of crashing the scan or blaming its chain
+    successor. The first record's previous-assignment id must be empty; every
+    later record's must be the id of the immediately preceding record, and its
+    stored content and chain digests must match the digests recomputed under
+    the public creation-time rules — nothing is written back when they do not.
+    The first mismatch sets the broken id; later records cannot change it.
+    Only rows whose stored ``machine_id`` equals the path machine are
+    examined, so another machine's damaged records never change this result.
+    """
+    rows = _chain_order(
+        list(
+            session.execute(
+                _TABLE.select().where(_TABLE.c.machine_id == machine_id)
+            )
+        )
+    )
+
+    corrupted_id = _first_unparseable_created_at_id(rows)
+    if corrupted_id is not None:
+        return False, len(rows), corrupted_id
+
+    previous_assignment_id: str | None = None
+    previous_chain_hash = ""
+    for row in rows:
+        mapping = row._mapping
+        try:
+            content_hash = compute_content_hash(
+                **{key: mapping[key] for key in _CONTENT_COLUMNS}
+            )
+            chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+        except (TypeError, ValueError):
+            # A damaged stored value (e.g. a non-text field) cannot produce
+            # the published digest; the record is broken, not a reason to
+            # crash the read-only audit.
+            return False, len(rows), mapping["id"]
         if (
             mapping["content_hash"] != content_hash
             or mapping["previous_assignment_id"] != previous_assignment_id
