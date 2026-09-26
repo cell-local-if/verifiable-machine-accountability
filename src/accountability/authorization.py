@@ -22,6 +22,7 @@ write: the status read and the decision are never based on a state older
 than the transaction the event commits in.
 """
 
+import heapq
 import re
 
 from sqlalchemy import Connection
@@ -43,92 +44,94 @@ def _split_glob(pattern: str) -> tuple[str, tuple[str, ...], str]:
     return parts[0], tuple(parts[1:-1]), parts[-1]
 
 
-def _middle_runs_compatible(
-    first_middles: tuple[str, ...], second_middles: tuple[str, ...]
-) -> bool:
-    """Whether two middle literal runs can hold inside a single resource.
-
-    Each run pins the relative order of the distinct literal fragments it
-    contains: a fragment appearing before another in a pattern must be laid
-    out before it in any common resource. The two runs are compatible exactly
-    when the combined order constraints are acyclic; runs demanding opposite
-    orders for the same pair of fragments (directly, as in ``*a*b*`` against
-    ``*b*a*``, or through a longer cycle) can never be satisfied by one
-    resource, no matter how the remaining text is chosen.
-    """
-    edges: set[tuple[str, str]] = set()
-    fragments: set[str] = set()
-    for middles in (first_middles, second_middles):
-        fragments.update(middles)
-        for index, earlier in enumerate(middles):
-            for later in middles[index + 1 :]:
-                if earlier != later:
-                    edges.add((earlier, later))
-    # Kahn's algorithm: a layout of all fragments exists exactly when the
-    # constraint graph has no cycle.
-    outgoing: dict[str, list[str]] = {fragment: [] for fragment in fragments}
-    indegree: dict[str, int] = {fragment: 0 for fragment in fragments}
-    for earlier, later in edges:
-        outgoing[earlier].append(later)
-        indegree[later] += 1
-    ready = [fragment for fragment in fragments if indegree[fragment] == 0]
-    placed = 0
-    while ready:
-        fragment = ready.pop()
-        placed += 1
-        for later in outgoing[fragment]:
-            indegree[later] -= 1
-            if indegree[later] == 0:
-                ready.append(later)
-    return placed == len(fragments)
-
-
 def _merge_middle_runs(
     first_middles: tuple[str, ...], second_middles: tuple[str, ...]
-) -> tuple[str, ...]:
+) -> tuple[str, ...] | None:
     """Canonical literal run covering both middle runs in order.
 
-    The merge is the lexicographically smallest of the shortest common
-    supersequences of the two runs: it keeps every literal fragment of both
-    patterns in an order both runs can satisfy, shares fragments the runs
-    have in common instead of duplicating them, and is independent of which
-    pattern was passed first, so the reported intersection never varies with
-    the order a pair is examined in.
+    Returns ``None`` when the two runs demand contradictory orders (so no
+    single resource can satisfy both patterns); otherwise returns the
+    lexicographically smallest run that contains each input run as an
+    ordered subsequence.
+
+    Literal fragments are *not* identified by their text: every occurrence
+    in a run is its own state, and when the same text appears in both runs
+    the occurrences line up position by position — the k-th occurrence of a
+    text in one run is the same merged fragment as the k-th occurrence in
+    the other. Deduping by text first would both erase real repetitions
+    (``*x*y*x*`` genuinely pins ``x`` twice, once on each side of ``y``)
+    and invent contradictions, since a self-revisiting run such as
+    ``x, y, x`` collapses into a spurious ``x -> y -> x`` cycle. The
+    multiplicity of each text in the merge is the larger of its two
+    multiplicities, so repeated occurrences are never lost.
+
+    Consecutive occurrences within each run pin a strict ordering edge on
+    the shared merged nodes; the run exists exactly when the resulting
+    directed graph has no cycle (a pair such as ``*a*b*`` against
+    ``*b*a*`` demands opposite orders for the single ``a``/``b`` nodes and
+    is rejected), and the canonical merge is its lexicographically
+    smallest topological ordering, which is independent of which pattern
+    was passed first.
     """
-    first_len, second_len = len(first_middles), len(second_middles)
-    # length[i][j]: length of a shortest common supersequence of
-    # first_middles[i:] and second_middles[j:].
-    length = [[0] * (second_len + 1) for _ in range(first_len + 1)]
-    for i in range(first_len - 1, -1, -1):
-        length[i][second_len] = first_len - i
-    for j in range(second_len - 1, -1, -1):
-        length[first_len][j] = second_len - j
-    for i in range(first_len - 1, -1, -1):
-        for j in range(second_len - 1, -1, -1):
-            if first_middles[i] == second_middles[j]:
-                length[i][j] = 1 + length[i + 1][j + 1]
-            else:
-                length[i][j] = 1 + min(length[i + 1][j], length[i][j + 1])
-    # best[i][j]: the lexicographically smallest shortest common
-    # supersequence of the two suffixes, built bottom-up.
-    best: list[list[tuple[str, ...]]] = [
-        [()] * (second_len + 1) for _ in range(first_len + 1)
+    # One merged node per (text, occurrence index): same text, distinct
+    # occurrences never replace one another.
+    counts: dict[str, int] = {}
+    for middles in (first_middles, second_middles):
+        seen: dict[str, int] = {}
+        for fragment in middles:
+            seen[fragment] = seen.get(fragment, 0) + 1
+            counts[fragment] = max(counts.get(fragment, 0), seen[fragment])
+    nodes = sorted(
+        (occurrence, fragment)
+        for fragment, count in counts.items()
+        for occurrence in range(1, count + 1)
+    )
+    node_index = {node: index for index, node in enumerate(nodes)}
+
+    outgoing: list[set[int]] = [set() for _ in nodes]
+    indegree = [0 for _ in nodes]
+
+    def pin_order(middles: tuple[str, ...]) -> None:
+        seen: dict[str, int] = {}
+        earlier_pos: int | None = None
+        for fragment in middles:
+            occurrence = seen.get(fragment, 0) + 1
+            seen[fragment] = occurrence
+            position = node_index[(occurrence, fragment)]
+            if earlier_pos is not None and position not in outgoing[earlier_pos]:
+                outgoing[earlier_pos].add(position)
+                indegree[position] += 1
+            earlier_pos = position
+
+    pin_order(first_middles)
+    pin_order(second_middles)
+
+    # Kahn's algorithm, always placing the ready node with the smallest
+    # fragment text (and occurrence index as a deterministic tie-break; two
+    # occurrences of one text are never ready together since each run orders
+    # them). A shared merged run exists exactly when the combined ordering
+    # graph is acyclic, and choosing the smallest ready node yields the
+    # canonical, argument-order-independent topological order.
+    ready = [
+        (nodes[index][1], nodes[index][0], index)
+        for index, degree in enumerate(indegree)
+        if degree == 0
     ]
-    for j in range(second_len, -1, -1):
-        best[first_len][j] = tuple(second_middles[j:])
-    for i in range(first_len, -1, -1):
-        best[i][second_len] = tuple(first_middles[i:])
-    for i in range(first_len - 1, -1, -1):
-        for j in range(second_len - 1, -1, -1):
-            candidates = []
-            if first_middles[i] == second_middles[j]:
-                candidates.append((first_middles[i],) + best[i + 1][j + 1])
-            if length[i][j] == 1 + length[i + 1][j]:
-                candidates.append((first_middles[i],) + best[i + 1][j])
-            if length[i][j] == 1 + length[i][j + 1]:
-                candidates.append((second_middles[j],) + best[i][j + 1])
-            best[i][j] = min(candidates)
-    return best[0][0]
+    heapq.heapify(ready)
+    merged: list[str] = []
+    while ready:
+        _fragment, _occurrence, position = heapq.heappop(ready)
+        merged.append(nodes[position][1])
+        for later in outgoing[position]:
+            indegree[later] -= 1
+            if indegree[later] == 0:
+                heapq.heappush(
+                    ready,
+                    (nodes[later][1], nodes[later][0], later),
+                )
+    if len(merged) != len(nodes):
+        return None
+    return tuple(merged)
 
 
 def patterns_intersect(first: str, second: str) -> bool:
@@ -142,10 +145,10 @@ def patterns_intersect(first: str, second: str) -> bool:
     literal. When both patterns carry a star, a common string exists exactly
     when their prefix literals are prefix-comparable (one starts with the
     other), their suffix literals are suffix-comparable, and their middle
-    literal runs can hold inside one resource: each run pins the relative
-    order of its distinct literal fragments, and runs pinning contradictory
-    orders for the same fragments (such as ``*a*b*`` against ``*b*a*``) share
-    no common match.
+    literal runs can hold inside one resource: repeated literal fragments keep
+    every occurrence and its ordering (the k-th occurrences line up across
+    patterns), and runs pinning contradictory orders for the same occurrences
+    (such as ``*a*b*`` against ``*b*a*``) share no common match.
     """
     return intersection_pattern(first, second) is not None
 
@@ -158,11 +161,15 @@ def intersection_pattern(first: str, second: str) -> str | None:
     the existing ``*`` semantics whose every match is matched by both
     patterns: the longer of the two prefix literals, the merged middle
     literal runs, and the longer of the two suffix literals, joined by stars.
-    The middle runs merge into the canonical common supersequence that keeps
-    every literal fragment of both patterns in an order both can satisfy, so
-    the result never depends on which pattern is examined first. A literal
-    pattern's intersection with a glob it matches is the literal itself, so
-    when one rule uses an exact resource its intersection with any
+    The middle runs merge occurrence by occurrence — literal fragments are
+    never deduped by their text, the k-th occurrence of a fragment in one run
+    lines up with the k-th occurrence in the other, and each run embeds in
+    the merge in order — into a canonical common supersequence whose
+    fragment multiplicity is the larger of the two, so the result never
+    depends on which pattern is examined first and never loses a repeated
+    fragment; runs demanding opposite occurrence orders yield ``None``. A
+    literal pattern's intersection with a glob it matches is the literal
+    itself, so when one rule uses an exact resource its intersection with any
     overlapping pattern is that exact resource.
     """
     if "*" not in first:
@@ -193,9 +200,11 @@ def intersection_pattern(first: str, second: str) -> str | None:
     # matches exactly the same resources as ``a*b``.
     first_middles = tuple(part for part in first_middles if part)
     second_middles = tuple(part for part in second_middles if part)
-    if not _middle_runs_compatible(first_middles, second_middles):
-        return None
+    # The merge embeds each run as an ordered subsequence and fails only when
+    # the runs demand opposite occurrence orders.
     middles = _merge_middle_runs(first_middles, second_middles)
+    if middles is None:
+        return None
     return "*".join([prefix, *middles, suffix])
 
 
