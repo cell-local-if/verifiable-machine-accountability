@@ -31,6 +31,7 @@ from . import (
     assignment_chain,
     authorization,
     chain,
+    declaration_integrity,
     diagnostics,
     evidence_chain,
     incidents,
@@ -513,6 +514,84 @@ def list_behavior_declarations(machine_id: str, session: SessionDep):
         .order_by(BehaviorDeclaration.created_at, BehaviorDeclaration.id)
     ).all()
     return [declaration_to_out(d) for d in declarations]
+
+
+def validate_behavior_declaration_integrity_params(request: Request) -> None:
+    """Validate the behavior-declaration integrity query string.
+
+    The integrity query is keyed on the path machine alone and accepts no
+    business filter parameters; any parameter name is a 422 ``invalid_query``.
+    The check runs during validation, before the machine is looked up and
+    without any database access, so an extra parameter against a non-existent
+    machine still reports 422 rather than 404 and no declaration is read.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/behavior-declarations/integrity")
+def check_behavior_declaration_integrity(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_behavior_declaration_integrity_params)],
+    session: SessionDep,
+):
+    """Read-only integrity audit of one machine's behavior declarations.
+
+    The caller submits only the path machine id — no business filter
+    parameters; any query parameter is a 422 ``invalid_query`` raised during
+    validation before any declaration is read. A missing machine is a 404
+    ``not_found`` carrying no integrity conclusion. Only ``GET`` is routed;
+    other methods return 405 without reading declarations, computing a check,
+    or writing anything.
+
+    On success the response carries exactly ``{valid, checked_count,
+    broken_declaration_id}`` in this fixed field order. A machine with no
+    declarations reports ``true``, ``0``, and ``null``. ``checked_count``
+    always counts every declaration owned by the path machine. Declarations
+    are examined in the order of the actual UTC instant of ``created_at`` and
+    then ``id`` ascending, and the first record failing any condition makes
+    ``valid`` ``false`` and is reported by its stored identifier verbatim:
+    the record's ``machine_id`` must equal the path machine, ``id`` must be a
+    UUID, ``action_type`` and ``resource_pattern`` must be strings that stay
+    non-empty after surrounding whitespace is stripped, ``enabled`` must be a
+    boolean, ``created_at`` and ``updated_at`` must be UTC date-times ending
+    in ``Z``, and the stripped ``(action_type, resource_pattern)``
+    combination must not repeat among the machine's declarations — inside a
+    duplicate group the record sorting first is the one judged broken. When
+    every condition holds, ``valid`` is ``true`` and the broken id is
+    ``null``. Another machine's declarations — sound or damaged — never enter
+    the checked set and never change this machine's conclusion.
+
+    The query is strictly read-only: it never creates, updates, deletes,
+    repairs, recomputes, or normalizes a declaration and never changes an
+    authorization-evaluation result. The body is compact UTF-8 JSON
+    terminated by a single newline, with ``checked_count`` a JSON integer and
+    no floating-point or non-finite value, byte-identical on repeat calls
+    against unchanged data, including data persisted across application
+    restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+
+    valid, checked_count, broken_declaration_id = declaration_integrity.verify(
+        session, machine_id
+    )
+    payload = {
+        "valid": valid,
+        "checked_count": checked_count,
+        "broken_declaration_id": broken_declaration_id,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 class PolicyRuleCreate(BaseModel):
