@@ -19,7 +19,9 @@ the chain, or break a link.
 
 import hashlib
 import json
+import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import Connection, Engine, inspect, text
@@ -343,3 +345,88 @@ def verify_chain(session, machine_id: str) -> tuple[bool, int, str | None]:
         previous_chain_hash = chain_hash
 
     return True, len(rows), None
+
+
+# A stored ``created_at`` that no longer parses is ordered after every
+# parseable record (the same tolerant convention the other read-only audits
+# use), so a damaged stamp sorts deterministically last instead of crashing a
+# read-only verification; the stored text itself is never repaired.
+_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+_RFC3339_Z_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
+)
+
+
+def _created_at_instant(value: Any) -> datetime:
+    """Parse a stored ``created_at`` to its UTC instant without crashing.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract; a
+    damaged value sorts after every parseable record instead of raising, so
+    the read-only verification neither crashes nor normalizes the stored
+    text.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            pass
+    return _FAR_FUTURE
+
+
+def _record_sort_key(mapping: Any) -> tuple[datetime, str]:
+    record_id = mapping["id"]
+    return (
+        _created_at_instant(mapping["created_at"]),
+        record_id if isinstance(record_id, str) else "",
+    )
+
+
+def verify_chain_by_instant(
+    session, machine_id: str
+) -> tuple[bool, int, str | None]:
+    """Verify a machine's assignment chain in (created_at instant, id) order.
+
+    Read-only counterpart of :func:`verify_chain` that examines the records
+    in the order of the actual UTC instant of ``created_at`` and then the
+    record id, so an exact-second stamp sorts before any fractional-second
+    stamp of the same second and a stamp that no longer parses sorts after
+    every parseable record instead of crashing the scan. Returns ``(valid,
+    checked_count, broken_assignment_id)``: ``checked_count`` always counts
+    every record owned by the machine, damaged ones included; the first
+    record whose previous-assignment link, recomputed content hash, or
+    recomputed chain hash differs from the stored values makes the
+    conclusion ``False`` and is reported by its stored id verbatim, with
+    later records never changing that first-error attribution; an empty
+    chain is valid. Damaged stored values are never repaired, normalized, or
+    recomputed back into the database.
+    """
+    rows = list(
+        session.execute(_TABLE.select().where(_TABLE.c.machine_id == machine_id))
+    )
+    records = sorted(rows, key=lambda row: _record_sort_key(row._mapping))
+
+    previous_assignment_id: str | None = None
+    previous_chain_hash = ""
+    for row in records:
+        mapping = row._mapping
+        try:
+            content_hash = compute_content_hash(
+                **{key: mapping[key] for key in _CONTENT_COLUMNS}
+            )
+            chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+        except Exception:
+            # A stored value so damaged it cannot even be hashed makes the
+            # record inconsistent with the chain data; it is reported as the
+            # first anomaly, never repaired, and never crashes the query.
+            return False, len(records), mapping["id"]
+        if (
+            mapping["previous_assignment_id"] != previous_assignment_id
+            or mapping["content_hash"] != content_hash
+            or mapping["chain_hash"] != chain_hash
+        ):
+            return False, len(records), mapping["id"]
+        previous_assignment_id = mapping["id"]
+        previous_chain_hash = chain_hash
+
+    return True, len(records), None

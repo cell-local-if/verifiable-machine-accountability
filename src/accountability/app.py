@@ -2513,6 +2513,113 @@ def check_responsibility_assignment_integrity(machine_id: str, session: SessionD
     )
 
 
+def validate_event_assignment_chain_check_params(request: Request) -> None:
+    """Validate the event-scoped assignment chain-check request shape.
+
+    The verification is keyed on the path machine and event alone and accepts
+    no query parameters and no request body; any parameter name or a carried
+    body is a 422 ``invalid_query``. The check runs during validation, before
+    the machine is looked up and without any database access, so an extra
+    parameter or a body against a non-existent machine still reports 422
+    rather than 404 and no responsibility record is read.
+    """
+    # A present non-zero Content-Length, or a chunked request without one,
+    # means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/"
+    "responsibility-assignments/integrity"
+)
+def check_event_responsibility_assignment_integrity(
+    machine_id: str,
+    event_id: str,
+    _: Annotated[None, Depends(validate_event_assignment_chain_check_params)],
+    session: SessionDep,
+):
+    """Read-only verification of one machine's responsibility-assignment
+    chain, entered through the machine-event path.
+
+    The caller submits only the path machine id and event id — no query
+    parameters and no request body; any query parameter or carried body is a
+    422 ``invalid_query`` raised during validation before the machine is
+    looked up and before any responsibility record is read. Only ``GET`` is
+    routed; other methods return 405 without reading records, computing a
+    chain conclusion, or writing anything. A missing machine is a 404
+    ``not_found`` carrying no partial chain conclusion; an event that does
+    not exist or does not belong to the path machine is likewise a 404
+    ``not_found``, so no cross-event data is ever read.
+
+    The verified scope is the responsibility-assignment chain owned by the
+    path machine; the event id only confirms the ownership context and does
+    not filter the chain or change its order. On success the response
+    carries exactly ``{valid, checked_count, broken_assignment_id}`` in this
+    fixed field order. An empty chain reports ``true``, ``0``, and ``null``.
+    ``checked_count`` always counts the machine's complete chain — damaged
+    records included. Records are examined in the order of the actual UTC
+    instant of ``created_at`` and then the record id, so an exact-second
+    record sorts before any fractional-second record of the same second and
+    a damaged stamp sorts deterministically last instead of crashing the
+    scan. The first record must carry an empty ``previous_assignment_id``;
+    every later record must point at the immediately preceding record,
+    following the machine chain's tail evolution, and each record's stored
+    ``content_hash`` and ``chain_hash`` must equal the digests recomputed
+    with the same public rules used at creation. The first record whose
+    previous-assignment link, content hash, or chain hash disagrees with the
+    chain data makes ``valid`` ``false`` and is reported by its stored id
+    verbatim; later records never change that first-error attribution.
+    Damaged timestamps, ids, digests, or references never crash the query
+    and are never repaired, normalized, or recomputed back into the
+    database, and another machine's damaged records never enter this
+    machine's count, conclusion, or first-anomaly id.
+
+    The query is strictly read-only — it never creates, updates, deletes,
+    repairs, recomputes, or normalizes any responsibility record — and a
+    genuine read failure returns 500 ``internal_error`` with no partial
+    check result. The body is compact UTF-8 JSON terminated by a single
+    newline, free of any floating-point or non-finite value, byte-identical
+    on repeat calls against unchanged data, including data persisted across
+    application restarts.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        if get_machine_event(session, machine_id, event_id) is None:
+            return error_response(404, "not_found")
+        valid, checked_count, broken_assignment_id = (
+            assignment_chain.verify_chain_by_instant(session, machine_id)
+        )
+    except Exception:
+        # A genuine read-layer failure answers 500 with no partial check
+        # result; damaged stored values are not read failures and surface as
+        # a normal 200 conclusion instead.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "valid": valid,
+        "checked_count": checked_count,
+        "broken_assignment_id": broken_assignment_id,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 class ResponsibilityAssignmentComplianceExportOut(BaseModel):
     machine_id: str
     from_created_at: str

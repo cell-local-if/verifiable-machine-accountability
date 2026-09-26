@@ -419,6 +419,51 @@ incident can never read them), survive application restarts, and neither
 endpoint ever writes or modifies incidents, events, evidence, hash chains, or
 causal links.
 
+## Read-only event-scoped responsibility chain verification
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/responsibility-assignments/integrity`
+verifies the responsibility-assignment hash chain owned by the path machine,
+entered through the machine-event path. The caller submits only the machine id
+and the event id — no query parameters and no request body; any query
+parameter or carried body returns `422 {"error":{"code":"invalid_query"}}`
+during validation, before the machine is looked up and before any
+responsibility record is read. Only `GET` is routed; other methods return
+`405` without reading records, computing a chain conclusion, or writing
+anything. A missing machine returns `404 {"error":{"code":"not_found"}}`; an
+event that does not exist or does not belong to the path machine returns the
+same `404`, so no cross-event data is ever read.
+
+The event id only confirms the ownership context: the verified scope is the
+machine's complete assignment chain, and the event neither filters the
+records nor changes their order. The success body is exactly `{valid,
+checked_count, broken_assignment_id}` in this fixed field order. An empty
+chain reports `true`, `0`, and `null`; `checked_count` always counts every
+assignment owned by the machine, damaged records included. Records are
+examined in the order of the actual UTC instant of `created_at` and then the
+record id, so an exact-second record sorts before any fractional-second
+record of the same second and a damaged stamp sorts deterministically last
+instead of crashing the scan. The first record must carry an empty
+`previous_assignment_id`, every later record must point at the immediately
+preceding record along the machine chain's tail evolution, and each record's
+stored `content_hash` and `chain_hash` must equal the digests recomputed with
+the same public rules used at creation. The first record whose
+previous-assignment link, content hash, or chain hash disagrees with the
+chain data makes `valid` `false` and is reported by its stored id verbatim;
+later records never change that first-error attribution. Damaged timestamps,
+ids, digests, or references never crash the query and are never repaired,
+normalized, or recomputed back into the database, and another machine's
+damaged records never enter this machine's count, conclusion, or
+first-anomaly id.
+
+The query is strictly read-only — it never creates, updates, deletes,
+repairs, recomputes, or normalizes any responsibility record — and a genuine
+read failure returns `500 {"error":{"code":"internal_error"}}` with no
+partial check result. The body is compact UTF-8 JSON terminated by a single
+newline, byte-identical on repeat calls against unchanged data, including
+data persisted across application restarts. Responsibility creation, the
+assignment listing, the machine-level chain audit, and every existing export
+keep their response and write semantics unchanged.
+
 ## Read-only incident lifecycle and responsibility-closure audit
 
 `GET /machines/{machine_id}/authorization-decision-events/incidents/integrity`
