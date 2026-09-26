@@ -6084,6 +6084,379 @@ def export_machine_accountability(
     )
 
 
+# --- read-only stable incremental query over the machine accountability view -
+
+
+class AccountabilityChangesParams(BaseModel):
+    limit: int
+    cursor: str | None = None
+
+
+def validate_accountability_changes_params(
+    request: Request,
+) -> AccountabilityChangesParams:
+    """Validate the machine accountability ``changes`` query string before reads.
+
+    Exactly two parameters are accepted: the required ``limit`` and the
+    optional ``cursor``; no business filter parameters and no request body.
+    ``limit`` must be a non-boolean integer in 1..100; a missing, blank,
+    fractional, boolean, non-decimal, or out-of-range value is a 422
+    ``bad_limit``. ``cursor``, when present, must be a non-empty string
+    shaped ``<created_at original text>|<group>|<record id>``; an empty,
+    non-string, or shape-mismatching value is a 422 ``invalid_cursor``.
+    The timestamp segment is accepted verbatim as stored text rather than
+    parsed here: records whose stored ``created_at`` no longer parses sort
+    last and remain pageable, so a cursor legitimately built from such a
+    record must pass shape validation; locating the named record happens in
+    the handler while records are read, and a position that names no stored
+    record of the path machine is a 422 ``invalid_cursor`` there. Any other
+    parameter name, a repeated ``limit``/``cursor``, or a request that
+    carries a body is a 422 ``invalid_query``. Every check in this
+    dependency runs before the machine or any accountability record is read.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or accountability record is read. A present non-zero
+    # Content-Length, or a chunked request without one, means a body is
+    # being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``limit=1&limit=2`` rather than silently taking one occurrence.
+    if len(request.query_params.getlist("limit")) != 1:
+        raise QueryError("bad_limit")
+    if len(request.query_params.getlist("cursor")) > 1:
+        raise QueryError("invalid_cursor")
+
+    raw_limit = request.query_params.get("limit")
+    if raw_limit is None or not _INTEGER_QUERY_RE.fullmatch(raw_limit):
+        raise QueryError("bad_limit")
+    limit = int(raw_limit)
+    if not 1 <= limit <= 100:
+        raise QueryError("bad_limit")
+
+    cursor = request.query_params.get("cursor")
+    if cursor is not None:
+        # Query parameters arrive as strings; an empty value carries no
+        # separator and fails the shape check. Split on the LAST two
+        # separators because the position is ``<created_at original
+        # text>|<group>|<record id>`` and the timestamp segment is original
+        # stored text that may itself contain ``|`` (a record with an
+        # unparseable created_at stays pageable), while the group and
+        # record-id segments never do. All three segments only have to be
+        # non-empty here; the triple is resolved against stored rows in the
+        # handler, so a position naming no record is rejected there as a
+        # non-locatable cursor.
+        parts = cursor.rsplit("|", 2)
+        if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2]:
+            raise QueryError("invalid_cursor")
+
+    return AccountabilityChangesParams(limit=limit, cursor=cursor)
+
+
+def _encode_accountability_cursor(
+    created_at: str, group: str, record_id: str
+) -> str:
+    return f"{created_at}|{group}|{record_id}"
+
+
+# A stored ``created_at`` that no longer parses is ordered after every
+# parseable record (the same tolerant convention the other changes queries
+# use), so a damaged stamp sorts deterministically last instead of crashing
+# this read-only query; ties break by group tag and then record id.
+_ACCOUNTABILITY_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _accountability_created_instant(value: object) -> datetime:
+    """Parse a stored accountability ``created_at`` to its UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract;
+    a damaged value sorts after every parseable record instead of raising,
+    so the read-only query neither crashes nor repairs the stored text.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _ACCOUNTABILITY_FAR_FUTURE
+
+
+def _accountability_id_key(value: object) -> tuple[int, str]:
+    """Tie-break key for a stored record identifier.
+
+    Legitimately written ids are strings; a damaged non-string id never
+    crashes the ordering — it sorts after string ids within one instant,
+    and the stored value is still emitted verbatim.
+    """
+    if isinstance(value, str):
+        return (0, value)
+    return (1, "")
+
+
+def _accountability_event_to_dict(
+    record: AuthorizationDecisionEvent,
+) -> dict[str, object]:
+    """Complete compliance-export view of one stored decision event."""
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "action_type": record.action_type,
+        "resource": record.resource,
+        "allowed": record.allowed,
+        "reason": record.reason,
+        "created_at": record.created_at,
+        "previous_event_id": record.previous_event_id,
+        "content_hash": record.content_hash,
+        "chain_hash": record.chain_hash,
+    }
+
+
+def _accountability_evidence_to_dict(
+    record: AuthorizationDecisionEvidence,
+) -> dict[str, object]:
+    """Complete compliance-export view of one stored evidence record."""
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "event_id": record.event_id,
+        "evidence_type": record.evidence_type,
+        "content_hash": record.content_hash,
+        "created_at": record.created_at,
+    }
+
+
+def _accountability_incident_to_dict(
+    record: AuthorizationDecisionIncident,
+) -> dict[str, object]:
+    """Complete compliance-export view of one stored incident."""
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "event_id": record.event_id,
+        "incident_type": record.incident_type,
+        "summary": record.summary,
+        "status": record.status,
+        "created_at": record.created_at,
+    }
+
+
+def _accountability_status_event_to_dict(
+    record: IncidentStatusEvent,
+) -> dict[str, object]:
+    """Complete compliance-export view of one stored status transition."""
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "event_id": record.event_id,
+        "incident_id": record.incident_id,
+        "from_status": record.from_status,
+        "to_status": record.to_status,
+        "created_at": record.created_at,
+    }
+
+
+def _accountability_assignment_to_dict(
+    record: IncidentResponsibilityAssignment,
+) -> dict[str, object]:
+    """Complete compliance-export view of one stored assignment."""
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "event_id": record.event_id,
+        "incident_id": record.incident_id,
+        "party": record.party,
+        "role": record.role,
+        "created_at": record.created_at,
+        "previous_assignment_id": record.previous_assignment_id,
+        "content_hash": record.content_hash,
+        "chain_hash": record.chain_hash,
+    }
+
+
+# The five accountability record groups merged by the changes query, with
+# the fixed category tag each record item carries. The tag is also the
+# tie-break category key for records sharing one creation instant.
+_ACCOUNTABILITY_CHANGE_GROUPS = (
+    ("events", AuthorizationDecisionEvent, _accountability_event_to_dict),
+    ("evidence", AuthorizationDecisionEvidence, _accountability_evidence_to_dict),
+    ("incidents", AuthorizationDecisionIncident, _accountability_incident_to_dict),
+    (
+        "status_history",
+        IncidentStatusEvent,
+        _accountability_status_event_to_dict,
+    ),
+    (
+        "responsibility_assignments",
+        IncidentResponsibilityAssignment,
+        _accountability_assignment_to_dict,
+    ),
+)
+
+
+@app.get("/machines/{machine_id}/accountability/compliance-export/changes")
+def get_machine_accountability_changes(
+    machine_id: str,
+    params: Annotated[
+        AccountabilityChangesParams,
+        Depends(validate_accountability_changes_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only stable incremental, keyset-paginated query over one machine's
+    five accountability record groups.
+
+    The real entry point is the ``changes`` sub-entry under the machine
+    accountability compliance-export path; only ``GET`` is routed, so
+    non-GET methods return ``405`` without reading records, computing a
+    page, or writing anything. The caller submits only the path machine id,
+    a required ``limit`` (a non-boolean integer from 1 to 100), and an
+    optional opaque ``cursor`` returned by a previous page — no business
+    filter parameters and no request body. Query validation
+    (``invalid_query`` for unknown parameters, repeated names, or a carried
+    body; ``bad_limit`` for a missing, blank, fractional, boolean, or
+    out-of-range ``limit``; ``invalid_cursor`` for an empty, non-string, or
+    shape-mismatching ``cursor``) completes before the machine or any
+    record is read; a well-shaped cursor that names no stored
+    ``(created_at, group, id)`` position of the path machine is an
+    ``invalid_cursor`` reported while the records are read, so a parameter
+    error always takes priority over the machine lookup. A valid query
+    against a missing machine is a 404 ``not_found`` carrying no records.
+
+    On success the response carries exactly ``{machine_id, limit, records,
+    next_cursor, has_more}`` in this fixed key order. ``records`` merges
+    the five accountability groups — ``events``, ``evidence``,
+    ``incidents``, ``status_history``, and ``responsibility_assignments`` —
+    into one page where each item is ``{group, record}``: the fixed
+    category tag and the complete record exactly as the compliance export
+    emits it, with no normalization or repair. Items are ordered by the
+    actual UTC instant of ``created_at``, then by group tag, then by record
+    id ascending, so an exact-second record sorts before any
+    fractional-second record of the same second; a stored ``created_at``
+    that no longer parses is kept verbatim and deterministically sorts
+    after every parseable instant instead of crashing, being deleted, or
+    being rewritten.
+
+    The cursor is the exclusive position ``<created_at original
+    text>|<group>|<record id>`` pointing just after a page's last record,
+    so a page returns only records strictly after it: repeating the same
+    cursor against unchanged data returns the byte-identical next page, and
+    a newly inserted record whose sort position is earlier never makes an
+    already-returned record resurface while the current page still follows
+    the stable order. ``next_cursor`` carries the position after the page's
+    last record only when a record follows (``null`` on the last page), and
+    ``has_more`` is true exactly in that case — false on an empty or last
+    page, including an empty database. The endpoint adds no schema (cursors
+    are stateless) and is strictly read-only and machine isolated: it never
+    creates, updates, deletes, repairs, recomputes, or normalizes a record,
+    corrupted, missing, misowned, or duplicated records are kept exactly as
+    stored, and another machine's records never enter the page. The body is
+    compact UTF-8 JSON terminated by a single newline, free of
+    floating-point, ``-0.0``, or non-finite values, byte-identical on
+    repeat calls against unchanged data, and readable across application
+    restarts. A failure while reading the records returns 500
+    ``internal_error`` with no partial page.
+    """
+    # Any failure while *reading* — the group rows, the merge ordering, the
+    # cursor position, or the machine lookup — is an internal read-layer
+    # fault: answer 500 internal_error with no partial page. Damaged stored
+    # values are not a read failure — rows read successfully are ordered and
+    # emitted verbatim, with an unparseable stamp sorting last — so the
+    # tolerant key functions and cursor matching stay inside the guard but
+    # only a true read/order fault reaches the except branch.
+    try:
+        merged: list[tuple[str, object]] = []
+        for group, model, _to_dict in _ACCOUNTABILITY_CHANGE_GROUPS:
+            rows = session.scalars(
+                select(model).where(model.machine_id == machine_id)
+            ).all()
+            merged.extend((group, row) for row in rows)
+        ordered = sorted(
+            merged,
+            key=lambda item: (
+                _accountability_created_instant(item[1].created_at),
+                item[0],
+                _accountability_id_key(item[1].id),
+            ),
+        )
+
+        start = 0
+        if params.cursor is not None:
+            cursor_created_at, cursor_group, cursor_id = params.cursor.rsplit(
+                "|", 2
+            )
+            # Exclusive keyset position. A cursor this endpoint issued
+            # always names a stored record, so locate it by its exact
+            # stored ``(created_at text, group, id)`` triple; a well-shaped
+            # cursor that no record of the path machine matches (deleted
+            # record, foreign position, drifted text, unknown group) cannot
+            # be positioned and is rejected as a non-locatable cursor — a
+            # parameter error, reported before the machine lookup below.
+            # Matching on stored text keeps the unparseable-stamp tail
+            # pageable too.
+            positions = [
+                index
+                for index, (group, record) in enumerate(ordered)
+                if record.created_at == cursor_created_at
+                and group == cursor_group
+                and record.id == cursor_id
+            ]
+            if not positions:
+                return error_response(422, "invalid_cursor")
+            start = positions[0] + 1
+
+        machine = session.get(Machine, machine_id)
+    except Exception:
+        return error_response(500, "internal_error")
+
+    if machine is None:
+        return error_response(404, "not_found")
+
+    remaining = ordered[start:]
+    page = remaining[: params.limit]
+    has_more = len(remaining) > len(page)
+    next_cursor = (
+        _encode_accountability_cursor(
+            page[-1][1].created_at, page[-1][0], page[-1][1].id
+        )
+        if page and has_more
+        else None
+    )
+
+    to_dict_by_group = {
+        group: to_dict for group, _model, to_dict in _ACCOUNTABILITY_CHANGE_GROUPS
+    }
+    payload = {
+        "machine_id": machine_id,
+        "limit": params.limit,
+        "records": [
+            {"group": group, "record": to_dict_by_group[group](record)}
+            for group, record in page
+        ],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- read-only machine-level integrity summary ------------------------------
 
 
