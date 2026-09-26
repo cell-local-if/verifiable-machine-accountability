@@ -1409,3 +1409,50 @@ unchanged data, and reads data persisted across application restarts. It adds
 no schema. `GET /health`, machine start/stop, authorization evaluation, the
 event chain, incident handling, and the existing compliance exports are
 unchanged.
+
+## Read-only incremental global policy rule changes
+
+`GET /policy-rules/changes` is a stable, keyset-paginated incremental view of
+the global policy rules — a `changes` sub-entry under the global policy rules
+path. Only `GET` is routed; other methods return `405` without reading rules,
+computing a page, or writing anything. The caller submits only a page size and
+an optional cursor — no business filter parameters and no request body:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, non-integer (`3.0`, `abc`), boolean (`true`/`false`), or out-of-range
+  value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque string shaped `<created_at original
+  text>|<rule uuid>` as returned by a previous page. An empty, non-string,
+  malformed, or unlocatable value (no stored rule carries exactly that id and
+  that original creation text) returns
+  `422 {"error":{"code":"invalid_cursor"}}`.
+- Any other query parameter, and any request body, returns
+  `422 {"error":{"code":"invalid_query"}}`. Every validation error is raised
+  during the validation phase, before any rule is read.
+
+The response is `{limit, records, next_cursor, has_more}` in this fixed field
+order. `records` contains only global policy rules, each carrying the full
+chain-view record `{id, action_type, resource_pattern, effect, priority,
+created_at, updated_at, previous_rule_id, content_hash, chain_hash}` exactly
+as stored. Records are ordered by the actual UTC instant of `created_at` and
+then by rule id ascending, so an exact-second record sorts before any
+fractional-second record of the same second; a stored `created_at` that no
+longer parses keeps its stored text and sorts after every parseable record —
+it is never dropped, repaired, or normalized.
+
+The cursor is an exclusive position over `(created_at, id)`: a page returns
+only records strictly after it, repeating the same cursor against unchanged
+data returns the byte-identical next page, and a rule inserted at an earlier
+sort position never makes an already-returned record resurface. `next_cursor`
+is the position after the page's last record when at least one record follows
+and `null` otherwise; `has_more` is `true` exactly when a record exists after
+the current position (false on an empty or last page). The query is strictly
+read-only — it never creates, updates, deletes, repairs, recomputes, or
+normalizes a rule — adds no schema, returns byte-identical compact UTF-8 JSON
+(terminated by a single newline, with no floating-point, `-0.0`, or
+non-finite value) on repeat calls against unchanged data, returns a complete
+empty page against an empty table, and reads rules persisted across
+application restarts. A failure that prevents reading the rules returns
+`500 {"error":{"code":"internal_error"}}` with no partial page. Rule creation,
+the rule listing, the window export, the chain queries, the decision previews,
+and authorization evaluation are unchanged.

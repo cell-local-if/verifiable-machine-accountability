@@ -1293,6 +1293,192 @@ def check_policy_rule_integrity(
     )
 
 
+# --- read-only incremental change query over the global policy rules --------
+
+
+class PolicyRuleChangesParams(BaseModel):
+    limit: int
+    cursor: str | None = None
+
+
+async def validate_policy_rule_changes_params(
+    request: Request,
+) -> PolicyRuleChangesParams:
+    """Validate the policy-rule ``changes`` query string before any read.
+
+    Exactly two parameters are accepted: the required ``limit`` and the
+    optional ``cursor``; any other parameter name — and any request body — is
+    a 422 ``invalid_query``. ``limit`` must be a non-boolean integer in
+    1..100; a missing, blank, non-integer (``3.0``, ``true``, non-decimal
+    text), or out-of-range value is a 422 ``bad_limit``. ``cursor``, when
+    present, must be a string shaped ``<created_at original text>|<rule
+    uuid>``; an empty, non-string, shape-mismatching, or unparseable cursor is
+    a 422 ``invalid_cursor``. Every check runs during validation, before any
+    rule is read and without any database access.
+    """
+    allowed = {"limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``limit=1&limit=2`` rather than silently taking one occurrence.
+    if len(request.query_params.getlist("limit")) != 1:
+        raise QueryError("bad_limit")
+    if len(request.query_params.getlist("cursor")) > 1:
+        raise QueryError("invalid_cursor")
+
+    raw_limit = request.query_params.get("limit")
+    if raw_limit is None or not _INTEGER_QUERY_RE.fullmatch(raw_limit):
+        raise QueryError("bad_limit")
+    limit = int(raw_limit)
+    if not 1 <= limit <= 100:
+        raise QueryError("bad_limit")
+
+    cursor = request.query_params.get("cursor")
+    if cursor is not None:
+        # Query parameters arrive as strings; an empty value carries no
+        # separator and fails the shape check below. The split is on the first
+        # separator, so the timestamp segment may itself contain ``|``; the
+        # rule-id segment must be exactly a UUID.
+        parts = cursor.split("|", 1)
+        if len(parts) != 2 or not parts[0] or not _UUID_RE.fullmatch(parts[1]):
+            raise QueryError("invalid_cursor")
+        # The position segment is the original ``created_at`` text, always a
+        # UTC RFC 3339 date-time ending in ``Z``; a damaged value is rejected
+        # here rather than failing later while parsing the position.
+        cursor_created_at = parts[0]
+        if not _RFC3339_Z_DATETIME_RE.fullmatch(cursor_created_at):
+            raise QueryError("invalid_cursor")
+        try:
+            parse_utc_z_datetime(cursor_created_at)
+        except ValueError:
+            raise QueryError("invalid_cursor") from None
+
+    # The incremental query accepts no request body; one is rejected during
+    # validation together with the unknown-parameter check, before any rule
+    # is read.
+    if await request.body():
+        raise QueryError("invalid_query")
+
+    return PolicyRuleChangesParams(limit=limit, cursor=cursor)
+
+
+@app.get("/policy-rules/changes")
+def get_policy_rule_changes(
+    params: Annotated[
+        PolicyRuleChangesParams, Depends(validate_policy_rule_changes_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only incremental, keyset-paginated query over the global rules.
+
+    The real entry point is the ``changes`` sub-entry of the global policy
+    rules path; only ``GET`` is routed, so non-GET methods return ``405``
+    without reading rules, computing a page, or writing anything. The caller
+    submits a required ``limit`` (a non-boolean integer from 1 to 100) and an
+    optional opaque ``cursor`` returned by a previous page — no business
+    filter parameters and no request body. Query validation
+    (``invalid_query`` for unknown parameters or a request body, ``bad_limit``
+    for a missing, fractional, boolean, or out-of-range ``limit``,
+    ``invalid_cursor`` for an empty, non-string, shape-mismatching, or
+    unparseable ``cursor``) completes before any rule is read. A well-formed
+    cursor that locates no stored rule — no rule carries exactly that id and
+    that original ``created_at`` text — is likewise a 422 ``invalid_cursor``.
+
+    On success the response carries exactly ``{limit, records, next_cursor,
+    has_more}`` in this fixed, stable key order. ``records`` contains only
+    global policy rules, each with the full chain-view record ``{id,
+    action_type, resource_pattern, effect, priority, created_at, updated_at,
+    previous_rule_id, content_hash, chain_hash}`` exactly as stored. Records
+    are ordered by the actual UTC instant of ``created_at`` and then by rule
+    id ascending, so an exact-second record sorts before any fractional-second
+    record of the same second; a stored ``created_at`` that no longer parses
+    keeps its stored text and sorts after every parseable record — it is
+    never dropped, repaired, or normalized.
+
+    The cursor is the exclusive position ``<created_at original text>|<rule
+    id>`` pointing just after a page's last record, so a page returns only
+    records strictly after it: repeating the same cursor against unchanged
+    data returns the byte-identical next page, and a newly inserted rule with
+    an earlier sort position never makes an already-returned record resurface.
+    ``next_cursor`` carries the position after the page's last record only
+    when a record follows (``null`` otherwise), and ``has_more`` is true
+    exactly in that case — false on an empty or last page. The endpoint adds
+    no schema (cursors are stateless), is strictly read-only, and reads rules
+    persisted across application restarts. A failure that prevents reading
+    the rules returns ``500 internal_error`` with no partial page. The body is
+    compact UTF-8 JSON terminated by a single newline, free of any
+    floating-point, ``-0.0``, or non-finite value.
+    """
+    try:
+        rows = policy_rule_chain.ordered_rules(session)
+    except Exception:
+        # Never emit a partial page when the rules cannot be read.
+        return error_response(500, "internal_error")
+
+    start = 0
+    if params.cursor is not None:
+        cursor_created_at, cursor_id = params.cursor.split("|", 1)
+        # The cursor must locate the record it was issued for: the rule with
+        # exactly this id and exactly this original ``created_at`` text. A
+        # well-formed cursor no stored rule matches is a 422 invalid_cursor.
+        position = next(
+            (
+                index
+                for index, row in enumerate(rows)
+                if row._mapping["id"] == cursor_id
+                and row._mapping["created_at"] == cursor_created_at
+            ),
+            None,
+        )
+        if position is None:
+            return error_response(422, "invalid_cursor")
+        # Exclusive keyset position: the page starts right after the located
+        # record, so the located record itself is never read back.
+        start = position + 1
+
+    remaining = rows[start:]
+    page = remaining[: params.limit]
+    has_more = len(remaining) > len(page)
+    next_cursor = (
+        f"{page[-1]._mapping['created_at']}|{page[-1]._mapping['id']}"
+        if page and has_more
+        else None
+    )
+
+    payload = {
+        "limit": params.limit,
+        "records": [
+            {
+                "id": row._mapping["id"],
+                "action_type": row._mapping["action_type"],
+                "resource_pattern": row._mapping["resource_pattern"],
+                "effect": row._mapping["effect"],
+                "priority": row._mapping["priority"],
+                "created_at": row._mapping["created_at"],
+                "updated_at": row._mapping["updated_at"],
+                "previous_rule_id": row._mapping["previous_rule_id"],
+                "content_hash": row._mapping["content_hash"],
+                "chain_hash": row._mapping["chain_hash"],
+            }
+            for row in page
+        ],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 @app.get("/policy-rules/conflicts")
 def analyze_policy_rule_conflicts(
     _: Annotated[None, Depends(validate_policy_rule_chain_query_params)],
