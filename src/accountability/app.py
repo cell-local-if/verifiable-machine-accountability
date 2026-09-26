@@ -4461,6 +4461,117 @@ def check_privacy_access_integrity(
     return Response(content=body, media_type="application/json")
 
 
+def validate_privacy_access_diagnostics_params(request: Request) -> None:
+    """Validate the privacy-access diagnostics query string before any lookup.
+
+    The per-record diagnostics query is keyed on the path machine alone and
+    accepts no filter parameters, no time bounds, and no request body; any
+    parameter name or a carried body is a 422 ``invalid_query``. The check
+    runs before the machine is looked up and issues no database access, so an
+    extra parameter or body against a non-existent machine still reports 422
+    rather than 404 and no access record is read.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+    # The entry point accepts only the path machine id: a body on a GET is
+    # an unknown-shape request rejected in the validation phase, before any
+    # machine or access record is read. A present non-zero Content-Length,
+    # or a chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/privacy-accesses/diagnostics")
+def get_privacy_access_diagnostics(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_privacy_access_diagnostics_params)],
+    session: SessionDep,
+):
+    """Read-only per-record diagnostics of one machine's privacy access chain.
+
+    The caller submits only the path machine id — no filter parameters, no
+    time bounds, and no request body; any query parameter or carried body is
+    a 422 ``invalid_query`` raised during validation before any machine or
+    access record is read. A missing machine is a 404 ``not_found`` carrying
+    no diagnostics data and no partial chain conclusion. Only ``GET`` is
+    routed; other methods return 405 without reading access records,
+    computing positions, or summarizing anything. A failure while reading the
+    machine or the access records is a 500 ``internal_error`` with no partial
+    diagnostics result.
+
+    On success the response carries exactly ``{machine_id, valid,
+    checked_count, records}`` in this fixed field order. Records are listed
+    in the order of the actual UTC instant of ``accessed_at`` and then ``id``
+    ascending — an exact-second record before any fractional-second record of
+    the same second, and a damaged stamp sorting after every parseable
+    instant instead of crashing the query — numbered by ``position`` from 1
+    consecutively. Each record carries exactly ``{id, position,
+    previous_access_id, content_hash, chain_hash, anomaly_codes}``: the
+    stored access id, its sort position, the stored predecessor id (``null``
+    expected on the first record, the immediately preceding record's id
+    afterwards), the stored content and chain digests verbatim, and every
+    anomaly found on the record drawn from the fixed taxonomy
+    ``missing_previous``, ``wrong_previous``, ``bad_content_hash``,
+    ``bad_chain_hash``, ``bad_time``, ``bad_id``, ``bad_ownership`` — an
+    empty array when the record is sound. The expected digests follow the
+    existing privacy access chain rules (content hash over the seven business
+    fields, chain hash from the empty-prefix root over the recomputed
+    chain). The first anomalous record makes ``valid`` ``false``; every
+    record keeps its own complete anomaly list, and later records are still
+    listed as stored. ``checked_count`` always counts every record owned by
+    the path machine, and an empty machine reports ``true``, ``0``, and an
+    empty ``records`` array.
+
+    The query is strictly read-only — it never creates, updates, deletes,
+    repairs, recomputes, or normalizes a record, damaged values are judged
+    and emitted verbatim rather than rewritten, and another machine's
+    records, sound or damaged, never enter the result or change this
+    machine's conclusion. The body is compact UTF-8 JSON terminated by a
+    single newline, with ``position`` and ``checked_count`` JSON integers and
+    no floating-point or non-finite value, byte-identical on repeat calls
+    against unchanged data, including data persisted across application
+    restarts.
+    """
+    # A failure while reading the machine is an internal read-layer fault:
+    # answer 500 internal_error with no partial machine object.
+    try:
+        machine = session.get(Machine, machine_id)
+    except Exception:
+        return error_response(500, "internal_error")
+    if machine is None:
+        return error_response(404, "not_found")
+
+    # A failure while *reading* the access records is an internal read-layer
+    # fault: answer 500 internal_error with no partial diagnostics result.
+    # Damaged stored values are not a read failure — rows read successfully
+    # are judged as per-record anomalies, never misclassified as an internal
+    # error.
+    try:
+        records = privacy_chain.diagnose_chain(session, machine_id)
+    except Exception:
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": machine_id,
+        "valid": all(not record["anomaly_codes"] for record in records),
+        "checked_count": len(records),
+        "records": records,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 class IncidentIntegrityOut(BaseModel):
     valid: bool
     checked_count: int

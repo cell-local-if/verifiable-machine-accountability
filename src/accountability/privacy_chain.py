@@ -25,6 +25,7 @@ is a no-op for the common tail-append case.
 
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -389,3 +390,136 @@ def verify_chain(session, machine_id: str) -> tuple[bool, int, str | None]:
         previous_chain_hash = chain_hash
 
     return True, len(rows), None
+
+
+# --- read-only per-record chain diagnostics ---------------------------------
+
+# The fixed anomaly taxonomy reported by the per-record diagnostics query, in
+# the fixed order codes are listed inside one record's ``anomaly_codes``
+# array. A record with no anomaly carries an empty array.
+ANOMALY_MISSING_PREVIOUS = "missing_previous"
+ANOMALY_WRONG_PREVIOUS = "wrong_previous"
+ANOMALY_BAD_CONTENT_HASH = "bad_content_hash"
+ANOMALY_BAD_CHAIN_HASH = "bad_chain_hash"
+ANOMALY_BAD_TIME = "bad_time"
+ANOMALY_BAD_ID = "bad_id"
+ANOMALY_BAD_OWNERSHIP = "bad_ownership"
+
+# A registered ``accessed_at`` is always a UTC RFC 3339 date-time ending in
+# ``Z`` (fractional seconds optional); anything else is a damaged stamp.
+_RFC3339_Z_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
+)
+
+# A registered record id is always a UUID; anything else is a damaged id.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _is_sound_accessed_at(value: object) -> bool:
+    """Whether a stored ``accessed_at`` keeps the RFC 3339 ``Z`` contract."""
+    if not isinstance(value, str) or not _RFC3339_Z_RE.fullmatch(value):
+        return False
+    try:
+        datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return True
+
+
+def diagnose_chain(session, machine_id: str) -> list[dict[str, Any]]:
+    """Diagnose one machine's privacy access chain record by record.
+
+    Records are examined in the chain order — the actual UTC instant of
+    ``accessed_at`` and then ``id``, with a damaged stamp sorting after every
+    parseable instant — and each is reported exactly as stored together with
+    its 1-based position and every anomaly found, in the fixed taxonomy
+    order. The expected content and chain hashes follow the same rules as
+    :func:`verify_chain` (the chain expectation is recomputed from the
+    business fields, so one record's damage never hides behind its stored
+    hashes), but the emitted ``content_hash``/``chain_hash`` are the stored
+    values verbatim: the query judges, never repairs, rewrites, or crashes on
+    a damaged value. Only the path machine's rows are examined, so another
+    machine's damaged records never enter the result.
+    """
+    rows = _chain_order(
+        list(
+            session.execute(
+                _TABLE.select().where(_TABLE.c.machine_id == machine_id)
+            )
+        )
+    )
+
+    records: list[dict[str, Any]] = []
+    expected_previous_id: str | None = None
+    expected_previous_chain_hash = ""
+    for position, row in enumerate(rows, start=1):
+        mapping = row._mapping
+        record_id = mapping["id"]
+        stored_previous = mapping["previous_access_id"]
+
+        codes: list[str] = []
+        # Predecessor link: the first record must point at no predecessor and
+        # every later record at its immediate predecessor in chain order.
+        if expected_previous_id is None:
+            if stored_previous is not None:
+                codes.append(ANOMALY_WRONG_PREVIOUS)
+        elif stored_previous is None:
+            codes.append(ANOMALY_MISSING_PREVIOUS)
+        elif stored_previous != expected_previous_id:
+            codes.append(ANOMALY_WRONG_PREVIOUS)
+
+        # Content and chain digests, recomputed from the stored business
+        # fields under the existing chain rules. A value so damaged the
+        # digest cannot even be recomputed is unverifiable, never a crash.
+        try:
+            expected_content_hash = compute_content_hash(
+                **{key: mapping[key] for key in _CONTENT_COLUMNS}
+            )
+        except Exception:
+            expected_content_hash = None
+        if (
+            expected_content_hash is None
+            or mapping["content_hash"] != expected_content_hash
+        ):
+            codes.append(ANOMALY_BAD_CONTENT_HASH)
+        if expected_content_hash is None:
+            expected_chain_hash = None
+        else:
+            expected_chain_hash = compute_chain_hash(
+                expected_previous_chain_hash, expected_content_hash
+            )
+        if (
+            expected_chain_hash is None
+            or mapping["chain_hash"] != expected_chain_hash
+        ):
+            codes.append(ANOMALY_BAD_CHAIN_HASH)
+        # The next record's chain expectation builds on this record's
+        # recomputed chain hash, matching verify_chain; an uncomputable
+        # digest degrades to the empty-prefix root deterministically.
+        expected_previous_chain_hash = (
+            expected_chain_hash if expected_chain_hash is not None else ""
+        )
+
+        if not _is_sound_accessed_at(mapping["accessed_at"]):
+            codes.append(ANOMALY_BAD_TIME)
+        if not (isinstance(record_id, str) and _UUID_RE.fullmatch(record_id)):
+            codes.append(ANOMALY_BAD_ID)
+        if mapping["machine_id"] != machine_id:
+            codes.append(ANOMALY_BAD_OWNERSHIP)
+
+        records.append(
+            {
+                "id": record_id,
+                "position": position,
+                "previous_access_id": stored_previous,
+                "content_hash": mapping["content_hash"],
+                "chain_hash": mapping["chain_hash"],
+                "anomaly_codes": codes,
+            }
+        )
+        expected_previous_id = record_id
+
+    return records
