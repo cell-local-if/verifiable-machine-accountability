@@ -1280,6 +1280,64 @@ and empty databases need no migration. The existing create queries, hash
 chains, diagnostics terminal state, integrity summary, and other compliance
 exports are unchanged.
 
+## Read-only stable incremental privacy responsibility query
+
+`GET /machines/{machine_id}/authorization-decision-events/privacy-responsibility/compliance-export/changes`
+is the stable, keyset-paginated incremental view of the desensitized privacy
+responsibility export — the `changes` sub-entry under that export path. It
+submits only the machine id, a page size, and an optional cursor; validation
+completes before the machine or any responsibility record is read, so an
+invalid query never touches machine or responsibility data:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, fractional, boolean (`true`/`false`), non-decimal, or out-of-range
+  value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque exclusive position shaped
+  `<created_at original text>|<record id>` and returned by a previous page.
+  An empty, non-string, or shape-mismatching value, or a well-shaped cursor
+  that names no stored assignment of the path machine, returns
+  `422 {"error":{"code":"invalid_cursor"}}`. The timestamp segment is the
+  original stored text (it is not required to parse), so an assignment with
+  an unparseable `created_at` stays pageable.
+- Any other query parameter, a repeated `limit`/`cursor`, or a request that
+  carries a body returns `422 {"error":{"code":"invalid_query"}}`; every
+  parameter check precedes the machine lookup, so an invalid query against a
+  non-existent machine is still `422`.
+- After validation, a missing machine returns
+  `404 {"error":{"code":"not_found"}}` with no responsibility records.
+- The path accepts `GET` only; other methods return `405` without reading
+  records, computing a page, or writing anything.
+
+The response is `{machine_id, limit, records, next_cursor, has_more}` in this
+fixed key order; `records` is an empty array on an empty page or an empty
+database. Each record carries exactly the ten desensitized
+privacy-responsibility fields `{id, machine_id, event_id, incident_id,
+created_at, previous_assignment_id, content_hash, chain_hash, party_ref,
+role_ref}` — the eight stored fields exactly as stored plus the same
+machine-scoped `party_ref`/`role_ref` digests the compliance export emits;
+the raw party and role never appear. Records are ordered by the actual UTC
+instant of `created_at` and then by record id ascending (an exact-second
+record sorts before any fractional-second record of the same second). A
+stored `created_at` that no longer parses is kept verbatim and
+deterministically sorts after every parseable record.
+
+The cursor is exclusive: a page returns only records strictly after the
+cursor, so repeating the same cursor against unchanged data returns the
+byte-identical page, and a newly inserted assignment with an earlier sort
+position never makes an already-returned record resurface. `next_cursor` is
+non-null only when at least one record follows the page (it is `null` on the
+last page), and `has_more` is `true` exactly in that case. A failure while
+reading the assignments returns `500 {"error":{"code":"internal_error"}}`
+with no partial page. Cursors are stateless and add no schema: the query is
+strictly read-only and machine-isolated, corrupted, missing, misowned, or
+duplicated records are kept exactly as stored, the body is compact UTF-8 JSON
+terminated by a single newline with no floating-point, `-0.0`, or non-finite
+value, repeated calls against identical data and parameters are
+byte-identical, and records persisted across application restarts remain
+readable; old and empty databases work unchanged. Responsibility creation,
+listing, chain verification, the existing desensitized export, diagnostics,
+health checks, and all other endpoints are unchanged.
+
 ## Machine-level privacy access registration and read-only query
 
 Two machine-scoped entries provide a machine-level audit of privacy data
