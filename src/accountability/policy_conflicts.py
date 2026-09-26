@@ -130,16 +130,48 @@ def _sort_id(value: object) -> tuple[int, str]:
     return (1, str(value))
 
 
+def _surfaced_key(value: Any) -> tuple[int, Any]:
+    """Total ascending key over the *surfaced* (json-safe) form of an id.
+
+    The pair ids and relation lists are emitted through
+    ``_json_safe_stored_value`` and must be ordered by exactly the identifiers
+    the response shows — never by the raw stored bucket (which would put every
+    string id ahead of a blob id regardless of the text it surfaces as,
+    emitting a pair such as ``["z", "a"]``). String ids therefore compare by
+    their shown text; the other json-safe surface types get their own stable
+    buckets so a damaged id still has a definite, comparable position.
+    """
+    if value is None:
+        return (0, 0)
+    if isinstance(value, bool):
+        return (1, int(value))
+    if isinstance(value, int):
+        return (2, value)
+    if isinstance(value, str):
+        return (3, value)
+    return (4, str(value))
+
+
 def build_analysis(stored_rules: list[dict[str, Any]]) -> dict[str, Any]:
     """Compute the conflict/override analysis from already-loaded rule rows.
 
     Pure: no database access, no writes.
     """
-    matchable = [dict(stored) for stored in stored_rules if _is_matchable(stored)]
+    # Matchable rules are examined in a canonical order rather than storage
+    # order, so every pair outcome (candidate or not, and the reported
+    # intersection) is independent of how the rows happened to be returned and
+    # of the direction the two rules are compared in.
+    matchable = sorted(
+        (dict(stored) for stored in stored_rules if _is_matchable(stored)),
+        key=lambda rule: (
+            rule.get("action_type"),
+            _sort_id(rule.get("id")),
+        ),
+    )
 
     conflicts: list[dict[str, Any]] = []
     overrides: list[dict[str, Any]] = []
-    # Relation memberships keyed by stored id; a rule can take part in several
+    # Relation memberships keyed by raw stored id; a rule can take part in several
     # pairs. Conflict marks outrank an override relation, matching the order
     # in which the audit names the two relations.
     conflict_ids: set[Any] = set()
@@ -158,14 +190,19 @@ def build_analysis(stored_rules: list[dict[str, Any]]) -> dict[str, Any]:
             if intersection is None:
                 continue
             first_id, second_id = first["id"], second["id"]
-            # Ordering and membership always key on the raw stored id; only the
-            # emitted pair ids are surfaced through the same value conversion
-            # the details use, so a matchable rule whose id itself is damaged
-            # (for example a stored blob) still produces a normal 200 analysis
-            # instead of crashing response serialization.
-            left_id, right_id = sorted((first_id, second_id), key=_sort_id)
-            safe_left = _json_safe_stored_value(left_id)
-            safe_right = _json_safe_stored_value(right_id)
+            # Membership keys keep the raw stored id, but the emitted pair and
+            # every ordering are over the surfaced identifiers: a matchable
+            # rule whose id itself is damaged (for example a stored blob) is
+            # surfaced through the same value conversion the details use and
+            # still sorts by the text it is shown as, so the pair is always
+            # emitted in ascending order instead of crashing serialization or
+            # leaking the raw string-before-blob bucket order.
+            safe_first = _json_safe_stored_value(first_id)
+            safe_second = _json_safe_stored_value(second_id)
+            if _surfaced_key(safe_first) <= _surfaced_key(safe_second):
+                safe_left, safe_right = safe_first, safe_second
+            else:
+                safe_left, safe_right = safe_second, safe_first
             if first["priority"] == second["priority"]:
                 if first["effect"] != second["effect"]:
                     conflicts.append(
@@ -198,27 +235,28 @@ def build_analysis(stored_rules: list[dict[str, Any]]) -> dict[str, Any]:
                 override_ids.update((first_id, second_id))
 
     # Conflict groups and override relations are ordered by both party rule
-    # ids ascending, so repeat queries over the same rows are byte-identical.
-    # The tolerant key keeps a damaged non-string id comparable instead of
-    # crashing the audit.
+    # ids ascending — by the identifiers actually emitted — so repeat queries
+    # over the same rows are byte-identical even when a damaged id surfaces as
+    # text that sorts among the string ids.
     conflicts.sort(
-        key=lambda entry: tuple(_sort_id(value) for value in entry["rule_ids"])
+        key=lambda entry: tuple(_surfaced_key(v) for v in entry["rule_ids"])
     )
     overrides.sort(
         key=lambda entry: (
-            _sort_id(entry["overriding_rule_id"]),
-            _sort_id(entry["overridden_rule_id"]),
+            _surfaced_key(entry["overriding_rule_id"]),
+            _surfaced_key(entry["overridden_rule_id"]),
         )
     )
 
     # Rule details order by the actual UTC instant of created_at and then by
-    # id, so an exact-second record sorts before a fractional-second record of
-    # the same second; a damaged stamp sorts after every parseable one.
+    # the surfaced id ascending, so an exact-second record sorts before a
+    # fractional-second record of the same second; a damaged stamp sorts after
+    # every parseable one.
     ordered = sorted(
         stored_rules,
         key=lambda stored: (
             _created_instant(stored.get("created_at")),
-            _sort_id(stored.get("id")),
+            _surfaced_key(_json_safe_stored_value(stored.get("id"))),
         ),
     )
 

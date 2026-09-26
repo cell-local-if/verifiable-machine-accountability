@@ -1132,12 +1132,17 @@ def analyze_policy_rule_conflicts(
     floating-point, ``-0.0``, or non-finite values, including data persisted
     across application restarts; old and empty databases work unchanged.
     """
+    # A failure while *reading* the rules is an internal read-layer fault:
+    # answer 500 internal_error with no partial analysis. Damaged business
+    # fields are not a read failure — the rows were read — so the pure, total
+    # analysis over them runs outside this guard and a content anomaly is
+    # reported as a normal 200 (every damaged value surfaces verbatim), never
+    # misclassified as an internal read error.
     try:
         stored_rules = policy_conflicts.load_rules(session)
-        payload = policy_conflicts.build_analysis(stored_rules)
     except Exception:
-        # Never emit a partial analysis when the rules cannot be read.
         return error_response(500, "internal_error")
+    payload = policy_conflicts.build_analysis(stored_rules)
 
     # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a fixed
     # field order, terminated by a single newline, and free of any

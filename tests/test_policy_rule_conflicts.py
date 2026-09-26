@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from accountability.app import app
+from accountability.policy_conflicts import build_analysis
 
 
 @pytest.fixture
@@ -819,6 +820,158 @@ def test_non_utf8_blob_id_never_breaks_the_analysis(client):
         }
     ]
     assert {rule["id"] for rule in body["rules"]} == {damaged, rid(2)}
+
+
+def test_conflict_pair_with_blob_id_is_emitted_in_ascending_order(client):
+    # The blob id surfaces as the text "a", which sorts before the string id
+    # "z". The pair must order by the identifiers it actually emits, not by the
+    # raw stored bucket (which would put every string id ahead of a blob id
+    # and wrongly emit ["z", "a"]).
+    _insert_raw_row(client, b"a", resource_pattern="res/a*", effect="allow",
+                    priority=3)
+    _insert_raw_row(client, "z", resource_pattern="res/*", effect="deny",
+                    priority=3, created_at=T1)
+
+    response = client.get(PATH)
+
+    assert response.status_code == 200
+    assert response.json()["conflicts"] == [
+        {
+            "rule_ids": ["a", "z"],
+            "intersection": "res/a*",
+            "reason": "same_priority_opposite_effect",
+        }
+    ]
+    # Stable across repeated queries.
+    assert client.get(PATH).content == response.content
+
+
+def test_conflict_groups_are_list_ordered_by_emitted_ids(client):
+    # Two independent action groups; once each pair is ascending by its
+    # surfaced ids, the group whose smallest surfaced id is earlier lists
+    # first, regardless of which id was stored as a blob.
+    _insert_raw_row(client, b"b", action_type="read", resource_pattern="res/a*",
+                    effect="allow", priority=1)
+    _insert_raw_row(client, "za", action_type="read", resource_pattern="res/*",
+                    effect="deny", priority=1, created_at=T1)
+    _insert_raw_row(client, b"a", action_type="write", resource_pattern="w/a*",
+                    effect="allow", priority=1, created_at=T2)
+    _insert_raw_row(client, "zb", action_type="write", resource_pattern="w/*",
+                    effect="deny", priority=1, created_at=T3)
+
+    body = client.get(PATH).json()
+    assert [conflict["rule_ids"] for conflict in body["conflicts"]] == [
+        ["a", "zb"],
+        ["b", "za"],
+    ]
+
+
+def test_blob_id_override_direction_is_stable_regardless_of_side(client):
+    # A damaged id on the covering (smaller-priority) side keeps the correct
+    # direction: the surfaced blob id is the overriding rule, never reordered
+    # into the covered slot.
+    _insert_raw_row(client, b"a", resource_pattern="res/*", effect="allow",
+                    priority=1)
+    _insert_raw_row(client, "z", resource_pattern="res/a*", effect="deny",
+                    priority=5, created_at=T1)
+
+    body = client.get(PATH).json()
+    assert body["overrides"] == [
+        {
+            "overriding_rule_id": "a",
+            "overridden_rule_id": "z",
+            "intersection": "res/a*",
+            "reason": "lower_priority_overrides",
+        }
+    ]
+
+    # Mirror case: the string id covers the larger-priority blob id.
+    with client.app.state.engine.begin() as conn:
+        conn.execute(text("DELETE FROM policy_rules"))
+    _insert_raw_row(client, "a", resource_pattern="res/*", effect="allow",
+                    priority=1)
+    _insert_raw_row(client, b"z", resource_pattern="res/a*", effect="deny",
+                    priority=5, created_at=T1)
+
+    body = client.get(PATH).json()
+    assert body["overrides"] == [
+        {
+            "overriding_rule_id": "a",
+            "overridden_rule_id": "z",
+            "intersection": "res/a*",
+            "reason": "lower_priority_overrides",
+        }
+    ]
+
+
+def test_details_tie_break_by_surfaced_id_with_a_damaged_id(client):
+    # At the same created_at the detail order follows the surfaced ids, so a
+    # blob surfacing as "a" precedes a string id "z".
+    _insert_raw_row(client, b"a", resource_pattern="res/*", effect="allow",
+                    priority=1)
+    _insert_raw_row(client, "z", resource_pattern="res/a*", effect="deny",
+                    priority=1, created_at=T0)
+
+    body = client.get(PATH).json()
+    assert [rule["id"] for rule in body["rules"]] == ["a", "z"]
+
+
+def test_damaged_decision_field_with_damaged_id_is_200_not_500(client):
+    # Content corruption (a blob id together with a float priority) is a
+    # content anomaly: still a normal 200 analysis with the rule invalid, not
+    # a read-layer internal_error.
+    _insert_raw_row(client, b"broken", resource_pattern="res/a*",
+                    effect="deny", priority=2.5)
+
+    response = client.get(PATH)
+
+    assert response.status_code == 200
+    [rule] = response.json()["rules"]
+    assert rule["id"] == "broken"
+    assert rule["priority"] == "2.5"
+    assert rule["relation"] == "invalid"
+
+
+def test_analysis_is_identical_when_pair_direction_is_exchanged():
+    # Reversing the stored row order (the direction each pair is examined in)
+    # changes nothing: candidate conclusions, intersections, ids, and relation
+    # annotations are byte-identical, including when one id is a damaged blob.
+    def row(rule_id, pattern, effect, priority, created_at):
+        return {
+            "id": rule_id,
+            "action_type": "read",
+            "resource_pattern": pattern,
+            "effect": effect,
+            "priority": priority,
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+
+    rows = [
+        row("r1", "*a*b*a*", "allow", 1, T0),
+        row(b"r2", "*b*a*", "deny", 1, T1),
+        row("r3", "*b*a*b*", "deny", 4, T2),
+    ]
+    forward = json.dumps(
+        build_analysis([dict(r) for r in rows]),
+        ensure_ascii=False, allow_nan=False, sort_keys=True,
+    )
+    reverse = json.dumps(
+        build_analysis([dict(r) for r in reversed(rows)]),
+        ensure_ascii=False, allow_nan=False, sort_keys=True,
+    )
+    assert forward == reverse
+
+    # Exchanging which of the two equal-priority rules carries which pattern
+    # keeps the same pair, intersection, and relation on each identifier.
+    swapped = [dict(r) for r in rows]
+    swapped[0]["resource_pattern"], swapped[1]["resource_pattern"] = (
+        swapped[1]["resource_pattern"],
+        swapped[0]["resource_pattern"],
+    )
+    assert build_analysis(swapped)["conflicts"] == build_analysis(
+        [dict(r) for r in rows]
+    )["conflicts"]
 
 
 # --------------------------------------------------------------------------- #
