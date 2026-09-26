@@ -336,6 +336,10 @@ def test_intersecting_patterns(client, first, second, intersection):
         ("res/a", "res/ab"),
         ("a*x", "b*"),
         ("*x", "*y"),
+        # Reversed middle literal runs can never hold inside one resource.
+        ("*a*b*", "*b*a*"),
+        ("res/*x*y*/z", "res/*y*x*/z"),
+        ("*a*b*c*", "*c*a*b*"),
     ],
 )
 def test_non_intersecting_patterns(client, first, second):
@@ -347,6 +351,57 @@ def test_non_intersecting_patterns(client, first, second):
     body = client.get(PATH).json()
     assert body["conflicts"] == []
     assert body["overrides"] == []
+
+
+@pytest.mark.parametrize(
+    "first, second, intersection",
+    [
+        # Disjoint middle fragments merge into one satisfiable order.
+        ("*a*", "*b*", "*a*b*"),
+        # Shared fragments line up instead of being duplicated.
+        ("*a*x*", "*b*x*", "*a*b*x*"),
+        ("res/*mid*/x", "res/a/*mid*", "res/a/*mid*/x"),
+        # Empty fragments from adjacent stars pin nothing.
+        ("a**b", "a*c*b", "a*c*b"),
+        ("res/**/x", "res/a/*", "res/a/*/x"),
+        # A run already covering the other is the intersection itself.
+        ("*a*b*", "*a*c*b*", "*a*c*b*"),
+    ],
+)
+def test_multi_star_intersecting_patterns(client, first, second,
+                                          intersection):
+    insert_rule_row(client, rid(1), T0, priority=1, effect="allow",
+                    resource_pattern=first)
+    insert_rule_row(client, rid(2), T1, priority=1, effect="deny",
+                    resource_pattern=second)
+
+    [conflict] = client.get(PATH).json()["conflicts"]
+    assert conflict["intersection"] == intersection
+
+
+def test_intersection_does_not_depend_on_insertion_order(client):
+    # The same pair inserted in the opposite row order must report the same
+    # intersection glob.
+    insert_rule_row(client, rid(1), T0, priority=1, effect="allow",
+                    resource_pattern="*b*")
+    insert_rule_row(client, rid(2), T1, priority=1, effect="deny",
+                    resource_pattern="*a*")
+
+    [conflict] = client.get(PATH).json()["conflicts"]
+    assert conflict["intersection"] == "*a*b*"
+
+
+def test_reversed_middle_run_forms_no_override_either(client):
+    # Different priorities do not rescue a pair whose middle runs contradict.
+    insert_rule_row(client, rid(1), T0, priority=1, effect="allow",
+                    resource_pattern="*a*b*")
+    insert_rule_row(client, rid(2), T1, priority=2, effect="deny",
+                    resource_pattern="*b*a*")
+
+    body = client.get(PATH).json()
+    assert body["conflicts"] == []
+    assert body["overrides"] == []
+    assert {rule["relation"] for rule in body["rules"]} == {"unmatched"}
 
 
 # --------------------------------------------------------------------------- #

@@ -739,11 +739,20 @@ nor deleted — plus a `relation` annotation:
 
 Two valid rules become candidates only when their actions are equal and their
 resource patterns can match some common resource, under the existing pattern
-semantics (`*` matches any text, every other segment is literal). The
-intersecting scope is reported as a glob under the same semantics: the longer
-of the two prefix literals, both middle literal runs, and the longer of the
-two suffix literals joined by stars; an exact pattern's intersection with a
-matching glob is the exact pattern itself.
+semantics (`*` matches any text, every other segment is literal). A common
+resource exists exactly when the prefix literals are prefix-comparable (one
+starts with the other), the suffix literals are suffix-comparable, and the
+middle literal runs can hold inside one resource: each run pins the relative
+order of its distinct literal fragments, so runs demanding contradictory
+orders for the same fragments (such as `*a*b*` against `*b*a*`) never form a
+candidate and produce neither a conflict nor an override. The intersecting
+scope is reported as a glob under the same semantics: the longer of the two
+prefix literals, the merged middle literal runs, and the longer of the two
+suffix literals joined by stars. The merged run keeps every literal fragment
+of both patterns in an order both can satisfy and is canonical, so the
+reported intersection never depends on the order a pair is examined in; an
+exact pattern's intersection with a matching glob is the exact pattern
+itself.
 
 Each conflict entry is
 `{rule_ids, intersection, reason}` with the two rule ids sorted ascending and
