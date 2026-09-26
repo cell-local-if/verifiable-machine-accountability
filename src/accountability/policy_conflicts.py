@@ -20,7 +20,9 @@ Resource-pattern overlap uses the existing glob semantics (a ``*`` matches any
 text, every other segment is literal) via
 ``authorization.intersection_pattern``: two rules are candidates only when
 their patterns can both match some common resource, and the reported
-intersection is the glob describing exactly that shared scope.
+intersection is the glob describing exactly that shared scope. Middle literal
+runs that demand the same shared fragments in opposite orders cannot be
+satisfied by a single resource, so such pairs never become candidates.
 """
 
 from datetime import datetime, timezone

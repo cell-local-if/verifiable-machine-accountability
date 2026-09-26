@@ -43,6 +43,44 @@ def _split_glob(pattern: str) -> tuple[str, tuple[str, ...], str]:
     return parts[0], tuple(parts[1:-1]), parts[-1]
 
 
+def _middle_literals(pattern: str) -> list[str]:
+    """The non-empty literal fragments between a glob's first and last star.
+
+    Empty fragments (from leading, trailing, or consecutive stars) match
+    empty text, so they impose no literal boundary and drop out of the
+    ordering judgement.
+    """
+    return [part for part in pattern.split("*")[1:-1] if part]
+
+
+def _middles_order_compatible(first: str, second: str) -> bool:
+    """Whether two globs' middle literal runs can hold one shared order.
+
+    The literal fragments a pattern carries between its outer stars must
+    appear in that order in every matching resource. Two runs can be
+    satisfied by a single resource only when the fragments they share keep
+    one consistent relative order: whenever the same two fragments appear in
+    both runs, the run that demands them in the opposite order cannot be
+    reconciled with the other, so the patterns share no common match. A
+    fragment set that merely overlaps is not enough — the shared fragments
+    must appear in the same relative order in both runs.
+    """
+    first_middles = _middle_literals(first)
+    second_middles = _middle_literals(second)
+    shared = set(first_middles) & set(second_middles)
+    if len(shared) < 2:
+        return True
+
+    def shared_order(middles: list[str]) -> list[str]:
+        order: list[str] = []
+        for fragment in middles:
+            if fragment in shared and fragment not in order:
+                order.append(fragment)
+        return order
+
+    return shared_order(first_middles) == shared_order(second_middles)
+
+
 def patterns_intersect(first: str, second: str) -> bool:
     """Whether two resource patterns can both match some common resource.
 
@@ -53,8 +91,10 @@ def patterns_intersect(first: str, second: str) -> bool:
     equal and a literal intersects a glob only when the glob matches the
     literal. When both patterns carry a star, a common string exists exactly
     when their prefix literals are prefix-comparable (one starts with the
-    other) and their suffix literals are suffix-comparable: the middle literal
-    runs can always be laid out one after another inside one string.
+    other), their suffix literals are suffix-comparable, and their middle
+    literal runs keep every shared fragment in one consistent relative order:
+    runs demanding the same fragments in opposite orders cannot be laid out
+    inside one string.
     """
     if "*" not in first:
         if "*" not in second:
@@ -70,7 +110,11 @@ def patterns_intersect(first: str, second: str) -> bool:
     suffixes_compatible = first_suffix.endswith(second_suffix) or (
         second_suffix.endswith(first_suffix)
     )
-    return prefixes_compatible and suffixes_compatible
+    return (
+        prefixes_compatible
+        and suffixes_compatible
+        and _middles_order_compatible(first, second)
+    )
 
 
 def intersection_pattern(first: str, second: str) -> str | None:
@@ -80,9 +124,10 @@ def intersection_pattern(first: str, second: str) -> str | None:
     same test as ``patterns_intersect``). Otherwise the result is a glob under
     the existing ``*`` semantics whose every match is matched by both
     patterns: the longer of the two prefix literals, both middle literal runs
-    (the first pattern's then the second's), and the longer of the two suffix
-    literals, joined by stars. A literal pattern's intersection with a glob it
-    matches is the literal itself, so when one rule uses an exact resource its
+    (the first pattern's then the second's, keeping every simultaneously
+    satisfiable literal order), and the longer of the two suffix literals,
+    joined by stars. A literal pattern's intersection with a glob it matches
+    is the literal itself, so when one rule uses an exact resource its
     intersection with any overlapping pattern is that exact resource.
     """
     if "*" not in first:
@@ -102,6 +147,10 @@ def intersection_pattern(first: str, second: str) -> str | None:
         first_suffix.endswith(second_suffix)
         or second_suffix.endswith(first_suffix)
     ):
+        return None
+    # Middle literal runs that demand shared fragments in opposite orders
+    # cannot be kept in a single resource, so there is no common scope.
+    if not _middles_order_compatible(first, second):
         return None
     prefix = (
         first_prefix if len(first_prefix) >= len(second_prefix) else second_prefix
