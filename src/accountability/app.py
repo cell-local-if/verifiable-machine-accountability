@@ -3399,44 +3399,51 @@ def get_key_rotation_event_changes(
     restarts. A failure while reading the rotations returns 500
     ``internal_error`` with no partial page.
     """
-    # A failure while reading the rotations is an internal read-layer
-    # fault: answer 500 internal_error with no partial page. Damaged stored
-    # values are not a read failure — rows read successfully are ordered
-    # and emitted verbatim, with an unparseable stamp sorting last.
+    # Any failure while *reading* — the rotation rows, the ordering over
+    # them, the cursor position, or the machine lookup — is an internal
+    # read-layer fault: answer 500 internal_error with no partial page.
+    # Damaged stored values are not a read failure — rows read successfully
+    # are ordered and emitted verbatim, with an unparseable stamp sorting
+    # last — so the tolerant key function and cursor matching stay inside
+    # the guard but only a true read/order fault reaches the except branch.
     try:
         rows = session.scalars(
             select(KeyRotationEvent).where(
                 KeyRotationEvent.machine_id == machine_id
             )
         ).all()
+        ordered = sorted(
+            rows,
+            key=lambda record: (
+                _rotation_created_instant(record.created_at),
+                record.id,
+            ),
+        )
+
+        start = 0
+        if params.cursor is not None:
+            cursor_created_at, cursor_id = params.cursor.rsplit("|", 1)
+            # Exclusive keyset position. A cursor this endpoint issued always
+            # names a stored row, so locate it by its exact stored
+            # ``(created_at text, id)`` pair; a well-shaped cursor that no row
+            # of the path machine matches (deleted rotation, foreign position,
+            # drifted text) cannot be positioned and is rejected as a
+            # non-locatable cursor — a parameter error, reported before the
+            # machine lookup below. Matching on stored text keeps the
+            # unparseable-stamp tail pageable too.
+            positions = [
+                index
+                for index, record in enumerate(ordered)
+                if record.created_at == cursor_created_at and record.id == cursor_id
+            ]
+            if not positions:
+                return error_response(422, "invalid_cursor")
+            start = positions[0] + 1
+
+        machine = session.get(Machine, machine_id)
     except Exception:
         return error_response(500, "internal_error")
-    ordered = sorted(
-        rows,
-        key=lambda record: (_rotation_created_instant(record.created_at), record.id),
-    )
 
-    start = 0
-    if params.cursor is not None:
-        cursor_created_at, cursor_id = params.cursor.rsplit("|", 1)
-        # Exclusive keyset position. A cursor this endpoint issued always
-        # names a stored row, so locate it by its exact stored
-        # ``(created_at text, id)`` pair; a well-shaped cursor that no row
-        # of the path machine matches (deleted rotation, foreign position,
-        # drifted text) cannot be positioned and is rejected as a
-        # non-locatable cursor — a parameter error, reported before the
-        # machine lookup below. Matching on stored text keeps the
-        # unparseable-stamp tail pageable too.
-        positions = [
-            index
-            for index, record in enumerate(ordered)
-            if record.created_at == cursor_created_at and record.id == cursor_id
-        ]
-        if not positions:
-            return error_response(422, "invalid_cursor")
-        start = positions[0] + 1
-
-    machine = session.get(Machine, machine_id)
     if machine is None:
         return error_response(404, "not_found")
 

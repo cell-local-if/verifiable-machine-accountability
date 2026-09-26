@@ -372,6 +372,19 @@ def test_read_failure_is_500_with_no_partial_page(client, machine_id):
     assert b"records" not in response.content
 
 
+def test_machine_lookup_failure_is_500_with_no_partial_page(client, machine_id):
+    # The machine lookup happens after the records are read; a failure there
+    # is still a read-layer fault reported with the internal_error envelope,
+    # never the framework default body and never a partial page.
+    insert_rotation(client, machine_id, 1, T0)
+    with client.app.state.engine.begin() as conn:
+        conn.execute(text("DROP TABLE machines"))
+    response = client.get(changes_url(machine_id, limit=10))
+    assert response.status_code == 500
+    assert response.json() == {"error": {"code": "internal_error"}}
+    assert b"records" not in response.content
+
+
 # --------------------------------------------------------------------------- #
 # Envelope shape, ordering, paging
 # --------------------------------------------------------------------------- #
