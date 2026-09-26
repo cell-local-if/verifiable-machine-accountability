@@ -667,6 +667,161 @@ def test_damaged_record_does_not_crash_and_is_not_rewritten(client):
 
 
 # --------------------------------------------------------------------------- #
+# Repeated literal fragments (regression: legal pairs must never 500)
+# --------------------------------------------------------------------------- #
+
+
+def test_legal_repeated_literal_pair_created_normally_returns_conflict(client):
+    # The headline regression: a legal rule pair whose literal fragment
+    # repeats is created through the public entry point and analyzed as a
+    # normal 200 conflict, never a 500 internal_error. Every repeated
+    # occurrence advances the fragment sequence on its own.
+    first = create_rule(client, resource_pattern="*a*b*a*", effect="allow",
+                        priority=1)
+    second = create_rule(client, resource_pattern="*b*a*", effect="deny",
+                         priority=1)
+    assert first.status_code == 201
+    assert second.status_code == 201
+
+    response = client.get(PATH)
+
+    assert response.status_code == 200
+    pair = sorted((first.json()["id"], second.json()["id"]))
+    assert response.json()["conflicts"] == [
+        {
+            "rule_ids": pair,
+            "intersection": "*a*b*a*",
+            "reason": "same_priority_opposite_effect",
+        }
+    ]
+
+
+def test_legal_repeated_literal_override_pair_returns_200(client):
+    # A repeated-fragment pair at different priorities is likewise a normal
+    # 200 override analysis, keeping every occurrence in the intersection.
+    first = create_rule(client, resource_pattern="*a*b*a*", effect="allow",
+                        priority=1)
+    second = create_rule(client, resource_pattern="*b*a*", effect="deny",
+                         priority=4)
+
+    response = client.get(PATH)
+
+    assert response.status_code == 200
+    assert response.json()["overrides"] == [
+        {
+            "overriding_rule_id": first.json()["id"],
+            "overridden_rule_id": second.json()["id"],
+            "intersection": "*a*b*a*",
+            "reason": "lower_priority_overrides",
+        }
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Damaged identifiers on otherwise valid, pairing rules
+# --------------------------------------------------------------------------- #
+
+
+def _insert_raw_row(client, rule_id, *, action_type="read",
+                    resource_pattern="res/*", effect="allow", priority=1,
+                    created_at=T0):
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO policy_rules "
+                "(id, action_type, resource_pattern, effect, priority, "
+                "created_at, updated_at) "
+                "VALUES (:id, :action_type, :resource_pattern, :effect, "
+                ":priority, :created_at, :updated_at)"
+            ),
+            {
+                "id": rule_id,
+                "action_type": action_type,
+                "resource_pattern": resource_pattern,
+                "effect": effect,
+                "priority": priority,
+                "created_at": created_at,
+                "updated_at": created_at,
+            },
+        )
+
+
+def test_blob_id_on_conflicting_rule_is_surfaced_with_200(client):
+    # A matchable rule whose id is stored as a blob is damaged business
+    # content, not a read failure: pairing it must still yield a normal 200
+    # analysis with the id surfaced in both the detail and the conflict pair.
+    _insert_raw_row(client, b"damaged-id", resource_pattern="res/a*",
+                    effect="allow", priority=3)
+    insert_rule_row(client, rid(2), T1, priority=3, effect="deny",
+                    resource_pattern="res/*")
+
+    response = client.get(PATH)
+
+    assert response.status_code == 200
+    body = response.json()
+    # Ordering keys on the raw stored id: the string UUID precedes the
+    # non-string blob even though the blob's surfaced text would sort first.
+    assert body["conflicts"] == [
+        {
+            "rule_ids": [rid(2), "damaged-id"],
+            "intersection": "res/a*",
+            "reason": "same_priority_opposite_effect",
+        }
+    ]
+    by_id = {rule["id"]: rule for rule in body["rules"]}
+    assert by_id["damaged-id"]["relation"] == "conflict"
+    assert by_id[rid(2)]["relation"] == "conflict"
+    # A repeat query is byte-identical.
+    assert client.get(PATH).content == response.content
+
+
+def test_blob_id_override_direction_is_surfaced_with_200(client):
+    # The covered side carries the damaged id; the override direction and
+    # intersection are still reported normally.
+    insert_rule_row(client, rid(1), T0, priority=1, effect="allow",
+                    resource_pattern="res/*")
+    _insert_raw_row(client, b"damaged-id", resource_pattern="res/a*",
+                    effect="deny", priority=4, created_at=T1)
+
+    response = client.get(PATH)
+
+    assert response.status_code == 200
+    assert response.json()["overrides"] == [
+        {
+            "overriding_rule_id": rid(1),
+            "overridden_rule_id": "damaged-id",
+            "intersection": "res/a*",
+            "reason": "lower_priority_overrides",
+        }
+    ]
+    by_id = {rule["id"]: rule for rule in response.json()["rules"]}
+    assert by_id["damaged-id"]["relation"] == "override"
+
+
+def test_non_utf8_blob_id_never_breaks_the_analysis(client):
+    # An undecodable blob id is surfaced with replacement characters in the
+    # details and the pair arrays instead of crashing the read-only query.
+    _insert_raw_row(client, b"\xff\xfe", resource_pattern="res/a*",
+                    effect="allow", priority=2)
+    insert_rule_row(client, rid(2), T1, priority=2, effect="deny",
+                    resource_pattern="res/*")
+
+    response = client.get(PATH)
+
+    assert response.status_code == 200
+    body = response.json()
+    damaged = "��"
+    assert body["conflicts"] == [
+        {
+            "rule_ids": [rid(2), damaged],
+            "intersection": "res/a*",
+            "reason": "same_priority_opposite_effect",
+        }
+    ]
+    assert {rule["id"] for rule in body["rules"]} == {damaged, rid(2)}
+
+
+# --------------------------------------------------------------------------- #
 # Serialization, failures, read-only behavior, persistence
 # --------------------------------------------------------------------------- #
 

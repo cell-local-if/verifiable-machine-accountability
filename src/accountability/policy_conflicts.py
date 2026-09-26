@@ -158,12 +158,19 @@ def build_analysis(stored_rules: list[dict[str, Any]]) -> dict[str, Any]:
             if intersection is None:
                 continue
             first_id, second_id = first["id"], second["id"]
+            # Ordering and membership always key on the raw stored id; only the
+            # emitted pair ids are surfaced through the same value conversion
+            # the details use, so a matchable rule whose id itself is damaged
+            # (for example a stored blob) still produces a normal 200 analysis
+            # instead of crashing response serialization.
             left_id, right_id = sorted((first_id, second_id), key=_sort_id)
+            safe_left = _json_safe_stored_value(left_id)
+            safe_right = _json_safe_stored_value(right_id)
             if first["priority"] == second["priority"]:
                 if first["effect"] != second["effect"]:
                     conflicts.append(
                         {
-                            "rule_ids": [left_id, right_id],
+                            "rule_ids": [safe_left, safe_right],
                             "intersection": intersection,
                             "reason": _CONFLICT_REASON,
                         }
@@ -178,8 +185,12 @@ def build_analysis(stored_rules: list[dict[str, Any]]) -> dict[str, Any]:
                     covering, covered = second, first
                 overrides.append(
                     {
-                        "overriding_rule_id": covering["id"],
-                        "overridden_rule_id": covered["id"],
+                        "overriding_rule_id": _json_safe_stored_value(
+                            covering["id"]
+                        ),
+                        "overridden_rule_id": _json_safe_stored_value(
+                            covered["id"]
+                        ),
                         "intersection": intersection,
                         "reason": _OVERRIDE_REASON,
                     }
