@@ -44,6 +44,7 @@ from . import (
     status_event_chain,
 )
 from .db import (
+    AuthorizationDecisionBasis,
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
     AuthorizationDecisionEvidence,
@@ -7558,6 +7559,87 @@ def get_authorization_decision_event_accountability_trace(
         + "\n"
     )
     return Response(content=body, media_type="application/json")
+
+
+# --- read-only decision-basis snapshot for one authorization event ---------
+
+
+def validate_decision_basis_params(request: Request) -> None:
+    """Validate the decision-basis request before any business read.
+
+    The basis is keyed on the path machine and the path authorization event
+    alone: no query parameters, no repeated parameters, no business filter,
+    and no request body. Any query-string content or a carried body is a 422
+    ``invalid_query``. The check runs as a dependency before the handler reads
+    the machine, the event, or the snapshot, so a malformed request against a
+    non-existent machine still reports 422 and never touches a record.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+    # A body on a GET is rejected in the validation phase, before any machine,
+    # event, or snapshot is read. A present non-zero Content-Length, or a
+    # chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/"
+    "decision-basis"
+)
+def get_authorization_decision_event_decision_basis(
+    machine_id: str,
+    event_id: str,
+    _: Annotated[None, Depends(validate_decision_basis_params)],
+    session: SessionDep,
+):
+    """Read-only immutable decision-basis snapshot for one decision event.
+
+    The real entry point is the ``decision-basis`` sub-entry under the
+    machine authorization decision event path; only ``GET`` is routed, so
+    ``HEAD`` and every other method return ``405`` without reading the
+    snapshot, recomputing a decision, or writing anything. The caller submits
+    only the path machine id and the path event id — no query parameters, no
+    repeated parameters, no request body, and no business filter; any query
+    string or carried body is a 422 ``invalid_query`` raised during validation
+    before the machine, the event, or the snapshot is read, so a malformed
+    request against a non-existent machine still reports 422. A missing
+    machine, a missing event, or an event owned by another machine is a 404
+    ``not_found`` with no basis data. An event written before snapshots existed
+    has no recorded basis: it reports 404 ``snapshot_not_found`` rather than
+    fabricating the basis from current data. A real failure while reading the
+    event or the snapshot is a 500 ``internal_error`` carrying neither
+    summary nor basis groups.
+
+    On success the body is the exact compact UTF-8 JSON document frozen with
+    the event — fixed five-group order ``event_summary``, ``status_basis``,
+    ``declaration_basis``, ``policy_candidates``, ``decision``, every
+    collection present even when empty — terminated by a single newline. The
+    document is never recomputed: the same event returns the document
+    byte-for-byte on every call and across application restarts, and it is
+    strictly isolated to the path machine.
+    """
+    try:
+        event = get_machine_event(session, machine_id, event_id)
+        if event is None:
+            return error_response(404, "not_found")
+        basis = session.get(AuthorizationDecisionBasis, event_id)
+    except Exception:
+        # A true read-layer fault answers 500 with no summary and no basis,
+        # never a partial document.
+        return error_response(500, "internal_error")
+
+    if basis is None or basis.machine_id != machine_id:
+        # Pre-snapshot history is never reconstructed from current data: the
+        # basis existed only when it was committed with the event.
+        return error_response(404, "snapshot_not_found")
+
+    return Response(
+        content=basis.basis_json + "\n", media_type="application/json"
+    )
 
 
 # --- read-only joint-write transaction diagnostics -------------------------

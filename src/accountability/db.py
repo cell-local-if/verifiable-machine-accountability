@@ -124,6 +124,38 @@ class AuthorizationDecisionEvent(Base):
     chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class AuthorizationDecisionBasis(Base):
+    """Immutable decision-basis snapshot captured with one decision event.
+
+    A row is inserted in the same locked write transaction that appends its
+    authorization decision event, so the event and its basis either commit
+    together or leave no trace. Rows are append-only: they are never updated,
+    deleted, or recomputed afterwards, so a later suspension, declaration
+    change, or policy-rule change never rewrites the recorded basis. Events
+    written before the feature simply have no row; their decision-basis query
+    reports ``snapshot_not_found`` rather than fabricating a basis from
+    current data.
+
+    Only visible business fields are frozen (machine status, the declaration
+    and rule records' visible columns and their decision relations, the event
+    result and reason, and the capture moment) — never key material or policy
+    rawtext beyond the rule's visible fields. ``basis_json`` stores the exact
+    compact UTF-8 JSON document the query serves (without its terminating
+    newline), so repeat queries are byte-identical.
+    """
+
+    __tablename__ = "authorization_decision_basis"
+
+    event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        primary_key=True,
+    )
+    machine_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    captured_at: Mapped[str] = mapped_column(String, nullable=False)
+    basis_json: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class AuthorizationDecisionEvidence(Base):
     __tablename__ = "authorization_decision_evidence"
     __table_args__ = (

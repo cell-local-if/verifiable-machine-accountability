@@ -32,7 +32,7 @@ from sqlalchemy import Connection, Engine, func, inspect, select, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from . import diagnostics
-from .db import AuthorizationDecisionEvent, Machine
+from .db import AuthorizationDecisionBasis, AuthorizationDecisionEvent, Machine
 
 _HASH_LEN = 64
 _MAX_LOCK_ATTEMPTS = 20
@@ -653,12 +653,14 @@ def append_decision_event(
     attempt records exactly one joint-write diagnostic via
     :func:`run_joint_write`.
     """
-    from . import authorization
+    from . import authorization, decision_basis
 
     def _work(conn: Connection) -> dict[str, Any]:
         status = authorization.machine_status(conn, machine_id)
         if status is None:
             raise JointWriteOutcome({"status": "not_found"})
+        # The decision uses the single shared entry point on this same locked
+        # connection, so its result is what the event commits.
         allowed, reason = authorization.decide(
             conn,
             machine_id,
@@ -673,6 +675,31 @@ def append_decision_event(
             resource=resource,
             allowed=allowed,
             reason=reason,
+        )
+        # Freeze the decision inputs this same locked transaction used (a
+        # suspended machine reads neither declarations nor rules) and classify
+        # the policy candidates. The recorded decision is the committed
+        # allowed/reason above, never a separately recomputed value. The basis
+        # snapshot joins the same locked write as the event: the snapshot row
+        # and the event row commit together or leave no trace at all, and it
+        # is rendered once here and never recomputed afterwards.
+        basis = decision_basis.capture(
+            conn,
+            machine_id=machine_id,
+            status=status,
+            action_type=action_type,
+            resource=resource,
+            allowed=allowed,
+            reason=reason,
+        )
+        basis_document = decision_basis.build_document(event, basis)
+        conn.execute(
+            AuthorizationDecisionBasis.__table__.insert().values(
+                event_id=event["id"],
+                machine_id=machine_id,
+                captured_at=basis["captured_at"],
+                basis_json=basis_document,
+            )
         )
         # Capture the attempt's own terminal snapshot inside the lock for
         # its diagnostic: the status the decision used, the new event's chain

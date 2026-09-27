@@ -1717,6 +1717,90 @@ body is compact UTF-8 JSON in a fixed field order terminated by a single
 newline, free of floating-point, `-0.0`, or non-finite values, and
 byte-identical on repeat calls and across application restarts.
 
+## Immutable authorization decision-basis snapshots
+
+Each new authorization decision event freezes the exact basis the decision
+was reached on, closing the accountability gap between the committed result
+(`allowed`/`reason`) and the inputs that produced it. The snapshot is saved
+through the existing `POST
+/machines/{machine_id}/authorization-decision-events` write path only — no new
+business write entry bypasses the event chain. The machine/status lookup, the
+declaration and policy reads, the event append, and the snapshot insert all run
+inside the same locked write transaction (the same joint write serialized
+against status changes), so the event and its snapshot commit together or
+leave no trace, and concurrent creates and status changes keep their existing
+definite serial order.
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/decision-basis`
+is a separate, strictly read-only audit sub-entry: it never recomputes a
+decision, never writes, and changes neither event creation, the event list,
+the hash chain, the evidence chain, incident responsibility, privacy exports,
+diagnostics, nor the health check. The caller submits only the path machine id
+and the path event id:
+
+- any query parameter (including a repeated parameter), or a body carried on
+  the GET, returns `422 {"error":{"code":"invalid_query"}}` during validation,
+  before the machine, event, or snapshot is read (so the same malformed query
+  against a non-existent machine is still `422`);
+- only `GET` is routed — `HEAD` and every other method return `405` without
+  reading the snapshot, recomputing a decision, or triggering any write;
+- a missing machine, a missing event, or an event owned by another machine
+  returns `404 {"error":{"code":"not_found"}}` with no basis data;
+- an event written before snapshots existed has no recorded basis and returns
+  `404 {"error":{"code":"snapshot_not_found"}}`; the basis is never
+  reconstructed from current declarations, rules, or status;
+- a real failure reading the event or the snapshot returns
+  `500 {"error":{"code":"internal_error"}}` with no summary and no partial
+  basis.
+
+A successful response is exactly five groups in this fixed order:
+`event_summary`, `status_basis`, `declaration_basis`, `policy_candidates`,
+`decision`. Every collection is present even when empty.
+
+- `event_summary` is one object carrying the event's `id`, `machine_id`,
+  `action_type`, `resource`, committed result (`allowed`, `reason`),
+  `created_at`, and the snapshot `captured_at` — the UTC RFC 3339 moment
+  (ending in `Z`) the basis was collected inside the decision transaction.
+- `status_basis` carries `machine_id`, the machine `status` at that moment
+  (`active`/`suspended`), and `declarations_read`/`policies_read`. A suspended
+  machine is decided without either read, so its snapshot records both as
+  `false` with empty declaration and candidate collections; an active machine
+  records `declarations_read: true`, and `policies_read` is `false` exactly
+  when the declaration gate short-circuited the decision
+  (`no_enabled_declaration`), mirroring the read order of the actual decision.
+- `declaration_basis` lists, for an active machine, the enabled behavior
+  declarations that participated in the action/resource scope check (disabled
+  declarations never participate): each entry's seven visible fields `{id,
+  machine_id, action_type, resource_pattern, enabled, created_at,
+  updated_at}` exactly as stored, plus `matched` (whether its stored scope
+  matched the requested resource). Ordered by the actual UTC instant of
+  `created_at`, then by id.
+- `policy_candidates` lists the global rules read for the requested action in
+  that decision, each with its seven visible fields `{id, action_type,
+  resource_pattern, effect, priority, created_at, updated_at}` exactly as
+  stored plus a `relation` under the existing priority semantics: `winner` (a
+  decisive minimum-priority matching rule when the decisive tier has one
+  effect), `conflict` (a decisive minimum-priority rule when that tier mixes
+  allows and denies — the tier is then decided as a denial), `overridden` (a
+  matching rule at a larger numeric priority than the decisive minimum), and
+  `not_adopted` (a read rule whose stored scope did not match the requested
+  resource). Candidates order by priority ascending, then the actual UTC
+  instant of `created_at`, then by id.
+- `decision` is `{allowed, reason}` and is always identical to the result
+  committed on the event (`machine_suspended`, `no_enabled_declaration`,
+  `no_matching_policy`, `denied_by_policy`, or `allowed_by_policy`).
+
+The snapshot keeps only visible business fields — never keys, secrets, or
+policy rawtext beyond the rules' visible fields. The document is rendered once
+when the event commits and stored verbatim: the body is compact UTF-8 JSON in
+fixed field order terminated by a single newline, free of floating-point,
+`-0.0`, or non-finite values; the same event returns the document byte-for-byte
+on every repeat query and across application restarts, strictly isolated to
+the path machine. On startup the snapshot table is created safely on databases
+that predate it (`CREATE TABLE IF NOT EXISTS`); pre-existing events keep
+returning `snapshot_not_found`, an empty database can create events and query
+their bases, and every existing endpoint response stays compatible.
+
 ## Read-only desensitized privacy responsibility export
 
 `GET /machines/{machine_id}/authorization-decision-events/privacy-responsibility/compliance-export`
