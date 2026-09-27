@@ -128,6 +128,66 @@ create events and query their bases, and the event list, hash chain, evidence
 chain, incident responsibility, privacy exports, diagnostics, and the health
 check are unchanged.
 
+### Independent read-only consistency audit
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/decision-basis/integrity`
+is the independent verification sub-entry under the snapshot path: it does not
+re-emit the snapshot, it checks it, read-only, against the committed event. It
+accepts only the path machine id and event id — any query parameter, a repeated
+parameter, or a request body is
+`422 {"error":{"code":"invalid_query"}}`, validated before the machine, event,
+or snapshot is read (the same malformed request against a non-existent machine
+is still `422`). After validation a missing machine, a missing event, or an
+event owned by another machine returns
+`404 {"error":{"code":"not_found"}}` with no audit conclusion. Only `GET` is
+routed; `HEAD` and every other method return `405` without reading or writing.
+A real failure while reading the event, snapshot, declarations, or rules
+returns `500 {"error":{"code":"internal_error"}}` with no conclusion and no
+partial result.
+
+A successful response carries exactly four conclusions in this fixed order:
+
+- `valid` — `true` only when the event summary, status basis, declaration
+  basis, policy candidates, and final decision all agree with one another and
+  with the committed event;
+- `checked_count` — `0` when the event has no snapshot row and `1` when the one
+  snapshot row exists (even if that snapshot is damaged). Another machine's
+  snapshot is never counted, and there is at most one snapshot per event;
+- `broken_basis_id` — the path event id whenever the conclusion is false,
+  `null` on success;
+- `reason` — `null` on success; the fixed `snapshot_not_found` for a missing
+  row; otherwise the stable category of the first anomaly found.
+
+The checks verify, in a fixed order: the document parses to the five expected
+groups with sound field types and ordering; the event summary corresponds
+verbatim to the event's committed `allowed` result, `reason`, capture moment
+(`created_at`), and chain fields (`previous_event_id`, `content_hash`,
+`chain_hash`) — nothing is recomputed or filled in; a suspended machine's
+basis explicitly records that declarations and policy were not read, while an
+active machine's read flags match its status and the declaration gate; the
+declaration basis names exactly the enabled declarations that participated in
+that action and resource judgement (a missing, disabled, other-action, or
+superfluous record is an inconsistency, and each `matched` scope flag must be
+correct); the policy candidates' winner/overridden/conflict/unmatched (and
+invalid) relations, winner group, conflict pairs, and priority-first ordering
+must follow the priorities as of the event and support the final judgement; and
+the final decision equals the event's committed `allowed` flag and `reason`.
+Relations are audited against the rules and declarations that already existed
+when the event committed, so later declarations or rules never retroactively
+break a faithful historical snapshot; the audit never recomputes or repairs a
+record and never fabricates a missing basis. An event without a snapshot row
+answers `valid false`, `checked_count 0`, `broken_basis_id` equal to the event
+id, and `reason "snapshot_not_found"`. A damaged, anomalously ordered, or
+self-contradictory snapshot answers `valid false`, `checked_count 1`, the event
+id, and the stable first-anomaly category. The conclusion is compact UTF-8 JSON
+in fixed field order terminated by one newline, with no floating-point or
+non-finite value, so identical stored data audits byte-for-byte identically,
+the result persists across restarts, and machine isolation is enforced. Event
+creation, the event list, the hash chain, evidence chain, incident
+responsibility, privacy exports, diagnostics, and health-check semantics are
+unchanged.
+
+
 ## Machine suspension and reactivation
 
 A machine is persistently either `active` (the status assigned at creation) or

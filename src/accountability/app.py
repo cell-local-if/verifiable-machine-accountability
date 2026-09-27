@@ -32,6 +32,7 @@ from . import (
     authorization,
     chain,
     decision_basis,
+    decision_basis_integrity,
     declaration_integrity,
     diagnostics,
     evidence_chain,
@@ -7662,6 +7663,84 @@ def get_authorization_decision_event_decision_basis(
         content=document + "\n",
         media_type="application/json",
     )
+
+
+# --- read-only consistency audit of one decision-basis snapshot -------------
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/"
+    "decision-basis/integrity"
+)
+def get_authorization_decision_event_decision_basis_integrity(
+    machine_id: str,
+    event_id: str,
+    _: Annotated[None, Depends(validate_decision_basis_params)],
+    session: SessionDep,
+):
+    """Read-only consistency audit of one decision event's basis snapshot.
+
+    The real entry point is the ``integrity`` sub-entry under the machine
+    authorization decision event ``decision-basis`` path; only ``GET`` is
+    routed, so ``HEAD`` and every other method return ``405`` without reading
+    or writing anything. The caller submits only the path machine id and
+    path event id — no query parameters, repeated parameters, request body,
+    or business filter; any query string or carried body is a 422
+    ``invalid_query`` raised by the shared validation dependency before the
+    machine, event, or snapshot is read, so the same malformed request
+    against a non-existent machine is still 422. A missing machine, a
+    missing event, or an event owned by another machine is a 404
+    ``not_found`` carrying no audit conclusion.
+
+    On success the response carries exactly four conclusions in this fixed
+    order: ``valid`` (true only when the event summary, status basis,
+    declaration basis, policy candidates, and final decision all agree),
+    ``checked_count`` (``0`` for an event with no snapshot, ``1`` when the
+    one snapshot row exists even if damaged; another machine's snapshot is
+    never counted), ``broken_basis_id`` (the path event id for a false
+    conclusion, ``null`` on success), and ``reason`` (``null`` on success,
+    the fixed ``snapshot_not_found`` for a missing row, otherwise the stable
+    first-anomaly category). The event summary is compared verbatim with
+    the committed result, reason, capture moment, and chain fields; a
+    suspended machine's basis must record that declarations and policy were
+    not read; the declaration basis may name only the participating enabled
+    declarations; candidate winner/overridden/conflict/unmatched relations
+    and the conflict group must follow the priority as of the event and
+    support the committed decision. The audit never recomputes or repairs a
+    record and never fabricates a missing basis.
+
+    The check is strictly read-only and machine isolated; the conclusion is
+    serialized as compact UTF-8 JSON in fixed field order terminated by a
+    single newline, with no floating-point or non-finite value, so repeated
+    queries against the same stored rows are byte-for-byte identical and the
+    audit reads persistent snapshots across restarts. A real failure while
+    reading the event, snapshot, declarations, or rules is a 500
+    ``internal_error`` carrying no conclusion and no partial result.
+    """
+    # Ownership and existence are ordinary 404 outcomes; every real read
+    # failure below (event, snapshot, declarations, rules) is a read-layer
+    # fault answered 500 with none of the four conclusions. Damaged snapshot
+    # *content* never raises — verify reports it as a false conclusion.
+    try:
+        event = get_machine_event(session, machine_id, event_id)
+        if event is None:
+            return error_response(404, "not_found")
+        document = decision_basis.load_document(
+            session, machine_id=machine_id, event_id=event_id
+        )
+        conclusion = decision_basis_integrity.verify(
+            session, machine_id=machine_id, event=event, document=document
+        )
+    except Exception:
+        return error_response(500, "internal_error")
+
+    body = (
+        json.dumps(
+            conclusion, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 # --- read-only joint-write transaction diagnostics -------------------------
