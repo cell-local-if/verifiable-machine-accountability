@@ -771,6 +771,58 @@ machine, ignores links whose target event no longer exists, terminates even
 when links form a cycle, and returns an empty array when nothing is
 reachable. The query never writes or modifies any record.
 
+## Read-only single-event accountability trace
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/accountability-trace`
+is the read-only, single-event closed-loop trace under the existing machine
+authorization event path. It adds a new query only; event registration,
+listing, the hash chain, exports, incident handling, responsibility
+assignment, and the health check are unchanged and no new write entry is
+added. The caller submits only the path machine id and event id — no query
+parameters, no repeated parameters, no request body, and no business filters:
+
+- any query parameter, a repeated parameter, or a body carried on the GET
+  returns `422 {"error":{"code":"invalid_query"}}`, and this validation runs
+  before any business record is read (so an invalid query against a missing
+  machine is still `422`);
+- a missing machine, a missing event, or an event owned by another machine
+  returns `404 {"error":{"code":"not_found"}}` carrying no closed-loop data;
+- `HEAD` and every non-GET method returns `405` without reading records,
+  computing a trace, or writing;
+- a real failure while reading the machine or any record group returns
+  `500 {"error":{"code":"internal_error"}}` with neither the event summary
+  nor any association array in the body.
+
+A successful response has exactly six groups in this fixed name and order:
+`event_summary`, `evidence`, `incidents`, `status_history`,
+`responsibility_assignments`, `causal_links`. `event_summary` is always a
+single object (never an array) holding the selected event's result
+(`allowed`), `reason`, creation moment (`created_at`), and the event's chain
+fields (`previous_event_id`, `content_hash`, `chain_hash`) exactly as stored.
+The other five groups are always arrays, empty when they contain no records:
+
+- `evidence`, `incidents`, `status_history`, and
+  `responsibility_assignments` contain the records whose own stored machine
+  ownership names the path machine and whose own stored event association
+  names the selected event; a damaged or missing parent (incident or event)
+  never filters a child record out;
+- `causal_links` contains the path machine's links whose either endpoint
+  (`cause_event_id` or `effect_event_id`) names the selected event; the other
+  endpoint is kept verbatim even when it names a missing or foreign event;
+- every associated record is output with its complete stored fields in a
+  stable field order. Damaged, duplicated, or dangling content is never
+  repaired, recomputed, normalized, deduplicated, or dropped.
+
+Each array is ordered by the actual UTC instant of the record's own
+`created_at` and then by id ascending (an exact-second record precedes any
+fractional-second record of the same second); a stored `created_at` that no
+longer parses is kept verbatim and sorts after every parseable instant rather
+than crashing. The query is strictly read-only and machine isolated — another
+machine's records never enter any group, empty groups are retained, and
+repeated calls against unchanged data are byte-identical, including across
+restarts. The body is compact UTF-8 JSON terminated by a single newline, with
+stable field order and no floating-point, `-0.0`, or non-finite value.
+
 ## Read-only global policy rule listing
 
 `GET /policy-rules` returns every global policy rule, or `[]` when none exist.
@@ -1965,7 +2017,14 @@ machine — so the original machine still counts the record in
 corrupted ownership column now names never gains it; and when neither
 evidence survives, the stored ownership column is trusted, so a record whose
 ownership column is intact but whose other business fields are damaged stays
-in its stored machine's total.
+in its stored machine's total. This attribution stays correct when stored
+identifiers are duplicated (a predecessor pointer that textually matches
+rows of two machines is resolved by the evidence on the other side and,
+failing that, by immediate chain-order adjacency) and under conflicting
+chain links (a row's own predecessor edge is preferred over a cross-machine
+reverse pointer, which is itself damage flagged on the pointer's record); a
+relabeled record still reports `bad_ownership` and later records continue to
+be listed, while another machine's data never enters the result.
 
 Each record is exactly `{id, position, previous_access_id, content_hash,
 chain_hash, errors}`: the actual stored record id, its position, its stored

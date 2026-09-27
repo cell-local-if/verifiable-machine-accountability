@@ -857,6 +857,173 @@ def test_damaged_values_never_crash_and_are_emitted_verbatim(
         assert record[column] is None
 
 
+# --------------------------------------------------------------------------- #
+# Attribution under duplicated identifiers and conflicting chain links
+# --------------------------------------------------------------------------- #
+
+
+def recreate_accesses_without_constraints(client):
+    """Recreate ``privacy_accesses`` without the primary key/unique constraint.
+
+    Stored damage can include duplicated identifiers, which the declared
+    primary key forbids; the diagnostic scan reads a table that could have
+    lost its constraints, so tests model that storage directly. Existing
+    rows are copied verbatim (chain columns included).
+    """
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE privacy_accesses RENAME TO privacy_accesses_backup"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE privacy_accesses ("
+                "id VARCHAR, machine_id VARCHAR, accessed_at VARCHAR, "
+                "window_start VARCHAR, window_end VARCHAR, result VARCHAR, "
+                "matches_count INTEGER, previous_access_id VARCHAR, "
+                "content_hash VARCHAR, chain_hash VARCHAR)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO privacy_accesses SELECT * FROM privacy_accesses_backup"
+            )
+        )
+
+
+def insert_access_row(client, values):
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO privacy_accesses (id, machine_id, accessed_at, "
+                "window_start, window_end, result, matches_count, "
+                "previous_access_id, content_hash, chain_hash) VALUES "
+                "(:id, :m, :a, :ws, :we, :r, :c, :p, :ch, :lh)"
+            ),
+            values,
+        )
+
+
+def test_duplicated_identifier_still_attributes_record_to_original_machine(
+    client, tmp_path
+):
+    # The damaged row's predecessor pointer textually matches two stored
+    # records carrying the same identifier (one per machine). The original
+    # machine must keep the record in its total with bad_ownership, list the
+    # records after it, and the named machine must never gain it.
+    machine_id = create_machine(client)
+    first = register(client, machine_id, accessed_at=T0)
+    damaged = register(client, machine_id, accessed_at=T1)
+    other = create_machine(client, "machine-2")
+    register(client, other, accessed_at=T2)
+
+    recreate_accesses_without_constraints(client)
+
+    # A second stored row carrying the same id as machine one's first record,
+    # but minted for machine two (digest verifies under machine two), and
+    # positioned after the damaged row in global chain order.
+    dup_id = first["id"]
+    dup_values = {
+        "id": dup_id,
+        "m": other,
+        "a": T3,
+        "ws": T1,
+        "we": T2,
+        "r": "success",
+        "c": 1,
+        "p": None,
+        "ch": None,
+        "lh": None,
+    }
+    dup_values["ch"] = canonical_content_hash(
+        {
+            "id": dup_id,
+            "machine_id": other,
+            "accessed_at": T3,
+            "window_start": T1,
+            "window_end": T2,
+            "result": "success",
+            "matches_count": 1,
+        }
+    )
+    insert_access_row(client, dup_values)
+
+    # Doubly damage machine one's row: ownership overwritten to machine two
+    # and a business field changed so the digest cannot prove either owner.
+    db = tmp_path / "test.db"
+    tamper(db, "UPDATE privacy_accesses SET machine_id = ? WHERE id = ? AND accessed_at = ?",
+           (other, damaged["id"], T1))
+    tamper(db,
+           "UPDATE privacy_accesses SET result = 'failed' WHERE id = ? AND accessed_at = ?",
+           (damaged["id"], T1))
+
+    result = diagnose(client, machine_id)
+    assert result["checked_count"] == 2
+    assert [r["id"] for r in result["records"]] == [first["id"], damaged["id"]]
+    damaged_record = result["records"][1]
+    assert "bad_ownership" in damaged_record["errors"]
+    assert damaged_record["previous_access_id"] == first["id"]
+
+    # The named machine gains neither the relabeled row nor any other of
+    # machine one's records.
+    named = diagnose(client, other)
+    ids = [r["id"] for r in named["records"]]
+    assert damaged["id"] not in ids
+    assert ids.count(dup_id) == 1
+    assert named["checked_count"] == 2
+
+
+def test_conflicting_chain_link_forward_edge_wins_and_successors_stay_listed(
+    client, tmp_path
+):
+    # The damaged row's own predecessor link names a machine-one record while
+    # a machine-two record's pointer names the damaged row (a conflicting
+    # cross-machine chain link). The row's own forward edge must keep it in
+    # machine one's total with bad_ownership; machine two's pointer cannot
+    # pull it over, and machine one's later records stay listed.
+    machine_id = create_machine(client)
+    first = register(client, machine_id, accessed_at=T0)
+    damaged = register(client, machine_id, accessed_at=T1)
+    third = register(client, machine_id, accessed_at=T2)
+    other = create_machine(client, "machine-2")
+    foreign = register(client, other, accessed_at=T0)
+
+    db = tmp_path / "test.db"
+    # Doubly damage machine one's middle row: ownership relabeled and a
+    # business field changed (digest proves neither machine).
+    tamper(db, "UPDATE privacy_accesses SET machine_id = ? WHERE id = ?",
+           (other, damaged["id"]))
+    tamper(db, "UPDATE privacy_accesses SET result = 'failed' WHERE id = ?",
+           (damaged["id"],))
+    # Machine two's sound record points back at the damaged row: a
+    # cross-machine (damaged) reverse link that must not change attribution.
+    tamper(
+        db,
+        "UPDATE privacy_accesses SET previous_access_id = ? WHERE id = ?",
+        (damaged["id"], foreign["id"]),
+    )
+
+    result = diagnose(client, machine_id)
+    assert result["checked_count"] == 3
+    assert [r["id"] for r in result["records"]] == [
+        first["id"],
+        damaged["id"],
+        third["id"],
+    ]
+    middle = result["records"][1]
+    assert "bad_ownership" in middle["errors"]
+    # Successor records continue to be listed in their positions.
+    assert result["records"][2]["id"] == third["id"]
+
+    named = diagnose(client, other)
+    assert named["checked_count"] == 1
+    assert [r["id"] for r in named["records"]] == [foreign["id"]]
+    # The cross pointer is flagged on the foreign record, not rewarded with
+    # the relabeled row.
+    assert "bad_previous" in named["records"][0]["errors"]
+
+
 def test_a_second_record_with_a_damaged_null_link_reports_missing_previous(
     client, tmp_path
 ):

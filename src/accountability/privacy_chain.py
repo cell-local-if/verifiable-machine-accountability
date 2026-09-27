@@ -590,9 +590,29 @@ def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
     # ``previous_access_id`` naming an attributed row, or an attributed
     # row's stored ``previous_access_id`` naming this row — attributes the
     # row to the same machine. Applied to a fixpoint so a run of damaged
-    # rows is recovered through its sound ends. A row linked to rows of two
-    # different machines stays unclaimed (the conflict is itself damage) and
-    # falls through to the stored ownership column below.
+    # rows is recovered through its sound ends.
+    #
+    # Two kinds of stored damage must not make the original machine lose its
+    # record:
+    #
+    # * duplicated identifiers — two rows carrying the same id, so one
+    #   predecessor pointer textually matches records of two machines. The
+    #   two raw owner sets disagree in that case; the ambiguity is resolved
+    #   first by the evidence on the other side (a successor's pointer back
+    #   to the row identifies the real chain) and, with no such evidence, by
+    #   chain-order adjacency — the true predecessor is the match positioned
+    #   immediately before the row in global chain order, and a true reverse
+    #   referrer the match immediately after it;
+    #
+    # * conflicting chain links — the row's own predecessor edge (forward
+    #   evidence, minted with the row at its own write time) uniquely names
+    #   one machine while a reverse ``previous_access_id`` pointer from
+    #   another row names a different one (the cross pointer is itself
+    #   damaged and is flagged on its own record). Forward evidence wins;
+    #   reverse evidence only attributes a row whose own predecessor link is
+    #   absent, dangling, or unresolvable (so a doubly damaged first record
+    #   is still recovered through its successor). A row with no usable
+    #   evidence either way falls through to the stored ownership column.
     rows_by_record_id: dict[str, list[int]] = {}
     referrers: dict[str, list[int]] = {}
     for index, row in enumerate(all_rows):
@@ -604,26 +624,185 @@ def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
         if isinstance(stored_previous, str):
             referrers.setdefault(stored_previous, []).append(index)
 
+    # Global chain order (owner-independent) used to disambiguate duplicate-id
+    # pointer matches by immediate-neighbour adjacency.
+    ordered_positions = {
+        index: position
+        for position, index in enumerate(
+            sorted(
+                range(len(all_rows)),
+                key=lambda idx: (
+                    _accessed_instant(all_rows[idx]._mapping["accessed_at"]),
+                    0 if isinstance(all_rows[idx]._mapping["id"], str) else 1,
+                    all_rows[idx]._mapping["id"]
+                    if isinstance(all_rows[idx]._mapping["id"], str)
+                    else "",
+                ),
+            )
+        )
+    }
+
+    def _adjacent_owner(
+        candidates: list[int], *, position: int, before: bool
+    ) -> str | None:
+        """Owner of the match immediately adjacent to ``position``, if unique.
+
+        Among duplicate-id matches already attributed, keep only the match
+        positioned directly before (a forward edge) or after (a reverse edge)
+        the row in global chain order; when exactly one owner survives that
+        adjacency it is the owner the pointer really carried.
+        """
+        if before:
+            adjacent = [idx for idx in candidates if ordered_positions[idx] < position]
+            adjacent = [max(adjacent, key=ordered_positions.get)] if adjacent else []
+        else:
+            following = [
+                idx for idx in candidates if ordered_positions[idx] > position
+            ]
+            adjacent = [min(following, key=ordered_positions.get)] if following else []
+        adjacent_owners = {owners[idx] for idx in adjacent}
+        if len(adjacent_owners) == 1:
+            return adjacent_owners.pop()
+        return None
+
+    def _pointer_evidence(
+        matches: list[int], *, position: int, before: bool
+    ) -> tuple[str | None, set[str]]:
+        """Owner evidence carried by a pointer textually matching ``matches``.
+
+        Returns ``(unique_owner, candidate_owners)``. ``unique_owner`` is the
+        single attributed owner when the pointer matches attributed rows of
+        exactly one machine directly; a match spanning machines (a duplicated
+        id) yields ``None`` plus every candidate owner so the caller can
+        resolve the ambiguity against evidence on the other side or by
+        chain-order adjacency.
+        """
+        candidates = [idx for idx in matches if idx in owners]
+        candidate_owners = {owners[idx] for idx in candidates}
+        if len(candidate_owners) == 1:
+            return candidate_owners.pop(), candidate_owners
+        if len(candidate_owners) > 1:
+            return None, candidate_owners
+        return None, set()
+
     changed = True
     while changed:
+        # Strong passes run to quiescence first. A row is attributed only on
+        # evidence that cannot be overturned by a later attribution: its own
+        # forward edge (which wins any conflict), reverse evidence when the
+        # forward edge is absent or dangling (not merely unresolved), or the
+        # duplicate-id disambiguations. This keeps an already-attributed
+        # conflicting reverse pointer from stealing a row whose forward
+        # target is still propagating ownership.
         changed = False
         for index, row in enumerate(all_rows):
             if index in owners:
                 continue
             mapping = row._mapping
-            linked_owners: set[str] = set()
+            position = ordered_positions[index]
+
             stored_previous = mapping["previous_access_id"]
-            if isinstance(stored_previous, str):
-                for other in rows_by_record_id.get(stored_previous, ()):
-                    if other in owners:
-                        linked_owners.add(owners[other])
             record_id = mapping["id"]
-            if isinstance(record_id, str):
-                for other in referrers.get(record_id, ()):
-                    if other in owners:
-                        linked_owners.add(owners[other])
-            if len(linked_owners) == 1:
-                owners[index] = linked_owners.pop()
+            forward_matches = (
+                rows_by_record_id.get(stored_previous, ())
+                if isinstance(stored_previous, str)
+                else ()
+            )
+            reverse_matches = (
+                referrers.get(record_id, ())
+                if isinstance(record_id, str)
+                else ()
+            )
+            forward_owner, forward_owners = _pointer_evidence(
+                forward_matches, position=position, before=True
+            )
+            reverse_owner, reverse_owners = _pointer_evidence(
+                reverse_matches, position=position, before=False
+            )
+            forward_present = any(
+                idx in owners for idx in forward_matches
+            )
+            # A textual pointer that matches no stored row at all is
+            # dangling: it can never gain a forward owner on a later pass.
+            forward_pending = bool(forward_matches) and not forward_present
+            reverse_pending = bool(reverse_matches) and not any(
+                idx in owners for idx in reverse_matches
+            )
+
+            chosen_owner: str | None = None
+            if forward_owner is not None:
+                # Strong forward evidence wins over any reverse owner,
+                # including a conflicting cross-machine pointer (which is
+                # itself damaged and flagged on its own record).
+                chosen_owner = forward_owner
+            elif not forward_owners and not forward_pending and reverse_owner:
+                # No forward edge at all (absent or dangling): the successor
+                # edge recovers the row (e.g. a doubly damaged first record).
+                chosen_owner = reverse_owner
+            elif forward_owners:
+                # Forward matches span machines through a duplicated id.
+                intersection = forward_owners & reverse_owners
+                if len(intersection) == 1:
+                    chosen_owner = intersection.pop()
+                elif reverse_owner is not None:
+                    # The forward edge is unreliable (it textually matches
+                    # two machines); an unambiguous reverse edge identifies
+                    # the real chain and decides.
+                    chosen_owner = reverse_owner
+                elif not reverse_pending:
+                    candidates = [idx for idx in forward_matches if idx in owners]
+                    chosen_owner = _adjacent_owner(
+                        candidates, position=position, before=True
+                    )
+            elif not forward_pending and reverse_owners:
+                candidates = [idx for idx in reverse_matches if idx in owners]
+                chosen_owner = _adjacent_owner(
+                    candidates, position=position, before=False
+                )
+
+            if chosen_owner is not None:
+                owners[index] = chosen_owner
+                changed = True
+
+        if changed:
+            continue
+
+        # Weak pass: strong evidence has quiesced, so any forward pointer
+        # still pending belongs to a damaged run that cannot prove an owner.
+        # A surviving reverse pointer now attributes the row; this and the
+        # stored-column fallback below are the last resorts.
+        for index, row in enumerate(all_rows):
+            if index in owners:
+                continue
+            mapping = row._mapping
+            position = ordered_positions[index]
+            stored_previous = mapping["previous_access_id"]
+            record_id = mapping["id"]
+            forward_matches = (
+                rows_by_record_id.get(stored_previous, ())
+                if isinstance(stored_previous, str)
+                else ()
+            )
+            reverse_matches = (
+                referrers.get(record_id, ())
+                if isinstance(record_id, str)
+                else ()
+            )
+            forward_owner, _ = _pointer_evidence(
+                forward_matches, position=position, before=True
+            )
+            reverse_owner, reverse_owners = _pointer_evidence(
+                reverse_matches, position=position, before=False
+            )
+
+            chosen_owner = forward_owner or reverse_owner
+            if chosen_owner is None and reverse_owners:
+                candidates = [idx for idx in reverse_matches if idx in owners]
+                chosen_owner = _adjacent_owner(
+                    candidates, position=position, before=False
+                )
+            if chosen_owner is not None:
+                owners[index] = chosen_owner
                 changed = True
 
     members = []

@@ -6955,6 +6955,302 @@ def get_authorization_decision_event_causal_trace(
     )
 
 
+# --- read-only single-event closed-loop accountability trace ----------------
+
+
+def validate_accountability_trace_params(request: Request) -> None:
+    """Validate the single-event accountability-trace request before reads.
+
+    The trace is keyed on the path machine and path event alone: it accepts no
+    query parameters (a repeated parameter name is the same unknown shape) and
+    no request body. Any parameter name, a repeated parameter, or a carried
+    body is a 422 ``invalid_query``. Every check runs in the validation phase,
+    before the machine or any accountability record is read and without
+    issuing database access, so an invalid query against a non-existent
+    machine or event still reports 422 rather than 404.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+    # A body on a GET is an unknown-shape request rejected in the validation
+    # phase, before any machine or accountability record is read. A present
+    # non-zero Content-Length, or a chunked request without one, means a body
+    # is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+
+def _trace_created_instant(value: object) -> datetime:
+    """Parse a stored ``created_at`` to its actual UTC instant for trace order.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract; a
+    damaged value (missing, non-string, malformed) sorts after every parseable
+    record instead of raising, so the read-only trace neither crashes nor
+    repairs the stored text.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _DECISION_EVENT_FAR_FUTURE
+
+
+def _trace_order(rows: list) -> list:
+    """Order stored row mappings by the actual UTC instant of ``created_at``.
+
+    A stored ``created_at`` that no longer parses sorts after every parseable
+    instant (the tolerant read-only convention); within one instant the tie is
+    broken by id ascending. A stored id that is not a string never crashes
+    the comparison: such ids deterministically sort after string ids.
+    """
+
+    def key(row: object) -> tuple[datetime, int, str]:
+        mapping = row._mapping
+        record_id = mapping.get("id")
+        instant = _trace_created_instant(mapping.get("created_at"))
+        if isinstance(record_id, str):
+            return (instant, 0, record_id)
+        return (instant, 1, "")
+
+    return sorted(rows, key=key)
+
+
+def _trace_event_summary(mapping: object) -> dict[str, object]:
+    """The selected event's result, reason, creation moment, chain fields."""
+    return {
+        "allowed": mapping["allowed"],
+        "reason": mapping["reason"],
+        "created_at": mapping["created_at"],
+        "previous_event_id": mapping["previous_event_id"],
+        "content_hash": mapping["content_hash"],
+        "chain_hash": mapping["chain_hash"],
+    }
+
+
+def _trace_evidence_to_dict(mapping: object) -> dict[str, object]:
+    """One evidence record exactly as stored, complete with chain fields."""
+    return {
+        "id": mapping["id"],
+        "machine_id": mapping["machine_id"],
+        "event_id": mapping["event_id"],
+        "evidence_type": mapping["evidence_type"],
+        "content_hash": mapping["content_hash"],
+        "created_at": mapping["created_at"],
+        "previous_evidence_id": mapping["previous_evidence_id"],
+        "content_digest": mapping["content_digest"],
+        "chain_hash": mapping["chain_hash"],
+    }
+
+
+def _trace_incident_to_dict(mapping: object) -> dict[str, object]:
+    """One incident record exactly as stored."""
+    return {
+        "id": mapping["id"],
+        "machine_id": mapping["machine_id"],
+        "event_id": mapping["event_id"],
+        "incident_type": mapping["incident_type"],
+        "summary": mapping["summary"],
+        "status": mapping["status"],
+        "created_at": mapping["created_at"],
+    }
+
+
+def _trace_status_event_to_dict(mapping: object) -> dict[str, object]:
+    """One status transition exactly as stored, chain fields included."""
+    return {
+        "id": mapping["id"],
+        "machine_id": mapping["machine_id"],
+        "event_id": mapping["event_id"],
+        "incident_id": mapping["incident_id"],
+        "from_status": mapping["from_status"],
+        "to_status": mapping["to_status"],
+        "created_at": mapping["created_at"],
+        "previous_status_event_id": mapping["previous_status_event_id"],
+        "content_hash": mapping["content_hash"],
+        "chain_hash": mapping["chain_hash"],
+    }
+
+
+def _trace_assignment_to_dict(mapping: object) -> dict[str, object]:
+    """One responsibility assignment exactly as stored, chain fields included."""
+    return {
+        "id": mapping["id"],
+        "machine_id": mapping["machine_id"],
+        "event_id": mapping["event_id"],
+        "incident_id": mapping["incident_id"],
+        "party": mapping["party"],
+        "role": mapping["role"],
+        "created_at": mapping["created_at"],
+        "previous_assignment_id": mapping["previous_assignment_id"],
+        "content_hash": mapping["content_hash"],
+        "chain_hash": mapping["chain_hash"],
+    }
+
+
+def _trace_causal_link_to_dict(mapping: object) -> dict[str, object]:
+    """One causal link exactly as stored (all five stored columns)."""
+    return {
+        "id": mapping["id"],
+        "machine_id": mapping["machine_id"],
+        "cause_event_id": mapping["cause_event_id"],
+        "effect_event_id": mapping["effect_event_id"],
+        "created_at": mapping["created_at"],
+    }
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/"
+    "accountability-trace"
+)
+def get_authorization_decision_event_accountability_trace(
+    machine_id: str,
+    event_id: str,
+    _: Annotated[None, Depends(validate_accountability_trace_params)],
+    session: SessionDep,
+):
+    """Read-only single-event closed-loop accountability trace.
+
+    The real entry point is the ``accountability-trace`` sub-entry under the
+    machine authorization decision event path; only ``GET`` is routed, so
+    ``HEAD`` and every other method return ``405`` without reading records,
+    computing a trace, or writing anything. The caller submits only the path
+    machine id and path event id — no query parameters, no repeated
+    parameters, no request body, and no business filters; any query parameter
+    or a carried body is a 422 ``invalid_query`` raised during validation
+    before the machine or any accountability record is read. A missing
+    machine or event, or an event owned by another machine, is a 404
+    ``not_found`` carrying no trace data. A failure while reading the machine
+    or any record group is a 500 ``internal_error`` whose body contains
+    neither the event summary nor any association array.
+
+    On success the response carries exactly six groups in this fixed order:
+    ``event_summary`` (always a single object, never an array) and then the
+    five arrays ``evidence``, ``incidents``, ``status_history``,
+    ``responsibility_assignments``, and ``causal_links``; each array is
+    present and empty when the group has no records. ``event_summary`` holds
+    the selected event's decision result (``allowed``), its ``reason``, its
+    creation moment, and its chain fields, exactly as stored.
+
+    The evidence, incidents, status-history, and responsibility groups hold
+    only records owned by the path machine whose stored event association
+    names the selected event — their own machine ownership and event
+    association are the only membership conditions; a damaged or missing
+    parent (incident or event) never filters a child row out. The causal-link
+    group holds the path machine's links whose either endpoint names the
+    selected event, and the other endpoint is kept verbatim even when it
+    names a missing or foreign event. Every record is output with its
+    complete stored fields in fixed order — damaged, duplicated, or dangling
+    content is never repaired, recomputed, normalized, deduplicated, or
+    dropped.
+
+    Each array is ordered by the actual UTC instant of the record's own
+    ``created_at`` and then by id ascending, so an exact-second record sorts
+    before any fractional-second record of the same second; a stored
+    ``created_at`` that no longer parses is kept verbatim and sorts after
+    every parseable instant instead of crashing. The query is strictly
+    read-only and machine isolated: another machine's records never enter
+    any group, empty groups are kept, and repeat calls against unchanged
+    data are byte-identical, including across restarts. The body is compact
+    UTF-8 JSON terminated by a single newline, with stable field order and no
+    floating-point, ``-0.0``, or non-finite value.
+    """
+    # A failure while *reading* the machine or any of the six groups is an
+    # internal read-layer fault: answer 500 internal_error with no event
+    # summary and no association arrays at all. Damaged stored values are not
+    # a read failure — rows read successfully are ordered and emitted
+    # verbatim, with an unparseable stamp sorting last — so only a true read
+    # fault reaches the except branch.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        # Core-level row read (not the ORM identity map) so damaged storage
+        # with duplicated primary keys cannot collapse two stored rows into
+        # one: the trace reports every stored row separately.
+        event_row = session.execute(
+            AuthorizationDecisionEvent.__table__.select().where(
+                AuthorizationDecisionEvent.__table__.c.id == event_id,
+                AuthorizationDecisionEvent.__table__.c.machine_id == machine_id,
+            )
+        ).first()
+        if event_row is None:
+            return error_response(404, "not_found")
+
+        def _group_rows(table, *conditions):
+            return list(
+                session.execute(
+                    table.select().where(table.c.machine_id == machine_id, *conditions)
+                )
+            )
+
+        evidence_rows = _group_rows(
+            AuthorizationDecisionEvidence.__table__,
+            AuthorizationDecisionEvidence.__table__.c.event_id == event_id,
+        )
+        incident_rows = _group_rows(
+            AuthorizationDecisionIncident.__table__,
+            AuthorizationDecisionIncident.__table__.c.event_id == event_id,
+        )
+        status_rows = _group_rows(
+            IncidentStatusEvent.__table__,
+            IncidentStatusEvent.__table__.c.event_id == event_id,
+        )
+        assignment_rows = _group_rows(
+            IncidentResponsibilityAssignment.__table__,
+            IncidentResponsibilityAssignment.__table__.c.event_id == event_id,
+        )
+        causal_rows = _group_rows(
+            AuthorizationDecisionCausalLink.__table__,
+            (
+                AuthorizationDecisionCausalLink.__table__.c.cause_event_id
+                == event_id
+            )
+            | (
+                AuthorizationDecisionCausalLink.__table__.c.effect_event_id
+                == event_id
+            ),
+        )
+    except Exception:
+        return error_response(500, "internal_error")
+
+    payload = {
+        "event_summary": _trace_event_summary(event_row._mapping),
+        "evidence": [
+            _trace_evidence_to_dict(row._mapping)
+            for row in _trace_order(evidence_rows)
+        ],
+        "incidents": [
+            _trace_incident_to_dict(row._mapping)
+            for row in _trace_order(incident_rows)
+        ],
+        "status_history": [
+            _trace_status_event_to_dict(row._mapping)
+            for row in _trace_order(status_rows)
+        ],
+        "responsibility_assignments": [
+            _trace_assignment_to_dict(row._mapping)
+            for row in _trace_order(assignment_rows)
+        ],
+        "causal_links": [
+            _trace_causal_link_to_dict(row._mapping)
+            for row in _trace_order(causal_rows)
+        ],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- read-only joint-write transaction diagnostics -------------------------
 
 
