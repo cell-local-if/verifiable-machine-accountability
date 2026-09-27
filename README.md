@@ -668,6 +668,85 @@ deletes, or normalizes incidents, history, assignments, events, evidence, hash
 chains, or causal links — gives identical results on repeat calls against
 unchanged data, and audits data persisted across application restarts.
 
+## Read-only stable machine incident-view incremental query
+
+`GET /machines/{machine_id}/authorization-decision-events/incidents/changes`
+is the stable, keyset-paginated incremental view over one machine's closed
+incident loop — incident registrations, incident status history, and
+responsibility assignments — the `changes` sub-entry under the machine
+incident path. It is a separate, strictly read-only audit entry point: it
+changes neither incident registration, status transitions, responsibility
+assignments, the per-incident history and assignment listings, the integrity
+audits, nor the compliance exports, and it adds no on-disk format (cursors
+are stateless), so old and empty databases work unchanged. The caller
+submits only the path machine id, a page size, and an optional cursor — no
+business filter parameters and no request body. Validation completes before
+the machine or any record is read:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, fractional (e.g. `1.0`), boolean (`true`/`false`), non-decimal,
+  or out-of-range value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque string shaped
+  `<created_at original text>|<group>|<record id>` and returned by a
+  previous page. An empty, non-string, or shape-mismatching value returns
+  `422 {"error":{"code":"invalid_cursor"}}`; the timestamp segment is
+  original stored text rather than re-parsed, because a record whose
+  stored `created_at` no longer parses stays pageable. A well-shaped
+  cursor whose `(created_at, group, id)` position cannot be located among
+  the path machine's stored records (including a position naming another
+  machine's record, or the right `(created_at, id)` pair under the wrong
+  group tag) is rejected as `422 {"error":{"code":"invalid_cursor"}}`
+  while the records are read, so a parameter error always takes priority
+  over the machine lookup.
+- Any other query parameter, a repeated `limit`/`cursor`, or a request
+  carrying a body returns `422 {"error":{"code":"invalid_query"}}` in the
+  validation phase; every validation error is answered without reading any
+  machine or record.
+- The path accepts `GET` only; `HEAD` and other methods return `405`
+  without reading records, computing a page, or writing anything.
+- A valid query against a machine that does not exist returns
+  `404 {"error":{"code":"not_found"}}` carrying no records.
+- A failure that prevents reading the records or the machine returns
+  `500 {"error":{"code":"internal_error"}}` with no partial page.
+
+The success object carries exactly `{machine_id, limit, records,
+next_cursor, has_more}` in this fixed field order; the path machine id and
+the page size are echoed back, and an empty database or a machine with no
+incident records returns the complete empty page. `records` merges the
+three incident record groups into one page. Each item is exactly `{group,
+record}` with the fixed group tag — `incidents`, `status_history`, or
+`responsibility_assignments` — and `record` carries the complete record
+exactly as the corresponding endpoint emits it: the seven incident fields
+`{id, machine_id, event_id, incident_type, summary, status, created_at}`;
+the seven transition fields plus `previous_status_event_id`,
+`content_hash`, and `chain_hash` for status history; the seven attribution
+fields plus `previous_assignment_id`, `content_hash`, and `chain_hash` for
+assignments — all emitted exactly as stored, with no filtering, repair, or
+normalization. Items are ordered by the actual UTC instant of
+`created_at`, then by the group tag, then by record id ascending, so an
+exact-second record sorts before any fractional-second record of the same
+second. A stored `created_at` that no longer parses never crashes the
+query: the record is kept with its stored value and deterministically
+sorts after every parseable instant rather than being deleted; damaged,
+missing, misowned, or duplicated references and chain values are likewise
+emitted exactly as stored.
+
+The cursor is the exclusive position `<created_at original text>|<group>|
+<record id>` pointing just after a page's last record, so a page returns
+only records strictly after it: repeating the same cursor against
+unchanged data returns the byte-identical next page, and a newly inserted
+record whose sort position is earlier never makes an already-returned
+record resurface while the current page still follows the stable order.
+`next_cursor` carries the position after the page's last record only when
+a record follows (`null` on the last page), and `has_more` is true exactly
+in that case — false on an empty or last page, including an empty
+database. The query is strictly read-only and machine isolated: it never
+creates, updates, deletes, repairs, recomputes, or normalizes a record,
+and another machine's records never enter the page. The body is compact
+UTF-8 JSON terminated by a single newline, free of floating-point, `-0.0`,
+or non-finite values, byte-identical on repeat calls against unchanged
+data, and readable across application restarts.
+
 ## Bounded causal traces
 
 `GET /machines/{machine_id}/authorization-decision-events/{event_id}/causal-trace`
@@ -1873,6 +1952,20 @@ fractional-second record of the same second), with `position` numbered from 1
 with no gaps; a damaged `accessed_at` that no longer parses sorts after every
 parseable instant instead of crashing. An empty machine returns `valid`
 `true`, `checked_count` `0`, and an empty `records` array.
+
+Every stored row is attributed to exactly one machine, in decreasing order of
+evidence strength: the content digest (which covers the ownership field) is
+authoritative when it verifies under some machine id; when the digest cannot
+verify under any machine because the ownership field and another business
+field are both damaged, the surviving chain links attribute the row — a row
+whose stored predecessor link names an attributed row, or whose own id is
+named by an attributed row's stored predecessor link, belongs to the same
+machine — so the original machine still counts the record in
+`checked_count` and reports it with `bad_ownership`, while the machine the
+corrupted ownership column now names never gains it; and when neither
+evidence survives, the stored ownership column is trusted, so a record whose
+ownership column is intact but whose other business fields are damaged stays
+in its stored machine's total.
 
 Each record is exactly `{id, position, previous_access_id, content_hash,
 chain_hash, errors}`: the actual stored record id, its position, its stored

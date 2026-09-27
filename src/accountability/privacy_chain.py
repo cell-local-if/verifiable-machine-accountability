@@ -514,18 +514,28 @@ def _resolve_content_owner(
 def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
     """Diagnose one machine's privacy access chain, record by record, read-only.
 
-    A row is a member of the path machine's chain when its authentic owner —
-    resolved from its content digest, which covers the ownership field — is
-    the path machine, or, when ownership is not cryptographically provable
-    (another business field is damaged too), when its stored ``machine_id``
-    names the path machine. This both keeps a record whose ownership field
-    was overwritten to another machine visible to its real owner (flagged
-    ``bad_ownership``) and keeps a genuinely foreign record out: a row whose
-    digest proves it belongs to a different machine never enters this
-    machine's diagnosis, even when its corrupted ownership column happens
-    to name this machine. A row whose ownership column is intact but whose
-    other business fields are damaged still belongs to its stored machine
-    and stays in that machine's total.
+    A row is attributed to exactly one machine, in decreasing order of
+    evidence strength:
+
+    * the content digest, which covers the ownership field, is
+      authoritative when it verifies under some machine id — this keeps a
+      record whose ownership field was overwritten to another machine
+      visible to its real owner (flagged ``bad_ownership``) and keeps a
+      genuinely foreign record out, even when its corrupted ownership
+      column happens to name the path machine;
+    * when the digest cannot verify under any machine (the ownership field
+      and another business field are both damaged), the surviving chain
+      links attribute the row: a row whose stored ``previous_access_id``
+      names an attributed row, or whose own id is named by an attributed
+      row's stored ``previous_access_id``, belongs to the same machine,
+      applied to a fixpoint so a run of damaged rows is recovered through
+      its sound ends — this keeps the original machine's record in its
+      total (flagged ``bad_ownership``) instead of silently dropping it,
+      and out of the machine its corrupted ownership column now names;
+    * when neither evidence survives, the stored ownership column is
+      trusted, so a record whose ownership column is intact but whose
+      other business fields are damaged still belongs to its stored
+      machine and stays in that machine's total.
 
     Members are examined in the same chain order used to build and verify
     the chain: the actual UTC instant of ``accessed_at`` and then ``id``. A
@@ -565,18 +575,66 @@ def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
             ),
         }
     )
-    members = []
-    for row in all_rows:
-        mapping = row._mapping
-        authentic_owner = _resolve_content_owner(mapping, candidate_machine_ids)
+
+    # Attribute every row to exactly one machine. The digest-provable owner
+    # wins whenever it exists.
+    owners: dict[int, str] = {}
+    for index, row in enumerate(all_rows):
+        authentic_owner = _resolve_content_owner(row._mapping, candidate_machine_ids)
         if authentic_owner is not None:
-            belongs = authentic_owner == machine_id
-        else:
-            # Ownership not cryptographically provable (another business
-            # field is damaged too): trust the ownership column so a damaged
-            # own record stays in its stored machine's total.
-            belongs = mapping["machine_id"] == machine_id
-        if belongs:
+            owners[index] = authentic_owner
+
+    # Chain-linkage attribution for rows whose digest cannot prove ownership
+    # (the ownership field and another business field are both damaged): a
+    # still-intact predecessor link — the row's own stored
+    # ``previous_access_id`` naming an attributed row, or an attributed
+    # row's stored ``previous_access_id`` naming this row — attributes the
+    # row to the same machine. Applied to a fixpoint so a run of damaged
+    # rows is recovered through its sound ends. A row linked to rows of two
+    # different machines stays unclaimed (the conflict is itself damage) and
+    # falls through to the stored ownership column below.
+    rows_by_record_id: dict[str, list[int]] = {}
+    referrers: dict[str, list[int]] = {}
+    for index, row in enumerate(all_rows):
+        mapping = row._mapping
+        record_id = mapping["id"]
+        if isinstance(record_id, str):
+            rows_by_record_id.setdefault(record_id, []).append(index)
+        stored_previous = mapping["previous_access_id"]
+        if isinstance(stored_previous, str):
+            referrers.setdefault(stored_previous, []).append(index)
+
+    changed = True
+    while changed:
+        changed = False
+        for index, row in enumerate(all_rows):
+            if index in owners:
+                continue
+            mapping = row._mapping
+            linked_owners: set[str] = set()
+            stored_previous = mapping["previous_access_id"]
+            if isinstance(stored_previous, str):
+                for other in rows_by_record_id.get(stored_previous, ()):
+                    if other in owners:
+                        linked_owners.add(owners[other])
+            record_id = mapping["id"]
+            if isinstance(record_id, str):
+                for other in referrers.get(record_id, ()):
+                    if other in owners:
+                        linked_owners.add(owners[other])
+            if len(linked_owners) == 1:
+                owners[index] = linked_owners.pop()
+                changed = True
+
+    members = []
+    for index, row in enumerate(all_rows):
+        owner = owners.get(index)
+        if owner is None:
+            # Ownership neither digest-provable nor chain-linked: trust the
+            # ownership column so a damaged own record stays in its stored
+            # machine's total.
+            owner = row._mapping["machine_id"]
+        if owner == machine_id:
             members.append(row)
     rows = _diagnostic_order(members)
 
