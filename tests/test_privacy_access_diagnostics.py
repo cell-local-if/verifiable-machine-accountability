@@ -652,13 +652,16 @@ def test_ownership_damage_plus_other_damage_keeps_each_anomaly(
     client, tmp_path
 ):
     # When the ownership field and another business field are both damaged,
-    # the digest cannot verify under any machine; the row is still retained
-    # by its (corrupted) stored ownership for the path machine only when it
-    # names it — a row moved to another machine whose digest is otherwise
-    # broken is not attributable and does not enter the original machine.
+    # the digest cannot verify under any machine; the row's place in the
+    # original machine's chain (its predecessor link and its sound
+    # successor) still attributes it, so the original machine keeps the
+    # record in its total and it is flagged bad_ownership together with the
+    # digest anomalies, rather than vanishing just because the corrupted
+    # ownership column now names another machine.
     machine_id = create_machine(client)
-    register(client, machine_id, accessed_at=T0)
+    first = register(client, machine_id, accessed_at=T0)
     damaged = register(client, machine_id, accessed_at=T1)
+    third = register(client, machine_id, accessed_at=T2)
     other = create_machine(client, "machine-2")
 
     db = tmp_path / "test.db"
@@ -667,11 +670,80 @@ def test_ownership_damage_plus_other_damage_keeps_each_anomaly(
     tamper(db, "UPDATE privacy_accesses SET result = 'failed' WHERE id = ?",
            (damaged["id"],))
 
-    # The digest now proves ownership of neither machine; the original
-    # machine's total only retains its first sound record.
+    # The original machine's total retains every record, including the
+    # simultaneously ownership- and business-damaged one.
+    result = diagnose(client, machine_id)
+    assert result["checked_count"] == 3
+    assert [r["id"] for r in result["records"]] == [
+        first["id"],
+        damaged["id"],
+        third["id"],
+    ]
+    damaged_record = result["records"][1]
+    assert damaged_record["position"] == 2
+    # The ownership column names another machine; the other business field
+    # no longer matches the minted digest. Every applicable anomaly stays.
+    assert "bad_ownership" in damaged_record["errors"]
+    assert "bad_content_hash" in damaged_record["errors"]
+    assert "bad_chain_hash" in damaged_record["errors"]
+    # The machine named by the corrupted ownership column has no sound
+    # claim: no row is authentically attributable to it.
+    other_result = diagnose(client, other)
+    assert other_result["checked_count"] == 0
+    assert other_result["records"] == []
+    assert other_result["valid"] is True
+
+
+def test_ownership_and_business_damage_on_only_record_stays_with_stored_owner(
+    client, tmp_path
+):
+    # An isolated dual-damaged record (no chain link can attribute it)
+    # whose ownership column is intact still belongs to that stored
+    # machine; it is counted and flagged for the business damage only.
+    machine_id = create_machine(client)
+    damaged = register(client, machine_id, accessed_at=T0)
+
+    tamper(
+        tmp_path / "test.db",
+        "UPDATE privacy_accesses SET matches_count = 42 WHERE id = ?",
+        (damaged["id"],),
+    )
+
     result = diagnose(client, machine_id)
     assert result["checked_count"] == 1
-    assert [r["id"] for r in result["records"]] != [damaged["id"]]
+    record = result["records"][0]
+    assert record["id"] == damaged["id"]
+    assert "bad_ownership" not in record["errors"]
+    assert "bad_content_hash" in record["errors"]
+
+
+def test_ownership_and_business_damage_recovered_from_successor_link(
+    client, tmp_path
+):
+    # Even with the damaged row's predecessor link also nulled, its sound
+    # successor naming it pins the row to the original machine's chain.
+    machine_id = create_machine(client)
+    first = register(client, machine_id, accessed_at=T0)
+    damaged = register(client, machine_id, accessed_at=T1)
+    third = register(client, machine_id, accessed_at=T2)
+    other = create_machine(client, "machine-2")
+
+    db = tmp_path / "test.db"
+    tamper(db, "UPDATE privacy_accesses SET machine_id = ? WHERE id = ?",
+           (other, damaged["id"]))
+    tamper(db, "UPDATE privacy_accesses SET result = 'failed' WHERE id = ?",
+           (damaged["id"],))
+    tamper(db, "UPDATE privacy_accesses SET previous_access_id = NULL WHERE id = ?",
+           (damaged["id"],))
+
+    result = diagnose(client, machine_id)
+    assert result["checked_count"] == 3
+    assert [r["id"] for r in result["records"]] == [
+        first["id"],
+        damaged["id"],
+        third["id"],
+    ]
+    assert "bad_ownership" in result["records"][1]["errors"]
 
 
 # --------------------------------------------------------------------------- #

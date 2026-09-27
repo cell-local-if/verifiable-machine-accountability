@@ -514,18 +514,33 @@ def _resolve_content_owner(
 def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
     """Diagnose one machine's privacy access chain, record by record, read-only.
 
-    A row is a member of the path machine's chain when its authentic owner —
-    resolved from its content digest, which covers the ownership field — is
-    the path machine, or, when ownership is not cryptographically provable
-    (another business field is damaged too), when its stored ``machine_id``
-    names the path machine. This both keeps a record whose ownership field
-    was overwritten to another machine visible to its real owner (flagged
-    ``bad_ownership``) and keeps a genuinely foreign record out: a row whose
-    digest proves it belongs to a different machine never enters this
-    machine's diagnosis, even when its corrupted ownership column happens
-    to name this machine. A row whose ownership column is intact but whose
-    other business fields are damaged still belongs to its stored machine
-    and stays in that machine's total.
+    A row is a member of the path machine's chain through a three-tier
+    attribution, each tier applying only when the one above it cannot decide:
+
+    1. Its authentic owner is resolved from its content digest, which covers
+       the ownership field: the digest is authoritative, so a record whose
+       ownership field was overwritten to another machine stays visible to
+       its real owner (flagged ``bad_ownership``), and a row whose digest
+       proves it belongs to a different machine never enters this machine's
+       diagnosis even when its corrupted ownership column happens to name
+       this machine.
+    2. When ownership is not cryptographically provable because another
+       business field is damaged too, the chain links attribute the row: a
+       stored ``previous_access_id`` naming a record already attributed to a
+       machine, or a successor record already attributed to a machine that
+       names this row as its predecessor, pins the row to that machine's
+       chain. The links propagate through runs of unprovable rows to a
+       fixed point, so a record whose ownership column was moved to another
+       machine *and* whose business fields are simultaneously damaged still
+       counts for the original machine — it is flagged ``bad_ownership``
+       together with its other anomalies instead of vanishing from the
+       total when the digest alone cannot place it. A provably owned row is
+       never reassigned by a link.
+    3. A row that remains unattributable (no digest proof and no link to an
+       attributed row — e.g. an isolated first record whose ownership
+       column is intact but whose business fields are damaged) trusts its
+       stored ``machine_id`` column, so it stays in its stored machine's
+       total.
 
     Members are examined in the same chain order used to build and verify
     the chain: the actual UTC instant of ``accessed_at`` and then ``id``. A
@@ -565,18 +580,67 @@ def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
             ),
         }
     )
-    members = []
+
+    # Tier 1: cryptographically provable ownership from the content digest.
+    owner_by_row: dict[int, str] = {}
+    rows_by_id: dict[str, Any] = {}
     for row in all_rows:
         mapping = row._mapping
+        record_id = mapping["id"]
+        if isinstance(record_id, str) and record_id not in rows_by_id:
+            rows_by_id[record_id] = row
         authentic_owner = _resolve_content_owner(mapping, candidate_machine_ids)
         if authentic_owner is not None:
-            belongs = authentic_owner == machine_id
-        else:
-            # Ownership not cryptographically provable (another business
-            # field is damaged too): trust the ownership column so a damaged
-            # own record stays in its stored machine's total.
-            belongs = mapping["machine_id"] == machine_id
-        if belongs:
+            owner_by_row[id(row)] = authentic_owner
+
+    # Successor index: predecessor id -> the rows whose stored link names it.
+    successors_by_previous_id: dict[str, list[Any]] = {}
+    for row in all_rows:
+        stored_previous = row._mapping["previous_access_id"]
+        if isinstance(stored_previous, str):
+            successors_by_previous_id.setdefault(stored_previous, []).append(row)
+
+    # Tier 2: attribute unprovable rows through the chain links to a fixed
+    # point. A resolved predecessor is authoritative; when no resolved
+    # predecessor exists, a resolved successor pins the row instead (a run
+    # of damaged rows anchored only at its tail is recovered that way).
+    # Provably owned rows are never reassigned, and a link between two
+    # differently owned chains only ever moves *unprovable* rows; when the
+    # two sides disagree without a predecessor decision, the smallest
+    # successor owner keeps the outcome deterministic.
+    while True:
+        progressed = False
+        for row in all_rows:
+            if id(row) in owner_by_row:
+                continue
+            stored_previous = row._mapping["previous_access_id"]
+            inferred: str | None = None
+            if isinstance(stored_previous, str):
+                predecessor = rows_by_id.get(stored_previous)
+                if predecessor is not None:
+                    inferred = owner_by_row.get(id(predecessor))
+            if inferred is None:
+                record_id = row._mapping["id"]
+                successor_owners = {
+                    owner_by_row[id(successor)]
+                    for successor in successors_by_previous_id.get(record_id, [])
+                    if id(successor) in owner_by_row
+                }
+                if successor_owners:
+                    inferred = min(successor_owners)
+            if inferred is not None:
+                owner_by_row[id(row)] = inferred
+                progressed = True
+        if not progressed:
+            break
+
+    # Tier 3: still-unattributable rows trust their stored ownership column.
+    members = []
+    for row in all_rows:
+        owner = owner_by_row.get(id(row))
+        if owner is None:
+            owner = row._mapping["machine_id"]
+        if owner == machine_id:
             members.append(row)
     rows = _diagnostic_order(members)
 
