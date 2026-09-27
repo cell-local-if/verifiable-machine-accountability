@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from . import (
     assignment_chain,
     authorization,
+    basis_integrity,
     chain,
     decision_basis,
     declaration_integrity,
@@ -7662,6 +7663,106 @@ def get_authorization_decision_event_decision_basis(
         content=document + "\n",
         media_type="application/json",
     )
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/"
+    "decision-basis/integrity"
+)
+def get_authorization_decision_event_decision_basis_integrity(
+    machine_id: str,
+    event_id: str,
+    _: Annotated[None, Depends(validate_decision_basis_params)],
+    session: SessionDep,
+):
+    """Read-only consistency audit of one decision event's basis snapshot.
+
+    The real entry point is the ``integrity`` sub-entry under the machine
+    authorization decision event's ``decision-basis`` path; only ``GET`` is
+    routed, so ``HEAD`` and every other method return ``405`` without
+    reading the machine, the event, the snapshot, or any declaration/rule,
+    and without writing anything. The caller submits only the path machine
+    id and path event id — no query parameters, repeated parameters,
+    request body, or business filter; any query string or carried body is a
+    422 ``invalid_query`` raised during validation before the machine, the
+    event, or the snapshot is read, so a malformed request against a
+    non-existent machine still reports 422 rather than 404. A missing
+    machine, a missing event, or an event owned by another machine is a 404
+    ``not_found`` carrying no audit conclusion.
+
+    On success the response carries exactly four conclusions in this fixed
+    order: ``valid``, ``checked_count``, ``broken_basis_id``, ``reason``.
+    ``checked_count`` is the number of snapshots counted for this event —
+    ``0`` when the event has no snapshot, ``1`` for its single present
+    snapshot even when damaged; another machine's snapshot is never
+    counted. ``valid`` is true only when the event summary, status basis,
+    declaration basis, policy candidates, and final decision are mutually
+    consistent: the summary repeats the event's committed allowed result,
+    reason, creation moment, and chain fields verbatim (never recomputed or
+    completed); a suspended machine explicitly read neither declarations
+    nor policy and an active machine matches the status and read flags of
+    the moment; the declaration basis contains exactly the enabled
+    declarations that participated in the action/resource judgement (a
+    missing, disabled, other-action, foreign, or extra record is
+    inconsistent); the policy candidate winner/overridden/conflict/
+    unmatched relations follow the priority of the moment and the conflict
+    groups and winner support the final judgement; and the decision equals
+    the event's committed allowed flag and reason. The first concrete
+    inconsistency is reported as a stable category in ``reason`` with
+    ``broken_basis_id`` set to the event id.
+
+    A present event with no snapshot is ``valid false``, ``checked_count
+    0``, ``broken_basis_id`` the event id, and ``reason``
+    ``snapshot_not_found`` — no basis is fabricated from current data. A
+    snapshot whose fields are damaged, whose ordering is anomalous, or whose
+    groups contradict one another is ``valid false`` with
+    ``checked_count 1``, the event id, and the stable first anomaly
+    category. The check is strictly read-only: it never creates, updates,
+    deletes, repairs, recomputes, or normalizes an event, snapshot,
+    declaration, rule, or any other accountability record, repeated queries
+    against unchanged storage are byte-for-byte identical, the audit reads
+    the persisted snapshot across restarts, and machine isolation always
+    holds. A real failure while reading the event, snapshot, or any
+    accountable record is a 500 ``internal_error`` carrying no conclusion
+    and no partial result.
+    """
+    # Existence and ownership are ordinary 404 outcomes, established before
+    # the audit reads the snapshot or any other accountable record.
+    try:
+        event = get_machine_event(session, machine_id, event_id)
+        if event is None:
+            return error_response(404, "not_found")
+        valid, checked_count, broken_basis_id, reason = basis_integrity.verify(
+            session,
+            machine_id=machine_id,
+            event_id=event_id,
+            event=event,
+        )
+    except Exception:
+        # A real read-layer fault — the event, snapshot, status history,
+        # declarations, or rules cannot be read — answers 500 with no
+        # conclusion and no partial result. Damaged stored values are not a
+        # read failure: they are handled inside the audit as concrete
+        # inconsistency categories, so only a true read fault reaches here.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "valid": valid,
+        "checked_count": checked_count,
+        "broken_basis_id": broken_basis_id,
+        "reason": reason,
+    }
+    # Hand-serialized so the body is compact UTF-8 JSON in the fixed
+    # four-field order, terminated by one newline, with no floating-point or
+    # non-finite value (allow_nan=False), and therefore byte-identical for
+    # repeated queries against unchanged storage.
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 # --- read-only joint-write transaction diagnostics -------------------------

@@ -128,6 +128,70 @@ create events and query their bases, and the event list, hash chain, evidence
 chain, incident responsibility, privacy exports, diagnostics, and the health
 check are unchanged.
 
+### Read-only decision-basis consistency audit
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/decision-basis/integrity`
+is the independent cross-check entry under a machine authorization decision
+event's `decision-basis` path; the caller submits only the path machine id
+and event id. It applies the same request contract as the snapshot query: any
+query parameter, a repeated parameter, or a request body is
+`422 {"error":{"code":"invalid_query"}}` validated before the machine, event,
+or snapshot is read (the same malformed request against a non-existent
+machine is still `422`). After validation, a missing machine, a missing
+event, or an event owned by another machine returns
+`404 {"error":{"code":"not_found"}}` with no audit conclusion. Only `GET` is
+routed; `HEAD` and every other method return `405` without reading or
+writing anything. A real failure while reading the event, snapshot, or any
+accountable record returns `500 {"error":{"code":"internal_error"}}` with no
+conclusion and no partial result.
+
+A successful response carries exactly four conclusions in this fixed order:
+
+- `valid` — `true` only when the event summary, status basis, declaration
+  basis, policy candidates, and final decision are mutually consistent;
+- `checked_count` — the number of snapshots counted for this event: `0` for
+  an event with no snapshot and `1` for its single present snapshot (even a
+  damaged one). Other machines' snapshots are never counted;
+- `broken_basis_id` — the event id when the snapshot is missing or
+  inconsistent, otherwise `null`;
+- `reason` — `null` when valid, otherwise the fixed code of the first
+  concrete inconsistency.
+
+The audit checks the snapshot against the accountable records rather than
+trusting it. The event summary must correspond verbatim to the event's
+committed allowed result, reason, creation moment, and chain fields — it is
+never recomputed or completed. The status basis must match the machine
+status in effect at the capture moment (read from the append-only status
+history, so later suspension/reactivation never changes a historical audit)
+with the correct read flags: a suspended machine explicitly read neither
+declarations nor policy, while an active machine read its enabled
+declarations and read the rules exactly when a declaration matched. The
+declaration basis must contain exactly the enabled declarations for the
+event action that existed at capture time (a missing, disabled,
+other-action, foreign, or extra record, a wrong `matched` scope, or an
+anomalous order is inconsistent); declarations created after the event never
+participate. The policy candidates' winner/overridden/conflict/unmatched
+relations, winner references, and conflict pairs must follow the priority of
+the moment (rules created after the event never enter the historical
+candidate set) and the conflict groups and winner must support the final
+judgement; the decision must equal the event's committed allowed flag and
+reason.
+
+An event with no snapshot reports `{"valid": false, "checked_count": 0,
+"broken_basis_id": <event id>, "reason": "snapshot_not_found"}` — no basis is
+fabricated. A present snapshot whose fields are damaged, whose ordering is
+anomalous, or whose groups contradict one another reports `valid false` with
+`checked_count 1`, the event id, and the stable first-anomaly category
+(`document_structure`, `event_summary_mismatch`, `status_basis_mismatch`,
+`declaration_basis_mismatch`, `policy_candidates_mismatch`, or
+`decision_mismatch`, checked in that order). The body is compact UTF-8 JSON
+terminated by a single newline with no floating-point or non-finite value, so
+repeated queries against unchanged storage are byte-for-byte identical; the
+audit reads the persisted snapshot across restarts, stays strictly isolated
+to the path machine, and is strictly read-only — it never creates, updates,
+deletes, repairs, recomputes, or normalizes an event, snapshot, declaration,
+rule, or any other accountability record.
+
 ## Machine suspension and reactivation
 
 A machine is persistently either `active` (the status assigned at creation) or
