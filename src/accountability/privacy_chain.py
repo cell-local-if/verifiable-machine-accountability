@@ -531,7 +531,20 @@ def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
       applied to a fixpoint so a run of damaged rows is recovered through
       its sound ends — this keeps the original machine's record in its
       total (flagged ``bad_ownership``) instead of silently dropping it,
-      and out of the machine its corrupted ownership column now names;
+      and out of the machine its corrupted ownership column now names.
+      The two link directions are weighed separately when a duplicated
+      identifier or a foreign/conflicting link produces more than one
+      candidate owner: an owner corroborated from BOTH directions (the
+      row's own predecessor and an incoming link) wins even though a
+      single foreign pointer names another machine, and a candidate
+      attested uniquely from one direction (with no contradicting
+      evidence from the other) attributes the row; a duplicated
+      identifier is non-evidence in both directions, and a genuine
+      one-direction disagreement stays unresolved and falls through
+      below. Together these rules keep a conflicting chain link or a
+      cross-machine duplicate id from moving the original machine's
+      record into the machine the corrupted column names, and keep
+      another machine's duplicate row out of its result;
     * when neither evidence survives, the stored ownership column is
       trusted, so a record whose ownership column is intact but whose
       other business fields are damaged still belongs to its stored
@@ -590,19 +603,47 @@ def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
     # ``previous_access_id`` naming an attributed row, or an attributed
     # row's stored ``previous_access_id`` naming this row — attributes the
     # row to the same machine. Applied to a fixpoint so a run of damaged
-    # rows is recovered through its sound ends. A row linked to rows of two
-    # different machines stays unclaimed (the conflict is itself damage) and
-    # falls through to the stored ownership column below.
+    # rows is recovered through its sound ends. Evidence is collected from
+    # the two directions separately:
+    #
+    # * an owner attested from BOTH the row's own predecessor and an
+    #   incoming link is corroborated and wins outright, even when a
+    #   single conflicting foreign link names another machine — the row's
+    #   genuine chain reaches it from both ends while a lone foreign
+    #   pointer does not;
+    # * a candidate attested uniquely from one direction (the other
+    #   direction carries no evidence) attributes the row, so a first
+    #   record reached only from its successor or a tail record reached
+    #   only through its predecessor is still recovered;
+    # * a duplicated identifier is non-evidence in both directions (it
+    #   cannot identify one predecessor or one target), and one-direction
+    #   evidence that genuinely disagrees attributes nothing; such rows
+    #   fall through to the stored ownership column below. These rules keep
+    #   a duplicated identifier or a conflicting chain link from moving the
+    #   original machine's record into the machine a corrupted column
+    #   names, and keep another machine's duplicate row out.
     rows_by_record_id: dict[str, list[int]] = {}
     referrers: dict[str, list[int]] = {}
     for index, row in enumerate(all_rows):
         mapping = row._mapping
         record_id = mapping["id"]
         if isinstance(record_id, str):
+            # A duplicated identifier resolves to every row carrying it;
+            # each attributed one becomes a candidate the fixpoint weighs.
             rows_by_record_id.setdefault(record_id, []).append(index)
         stored_previous = mapping["previous_access_id"]
         if isinstance(stored_previous, str):
             referrers.setdefault(stored_previous, []).append(index)
+
+    # A duplicated identifier can no longer uniquely identify a row. A link
+    # that names one is ambiguous in both directions — a row's own predecessor
+    # cannot pick one carrier, and an incoming link cannot name one target —
+    # so it attributes nothing on its own. A genuine chain never duplicates an
+    # id; duplication is always storage damage, and the affected row falls
+    # back to its stored ownership column below like any link-less row.
+    duplicated_record_ids = {
+        record_id for record_id, indices in rows_by_record_id.items() if len(indices) > 1
+    }
 
     changed = True
     while changed:
@@ -611,19 +652,38 @@ def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
             if index in owners:
                 continue
             mapping = row._mapping
-            linked_owners: set[str] = set()
+            own_owners: set[str] = set()
             stored_previous = mapping["previous_access_id"]
-            if isinstance(stored_previous, str):
+            if (
+                isinstance(stored_previous, str)
+                and stored_previous not in duplicated_record_ids
+            ):
                 for other in rows_by_record_id.get(stored_previous, ()):
                     if other in owners:
-                        linked_owners.add(owners[other])
+                        own_owners.add(owners[other])
+            incoming_owners: set[str] = set()
             record_id = mapping["id"]
-            if isinstance(record_id, str):
+            if (
+                isinstance(record_id, str)
+                and record_id not in duplicated_record_ids
+            ):
                 for other in referrers.get(record_id, ()):
                     if other in owners:
-                        linked_owners.add(owners[other])
-            if len(linked_owners) == 1:
-                owners[index] = linked_owners.pop()
+                        incoming_owners.add(owners[other])
+            corroborated = own_owners & incoming_owners
+            if corroborated:
+                candidates = corroborated
+            elif not own_owners:
+                candidates = incoming_owners
+            elif not incoming_owners:
+                candidates = own_owners
+            else:
+                # The two sides name different single owners and neither is
+                # corroborated; the conflict is itself damage and the
+                # stored ownership column gets the final say below.
+                candidates = set()
+            if len(candidates) == 1:
+                owners[index] = candidates.pop()
                 changed = True
 
     members = []

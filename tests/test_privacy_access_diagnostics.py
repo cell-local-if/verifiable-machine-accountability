@@ -739,6 +739,152 @@ def test_doubly_damaged_middle_record_is_recovered_through_both_links(
     assert diagnose(client, other)["checked_count"] == 0
 
 
+def test_doubly_damaged_record_with_a_conflicting_foreign_link_stays_owned(
+    client, tmp_path
+):
+    # A doubly damaged record (ownership overwritten to another machine AND a
+    # business field damaged, so its digest proves nothing) is anchored in the
+    # original machine's chain from both sides: its own predecessor points at
+    # a sound record of the original machine and the next record points back
+    # at it. A foreign record whose own predecessor link then points at the
+    # damaged record creates a CONFLICTING chain link — the original machine
+    # must still count the record (bad_ownership, plus the digest anomalies),
+    # keep listing the records after it, and the machine the corrupted
+    # column names must not gain it.
+    machine_id = create_machine(client)
+    first = register(client, machine_id, accessed_at=T0)
+    damaged = register(client, machine_id, accessed_at=T1)
+    third = register(client, machine_id, accessed_at=T2)
+    other = create_machine(client, "machine-2")
+    foreign = register(client, other, accessed_at=T3)
+
+    db = tmp_path / "test.db"
+    tamper(db, "UPDATE privacy_accesses SET machine_id = ?, result = 'xxx' WHERE id = ?",
+           (other, damaged["id"]))
+    # The foreign record's predecessor now points at the damaged record even
+    # though it belongs to another machine — the conflicting link.
+    tamper(db, "UPDATE privacy_accesses SET previous_access_id = ? WHERE id = ?",
+           (damaged["id"], foreign["id"]))
+
+    result = diagnose(client, machine_id)
+    assert result["valid"] is False
+    assert result["checked_count"] == 3
+    assert [r["id"] for r in result["records"]] == [
+        first["id"],
+        damaged["id"],
+        third["id"],
+    ]
+    damaged_record = result["records"][1]
+    assert damaged_record["position"] == 2
+    assert "bad_ownership" in damaged_record["errors"]
+    assert "bad_content_hash" in damaged_record["errors"]
+    assert "bad_chain_hash" in damaged_record["errors"]
+    # The record after the anomaly is still listed in its position.
+    assert result["records"][2]["position"] == 3
+
+    # The named machine keeps only its own record; the conflicting link never
+    # pulls the damaged row into its result (its own record just reports the
+    # bad predecessor pointer).
+    named = diagnose(client, other)
+    assert [r["id"] for r in named["records"]] == [foreign["id"]]
+    assert named["records"][0]["errors"] == ["bad_previous"]
+    assert all(r["id"] != damaged["id"] for r in named["records"])
+
+
+def _recreate_access_table_without_primary_key(db_path):
+    """Rebuild ``privacy_accesses`` without its primary-key constraint.
+
+    Direct storage damage can leave two rows carrying the same identifier;
+    SQLite dynamic typing lets the diagnostics read them, but the normal
+    schema's primary key rejects a second row with a duplicated id, so the
+    duplicated-identifier scenario needs the constraint dropped first.
+    """
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            "ALTER TABLE privacy_accesses RENAME TO privacy_accesses_old"
+        )
+        connection.execute(
+            "CREATE TABLE privacy_accesses ("
+            "id VARCHAR(36), machine_id VARCHAR(36), accessed_at VARCHAR, "
+            "window_start VARCHAR, window_end VARCHAR, result VARCHAR, "
+            "matches_count INTEGER, previous_access_id VARCHAR(36), "
+            "content_hash VARCHAR(64), chain_hash VARCHAR(64))"
+        )
+        connection.execute(
+            "INSERT INTO privacy_accesses "
+            "SELECT id, machine_id, accessed_at, window_start, window_end, "
+            "result, matches_count, previous_access_id, content_hash, "
+            "chain_hash FROM privacy_accesses_old"
+        )
+        connection.execute("DROP TABLE privacy_accesses_old")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_doubly_damaged_record_with_a_duplicated_foreign_id_stays_owned(
+    client, tmp_path
+):
+    # A second row carrying the SAME identifier as the doubly damaged record
+    # but carrying the other machine in its ownership column makes the
+    # damaged record's incoming back-link ambiguous (the shared id resolves
+    # to two rows). The damaged record is still recovered for the original
+    # machine through its own (unique) predecessor, keeps bad_ownership, and
+    # the records after it are still listed; the foreign duplicate row is
+    # other-machine data and must never enter the original machine's result,
+    # even though its identifier matches.
+    machine_id = create_machine(client)
+    first = register(client, machine_id, accessed_at=T0)
+    damaged = register(client, machine_id, accessed_at=T1)
+    third = register(client, machine_id, accessed_at=T2)
+    other = create_machine(client, "machine-2")
+    foreign = register(client, other, accessed_at=T3)
+
+    db = tmp_path / "test.db"
+    _recreate_access_table_without_primary_key(db)
+    # Ownership overwritten and a business field damaged, so the content
+    # digest proves neither machine.
+    tamper(db, "UPDATE privacy_accesses SET machine_id = ?, result = 'xxx' WHERE id = ?",
+           (other, damaged["id"]))
+    # A foreign duplicate of the identifier, with no verifiable digest and no
+    # predecessor of its own — its back-link through the shared id must not
+    # pull it into the original machine's result.
+    tamper(
+        db,
+        "INSERT INTO privacy_accesses (id, machine_id, accessed_at, "
+        "window_start, window_end, result, matches_count, "
+        "previous_access_id, content_hash, chain_hash) VALUES "
+        "(?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)",
+        (damaged["id"], other, T4, T1, T2, "success", 7),
+    )
+
+    result = diagnose(client, machine_id)
+    assert result["valid"] is False
+    # The original machine keeps exactly its three records; the foreign
+    # identifier duplicate never enters, and later records are still listed
+    # after the anomalous one.
+    assert result["checked_count"] == 3
+    assert [r["id"] for r in result["records"]] == [
+        first["id"],
+        damaged["id"],
+        third["id"],
+    ]
+    damaged_record = result["records"][1]
+    assert damaged_record["position"] == 2
+    assert "bad_ownership" in damaged_record["errors"]
+    assert result["records"][2]["position"] == 3
+
+    # The other machine keeps its own genuine record and its stored duplicate
+    # row; neither relabeled row is the original machine's leaking in.
+    named = diagnose(client, other)
+    named_ids = [r["id"] for r in named["records"]]
+    assert foreign["id"] in named_ids
+    assert first["id"] not in named_ids
+    assert third["id"] not in named_ids
+
+
 # --------------------------------------------------------------------------- #
 # Serialization, read-only, persistence
 # --------------------------------------------------------------------------- #

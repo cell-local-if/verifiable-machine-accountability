@@ -1594,6 +1594,58 @@ reads records persisted across application restarts. `GET /health`, machine
 start/stop, authorization evaluation, the event chain, the existing exports,
 and the diagnostics error semantics are unchanged.
 
+## Read-only single-event accountability trace
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/accountability-trace`
+returns a deterministic, read-only, single-event closed-loop trace in one
+response. It adds a new query only; event registration, listing, the hash
+chain, exports, incident handling, responsibility attribution, and the
+health check are unchanged and no write entry is added. The caller submits
+only the path machine id and the path event id — no query parameters,
+repeated parameters, request body, or business filter:
+
+- any query string (including a repeated parameter), or a body carried on
+  the GET, returns `422 {"error":{"code":"invalid_query"}}` before the
+  machine or event is looked up and without reading any record;
+- a missing machine, a missing event, or an event owned by another machine
+  returns `404 {"error":{"code":"not_found"}}` with no closed-loop data;
+- a failure while reading the event or any associated record returns
+  `500 {"error":{"code":"internal_error"}}` with no event summary and none
+  of the association arrays;
+- the path accepts `GET` only; `HEAD` and every other method return `405`
+  without reading records, computing a trace, or writing anything.
+
+A successful response is exactly six groups in this fixed order. The first,
+`event_summary`, is a single object (never an array) carrying the selected
+event's result and reason (`allowed`, `reason`), its creation moment
+(`created_at`), and its chain fields (`previous_event_id`, `content_hash`,
+`chain_hash`). The other five groups are arrays: `evidence`, `incidents`,
+`status_history`, `responsibility_assignments`, and `causal_links`.
+
+The evidence, incidents, status-history, and responsibility-assignment
+groups contain only records whose own `machine_id` is the path machine and
+whose own `event_id` is the selected event; a damaged parent object never
+filters a child (for example, a status transition or assignment is still
+traced when its stored incident no longer exists). `causal_links` contains
+the machine-owned associations whose stored `cause_event_id` OR
+`effect_event_id` points at the selected event; the other endpoint is
+emitted exactly as stored, even when it dangles or repeats. Every record is
+output with its complete stored fields — evidence keeps its
+`content_digest` and evidence chain fields, status transitions keep their
+chain fields, and assignments keep theirs — with no repair, recomputation,
+normalization, or dropping of a damaged, duplicated, or dangling value.
+
+Each array is ordered by the actual UTC instant of its own `created_at` and
+then by record id ascending, so an exact-second record precedes a
+fractional-second record of the same second; a `created_at` whose original
+text no longer parses is kept verbatim and sorts after every parseable
+instant instead of crashing. Every array is present, an empty array when
+the event has no record of that kind. The query is strictly read-only and
+machine isolated (another machine's records never enter a group), and the
+body is compact UTF-8 JSON in a fixed field order terminated by a single
+newline, free of floating-point, `-0.0`, or non-finite values, and
+byte-identical on repeat calls and across application restarts.
+
 ## Read-only desensitized privacy responsibility export
 
 `GET /machines/{machine_id}/authorization-decision-events/privacy-responsibility/compliance-export`
@@ -1965,7 +2017,16 @@ machine — so the original machine still counts the record in
 corrupted ownership column now names never gains it; and when neither
 evidence survives, the stored ownership column is trusted, so a record whose
 ownership column is intact but whose other business fields are damaged stays
-in its stored machine's total.
+in its stored machine's total. The two link directions are weighed
+separately when a duplicated identifier or a conflicting link produces more
+than one candidate owner: an owner corroborated from both directions (the
+row's own predecessor and an incoming link) wins over a single foreign
+pointer, and a candidate attested uniquely from one direction attributes the
+row, so a conflicting chain link keeps the original machine's record
+flagged `bad_ownership` and listed with the records after it rather than
+moving it; a duplicated identifier is non-evidence in either direction
+(it cannot identify one predecessor or one target), so a foreign row that
+shares an identifier never enters the original machine's result.
 
 Each record is exactly `{id, position, previous_access_id, content_hash,
 chain_hash, errors}`: the actual stored record id, its position, its stored
