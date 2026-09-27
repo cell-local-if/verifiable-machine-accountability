@@ -15,6 +15,7 @@ later declaration/rule changes never retroactively breaking a faithful
 historical snapshot, and persistence across restarts.
 """
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -124,6 +125,95 @@ def tamper_snapshot(client, event_id, mutate, *, raw=None):
         event_id,
         json.dumps(document, ensure_ascii=False, separators=(",", ":")),
     )
+
+
+def set_machine_row_status(client, machine_id, status):
+    """Set only the machines.status column, bypassing the history append.
+
+    This simulates the defect the new audit closes: the current machine row
+    can be made to agree (or disagree) with a snapshot independently of the
+    immutable transition history.
+    """
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text("UPDATE machines SET status = :s WHERE id = :id").bindparams(
+                s=status, id=machine_id
+            )
+        )
+
+
+def insert_status_event(
+    client,
+    *,
+    event_history_id,
+    machine_id,
+    from_status,
+    to_status,
+    created_at,
+):
+    """Insert one raw machine_status_events row without touching the machine."""
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO machine_status_events "
+                "(id, machine_id, from_status, to_status, created_at) "
+                "VALUES (:id, :mid, :fs, :ts, :at)"
+            ).bindparams(
+                id=event_history_id,
+                mid=machine_id,
+                fs=from_status,
+                ts=to_status,
+                at=created_at,
+            )
+        )
+
+
+def list_status_events(client, machine_id):
+    with client.app.state.engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT id, from_status, to_status, created_at "
+                "FROM machine_status_events WHERE machine_id = :id "
+                "ORDER BY created_at, id"
+            ).bindparams(id=machine_id)
+        ).all()
+        return [dict(row._mapping) for row in rows]
+
+
+def shift_status_event(client, event_history_id, *, seconds):
+    """Move one history record's created_at by a signed number of seconds."""
+    with client.app.state.engine.begin() as conn:
+        row = conn.execute(
+            text(
+                "SELECT created_at FROM machine_status_events WHERE id = :id"
+            ).bindparams(id=event_history_id)
+        ).one()
+        original = row[0]
+        instant = datetime.fromisoformat(original[:-1] + "+00:00")
+        moved = instant + timedelta(seconds=seconds)
+        stamp = moved.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        conn.execute(
+            text(
+                "UPDATE machine_status_events SET created_at = :at WHERE id = :id"
+            ).bindparams(at=stamp, id=event_history_id)
+        )
+        return stamp
+
+
+def suspend(client, machine_id):
+    response = client.post(
+        f"/machines/{machine_id}/status", json={"status": "suspended"}
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def reactivate(client, machine_id):
+    response = client.post(
+        f"/machines/{machine_id}/status", json={"status": "active"}
+    )
+    assert response.status_code == 200
+    return response.json()
 
 
 # --------------------------------------------------------------------------- #
@@ -367,6 +457,7 @@ def test_missing_snapshot_reports_snapshot_not_found_without_fabrication(client)
         "authorization_decision_basis",
         "behavior_declarations",
         "policy_rules",
+        "machine_status_events",
     ],
 )
 def test_real_read_failure_is_internal_error_without_partial_result(
@@ -632,7 +723,9 @@ def test_status_read_flags_must_match_status(client):
     create_rule(client)
     event = record_event(client, machine_id).json()
 
-    # Active machine recorded as not having read declarations.
+    # Active machine recorded as not having read declarations. The event-time
+    # history rebuilds to active and agrees with the recorded status; only the
+    # read flag contradicts the gate in force then.
     tamper_snapshot(
         client, event["id"], lambda doc: doc["status_basis"].__setitem__(
             "declarations_read", False
@@ -640,11 +733,50 @@ def test_status_read_flags_must_match_status(client):
     )
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "status_basis_mismatch",
+        "read_flags_mismatch",
     )
 
 
-def test_suspended_basis_with_records_or_read_flag_is_status_mismatch(client):
+def test_declaration_read_flag_contradicting_gate_is_read_flags_mismatch(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id)
+    create_rule(client)
+    event = record_event(client, machine_id).json()
+
+    # status_basis records the declarations read, but the declaration group's
+    # own read flag denies it; the rebuilt state is active and only the flag
+    # disagrees.
+    tamper_snapshot(
+        client, event["id"], lambda doc: doc["declaration_basis"].__setitem__(
+            "read", False
+        )
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "read_flags_mismatch",
+    )
+
+
+def test_policy_read_flag_against_declaration_gate_is_read_flags_mismatch(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    # No rule is needed: the declaration matches, so the gate opens, but the
+    # snapshot falsely records that policy was not read.
+    event = record_event(client, machine_id, resource="res/x").json()
+    assert event["reason"] == "no_matching_policy"
+
+    tamper_snapshot(
+        client, event["id"], lambda doc: doc["status_basis"].__setitem__(
+            "policies_read", False
+        )
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "read_flags_mismatch",
+    )
+
+
+def test_suspended_basis_with_records_or_read_flag_is_read_flags_mismatch(client):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -660,7 +792,7 @@ def test_suspended_basis_with_records_or_read_flag_is_status_mismatch(client):
     )
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "status_basis_mismatch",
+        "read_flags_mismatch",
     )
 
 
@@ -876,6 +1008,430 @@ def test_broken_conclusion_is_stable_across_repeats(client):
     first = audit(client, machine_id, event["id"]).content
     for _ in range(3):
         assert audit(client, machine_id, event["id"]).content == first
+
+
+# --------------------------------------------------------------------------- #
+# Event-time machine status reconstruction from transition history
+# --------------------------------------------------------------------------- #
+
+
+def _z_around(event_created_at, *, seconds):
+    instant = datetime.fromisoformat(event_created_at[:-1] + "+00:00")
+    return (instant + timedelta(seconds=seconds)).astimezone(
+        timezone.utc
+    ).isoformat().replace("+00:00", "Z")
+
+
+def test_active_event_followed_by_suspension_stays_valid(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+    assert event["reason"] == "allowed_by_policy"
+
+    # A later transition (and the machine's now-suspended current row) must
+    # not retroactively change the event-time state: the audit rebuilds as of
+    # the capture instant and excludes the later suspension.
+    suspend(client, machine_id)
+    body = audit(client, machine_id, event["id"]).json()
+    assert body["valid"] is True and body["checked_count"] == 1
+
+
+def test_suspended_then_reactivated_before_event_is_active(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    suspend(client, machine_id)
+    reactivate(client, machine_id)
+    event = record_event(client, machine_id, resource="res/x").json()
+    assert event["reason"] == "allowed_by_policy"
+
+    body = audit(client, machine_id, event["id"]).json()
+    assert body["valid"] is True
+
+
+def test_suspended_event_followed_by_reactivation_stays_suspended(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    suspend(client, machine_id)
+    event = record_event(client, machine_id, resource="res/x").json()
+    assert event["reason"] == "machine_suspended"
+
+    # The machine is active again *now* (current row disagrees with the
+    # snapshot), but at the suspended event's instant it was suspended. The
+    # audit must keep the event-time state and still verify.
+    reactivate(client, machine_id)
+    body = audit(client, machine_id, event["id"]).json()
+    assert body["valid"] is True and body["checked_count"] == 1
+
+
+def test_empty_history_rebuilds_to_active_default(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    assert list_status_events(client, machine_id) == []
+    assert audit(client, machine_id, event["id"]).json()["valid"] is True
+
+
+def test_current_machine_row_is_never_the_source_of_state(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    # Flip only the current machines.status column; the history still shows
+    # the machine active at the event. The audit must ignore the current row.
+    set_machine_row_status(client, machine_id, "suspended")
+    assert audit(client, machine_id, event["id"]).json()["valid"] is True
+
+
+def test_active_snapshot_but_history_suspended_at_event_is_state_mismatch(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    # Forge a transition that already suspended the machine before the event,
+    # without changing the (active) current row. The snapshot's active status
+    # then matches today's state but contradicts the event instant.
+    insert_status_event(
+        client,
+        event_history_id="11111111-1111-1111-1111-111111111111",
+        machine_id=machine_id,
+        from_status="active",
+        to_status="suspended",
+        created_at=_z_around(event["created_at"], seconds=-5),
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_state_mismatch",
+    )
+
+
+def test_suspended_snapshot_but_history_active_at_event_is_state_mismatch(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    suspend(client, machine_id)
+    event = record_event(client, machine_id, resource="res/x").json()
+    assert event["reason"] == "machine_suspended"
+
+    # Move the only suspension to after the event. The machine is still
+    # suspended *now* (current row agrees with the snapshot), but at the event
+    # it was active: matching the current state must not save the snapshot.
+    suspend_row = list_status_events(client, machine_id)[0]
+    shift_status_event(client, suspend_row["id"], seconds=+120)
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_state_mismatch",
+    )
+
+
+def test_transition_at_exactly_the_capture_instant_forms_state(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    # An equal-instant transition is not later than capture, so it forms the
+    # state then (<= boundary): the machine is suspended at that instant.
+    insert_status_event(
+        client,
+        event_history_id="22222222-2222-2222-2222-222222222222",
+        machine_id=machine_id,
+        from_status="active",
+        to_status="suspended",
+        created_at=event["created_at"],
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_state_mismatch",
+    )
+
+
+def test_same_instant_transitions_apply_in_ascending_id_order(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    # Two equal-instant transitions. Applied in ascending id order the chain is
+    # legal (active->suspended then suspended->active) and the state at the
+    # capture instant is active; in descending order the second edge would not
+    # continue the carried state and the history would be unbuildable.
+    insert_status_event(
+        client,
+        event_history_id="aaaaaaaa-0000-0000-0000-000000000000",
+        machine_id=machine_id,
+        from_status="active",
+        to_status="suspended",
+        created_at=event["created_at"],
+    )
+    insert_status_event(
+        client,
+        event_history_id="bbbbbbbb-0000-0000-0000-000000000000",
+        machine_id=machine_id,
+        from_status="suspended",
+        to_status="active",
+        created_at=event["created_at"],
+    )
+    assert audit(client, machine_id, event["id"]).json()["valid"] is True
+
+
+def test_state_mismatch_precedes_read_flag_and_declaration_checks(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    def mutate(doc):
+        # History will rebuild to suspended; also break a read flag. The state
+        # contradiction is the earlier category and must win.
+        doc["status_basis"]["policies_read"] = True
+
+    insert_status_event(
+        client,
+        event_history_id="33333333-3333-3333-3333-333333333333",
+        machine_id=machine_id,
+        from_status="active",
+        to_status="suspended",
+        created_at=_z_around(event["created_at"], seconds=-5),
+    )
+    tamper_snapshot(client, event["id"], mutate)
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_state_mismatch",
+    )
+
+
+def test_damaged_history_timestamp_is_status_history_invalid(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    suspend(client, machine_id)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE machine_status_events SET created_at = 'not-a-time'"
+            )
+        )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_history_invalid",
+    )
+
+
+def test_damaged_history_id_is_status_history_invalid(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    with client.app.state.engine.begin() as conn:
+        # A non-text id (stored as a BLOB) cannot give a stable same-instant
+        # order; it survives the String column read as bytes.
+        conn.execute(
+            text(
+                "INSERT INTO machine_status_events "
+                "(id, machine_id, from_status, to_status, created_at) "
+                "VALUES (CAST('98765' AS BLOB), :mid, 'active', 'suspended', :at)"
+            ).bindparams(mid=machine_id, at=_z_around(event["created_at"], seconds=-5))
+        )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_history_invalid",
+    )
+
+
+@pytest.mark.parametrize(
+    "from_status,to_status",
+    [
+        ("active", "deleted"),
+        ("suspended", "active-ish"),
+        ("active", "active"),
+        ("suspended", "suspended"),
+    ],
+)
+def test_illegal_transition_edge_is_status_history_invalid(
+    client, from_status, to_status
+):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    insert_status_event(
+        client,
+        event_history_id="44444444-4444-4444-4444-444444444444",
+        machine_id=machine_id,
+        from_status=from_status,
+        to_status=to_status,
+        created_at=_z_around(event["created_at"], seconds=-5),
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_history_invalid",
+    )
+
+
+def test_non_continuing_edge_is_status_history_invalid(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    # Two active->suspended edges: the second cannot continue the suspended
+    # state the first already established.
+    insert_status_event(
+        client,
+        event_history_id="55555555-5555-5555-5555-555555555555",
+        machine_id=machine_id,
+        from_status="active",
+        to_status="suspended",
+        created_at=_z_around(event["created_at"], seconds=-20),
+    )
+    insert_status_event(
+        client,
+        event_history_id="66666666-6666-6666-6666-666666666666",
+        machine_id=machine_id,
+        from_status="active",
+        to_status="suspended",
+        created_at=_z_around(event["created_at"], seconds=-10),
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_history_invalid",
+    )
+
+
+def test_damaged_future_record_still_counts_as_invalid_history(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    # A damaged (self-edge) record committed after the capture still belongs to
+    # this machine's one append-only history and must be counted, not hidden by
+    # the as-of boundary.
+    insert_status_event(
+        client,
+        event_history_id="77777777-7777-7777-7777-777777777777",
+        machine_id=machine_id,
+        from_status="active",
+        to_status="active",
+        created_at=_z_around(event["created_at"], seconds=20),
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_history_invalid",
+    )
+
+
+def test_history_invalid_precedes_state_mismatch(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    # Damaged history AND a snapshot status that the (damaged) rebuild cannot
+    # confirm: the history defect is reported first.
+    insert_status_event(
+        client,
+        event_history_id="88888888-8888-8888-8888-888888888888",
+        machine_id=machine_id,
+        from_status="active",
+        to_status="suspended",
+        created_at="garbage",
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_history_invalid",
+    )
+
+
+def test_damaged_history_conclusion_is_stable_across_repeats(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    suspend(client, machine_id)
+    event = record_event(client, machine_id, resource="res/x").json()
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE machine_status_events SET to_status = 'frozen'"
+            )
+        )
+    first = audit(client, machine_id, event["id"]).content
+    for _ in range(3):
+        assert audit(client, machine_id, event["id"]).content == first
+
+
+def test_other_machine_status_history_never_enters(client):
+    one = create_machine(client, external_id="machine-1")
+    two = create_machine(client, external_id="machine-2")
+    declare(client, one, resource_pattern="*")
+    declare(client, two, resource_pattern="*")
+    create_rule(client, resource_pattern="*", effect="allow", priority=0)
+    event_one = record_event(client, one, resource="a").json()
+    record_event(client, two, resource="b")
+
+    # Damage machine two's history only; machine one's audit is untouched, and
+    # machine one's healthy history cannot repair machine two's view.
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO machine_status_events "
+                "(id, machine_id, from_status, to_status, created_at) "
+                "VALUES (:hid, :mid, 'active', 'active', :at)"
+            ).bindparams(
+                hid="99999999-9999-9999-9999-999999999999",
+                mid=two,
+                at="2020-01-01T00:00:00Z",
+            )
+        )
+    body_one = audit(client, one, event_one["id"]).json()
+    assert body_one["valid"] is True and body_one["checked_count"] == 1
+    event_two = client.get(
+        f"/machines/{two}/authorization-decision-events"
+    ).json()[0]
+    _assert_broken(
+        audit(client, two, event_two["id"]), event_two["id"],
+        "status_history_invalid",
+    )
+
+
+def test_audit_does_not_write_or_repair_status_history(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client)
+    suspend(client, machine_id)
+    event = record_event(client, machine_id, resource="res/x").json()
+
+    def counts():
+        with client.app.state.engine.connect() as conn:
+            return {
+                name: conn.execute(
+                    text(f"SELECT COUNT(*) FROM {name}")
+                ).scalar_one()
+                for name in (
+                    "machine_status_events",
+                    "authorization_decision_basis",
+                    "behavior_declarations",
+                    "policy_rules",
+                )
+            }
+
+    before_rows = list_status_events(client, machine_id)
+    before = counts()
+    audit(client, machine_id, event["id"])
+    audit(client, machine_id, event["id"])
+    assert counts() == before
+    assert list_status_events(client, machine_id) == before_rows
 
 
 # --------------------------------------------------------------------------- #

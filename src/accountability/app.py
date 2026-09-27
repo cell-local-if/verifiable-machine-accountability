@@ -7701,21 +7701,29 @@ def get_authorization_decision_event_decision_basis_integrity(
     conclusion, ``null`` on success), and ``reason`` (``null`` on success,
     the fixed ``snapshot_not_found`` for a missing row, otherwise the stable
     first-anomaly category). The event summary is compared verbatim with
-    the committed result, reason, capture moment, and chain fields; a
-    suspended machine's basis must record that declarations and policy were
-    not read; the declaration basis may name only the participating enabled
-    declarations; candidate winner/overridden/conflict/unmatched relations
-    and the conflict group must follow the priority as of the event and
-    support the committed decision. The audit never recomputes or repairs a
-    record and never fabricates a missing basis.
+    the committed result, reason, capture moment, and chain fields; the
+    machine status is independently reconstructed as of the event from the
+    machine's own status-transition history (transitions not later than the
+    capture instant, same-instant in id order, active default) — not from
+    the current machine row — yielding ``status_history_invalid`` (a
+    misattributed, illegal, or non-rebuildable history),
+    ``status_state_mismatch`` (rebuilt state differs from the snapshot), or
+    ``read_flags_mismatch`` (the declarations/policy read flags contradict
+    the gate in force then) in that order; a suspended machine's basis must
+    record that declarations and policy were not read; the declaration
+    basis may name only the participating enabled declarations; candidate
+    winner/overridden/conflict/unmatched relations and the conflict group
+    must follow the priority as of the event and support the committed
+    decision. The audit never recomputes or repairs a record, never
+    fabricates a missing basis, and never fabricates status history.
 
     The check is strictly read-only and machine isolated; the conclusion is
     serialized as compact UTF-8 JSON in fixed field order terminated by a
     single newline, with no floating-point or non-finite value, so repeated
     queries against the same stored rows are byte-for-byte identical and the
     audit reads persistent snapshots across restarts. A real failure while
-    reading the event, snapshot, declarations, or rules is a 500
-    ``internal_error`` carrying no conclusion and no partial result.
+    reading the event, snapshot, status history, declarations, or rules is a
+    500 ``internal_error`` carrying no conclusion and no partial result.
     """
     # Ownership and existence are ordinary 404 outcomes; every real read
     # failure below (event, snapshot, declarations, rules) is a read-layer

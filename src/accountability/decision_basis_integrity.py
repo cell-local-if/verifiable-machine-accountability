@@ -40,6 +40,38 @@ declarations for the action that already existed at the event instant: the
 stored set is only allowed to name the declarations participating in this
 action/resource judgement, so a missing, disabled, other-action, or
 superfluous record is an inconsistency.
+
+The status basis is audited against the machine's status *as of the event*,
+not its current row. The audit independently reads the machine's own
+``machine_status_events`` transition history and folds it to the capture
+instant: only a transition whose actual creation instant is not later than
+the capture instant (``created_at <= capture``) forms the state then, equal
+instants apply in ascending ``id`` order, and with no qualifying transition
+the machine's creation default ``active`` carries forward unchanged. A
+snapshot that merely matches the machine's current status while
+contradicting this event-time reconstruction is rejected. Every stored
+transition of the machine is counted in the judgement, including one
+committed after the capture, because the history is one append-only chain
+whose edges must continue one another. The fixed status categories are:
+
+* ``status_history_invalid`` — the history is misattributed, illegal, or not
+  rebuildable: a non-text/unparseable ``created_at`` (the as-of boundary is
+  undecidable), a non-text ``id`` (same-instant order unstable), a status
+  outside ``active``/``suspended``, a self edge, or a ``from_status`` that
+  does not continue the carried state;
+* ``status_state_mismatch`` — the history rebuilds soundly but the rebuilt
+  event-time status differs from the snapshot's recorded ``status``;
+* ``read_flags_mismatch`` — the state agrees but the recorded
+  ``declarations_read``/``policies_read`` flags (and the declaration group's
+  own ``read`` flag) contradict the gate in force then: a suspended machine
+  reads neither, an active machine reads declarations, and policy is read
+  only when at least one participating declaration matched.
+
+These three are examined in that order (history, state, read flags), after
+the event summary and before the declaration content, policy relations, and
+final decision. A damaged history record is reported as the stable category,
+never crashed on, repaired, rewritten, or recomputed; a real failure while
+reading the history is a ``500 internal_error`` carrying no conclusion.
 """
 
 from datetime import datetime, timezone
@@ -51,7 +83,7 @@ from sqlalchemy.orm import Session
 
 from .authorization import pattern_matches
 from . import policy_preview
-from .db import BehaviorDeclaration
+from .db import BehaviorDeclaration, MachineStatusEvent
 
 _FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
 
@@ -118,6 +150,9 @@ _MALFORMED_DECLARATION_BASIS = "malformed_declaration_basis"
 _MALFORMED_POLICY_CANDIDATES = "malformed_policy_candidates"
 _MALFORMED_DECISION = "malformed_decision"
 _EVENT_SUMMARY_MISMATCH = "event_summary_mismatch"
+_STATUS_HISTORY_INVALID = "status_history_invalid"
+_STATUS_STATE_MISMATCH = "status_state_mismatch"
+_READ_FLAGS_MISMATCH = "read_flags_mismatch"
 _STATUS_BASIS_MISMATCH = "status_basis_mismatch"
 _DECLARATION_BASIS_MISMATCH = "declaration_basis_mismatch"
 _DECLARATION_MATCH_MISMATCH = "declaration_match_mismatch"
@@ -129,6 +164,7 @@ _CANDIDATE_ORDER = "candidate_order"
 _DECISION_MISMATCH = "decision_mismatch"
 
 _DECLARATION_TABLE = BehaviorDeclaration.__table__
+_HISTORY_TABLE = MachineStatusEvent.__table__
 
 
 def _created_instant(value: object) -> datetime:
@@ -478,6 +514,111 @@ def _declarations_existing_at(
     ]
 
 
+def _load_machine_status_history(
+    session: Session, machine_id: str
+) -> list[dict[str, Any]]:
+    """Read the path machine's own status-transition history, unordered.
+
+    This is the audit's independent read of ``machine_status_events``: it
+    never consults the machine's current ``status`` column (the snapshot
+    could agree with today's state while contradicting the event instant).
+    Read-only and scoped to the path machine, so another machine's
+    transitions never enter. A real storage failure propagates to the
+    caller (``500 internal_error``); damaged row *content* never raises —
+    the reconstruction classifies it.
+    """
+    rows = session.execute(
+        select(
+            _HISTORY_TABLE.c.id,
+            _HISTORY_TABLE.c.from_status,
+            _HISTORY_TABLE.c.to_status,
+            _HISTORY_TABLE.c.created_at,
+        ).where(_HISTORY_TABLE.c.machine_id == machine_id)
+    ).all()
+    return [dict(row._mapping) for row in rows]
+
+
+def _reconstruct_status_at(
+    rows: list[dict[str, Any]], capture_instant: datetime
+) -> tuple[str | None, str | None]:
+    """Rebuild the machine status in effect at the snapshot capture instant.
+
+    Independent fold over the machine's own transition history: only a
+    transition whose actual creation instant is not later than the capture
+    instant forms the state then (``created_at <= capture``), same-instant
+    transitions apply in ascending ``id`` order, and with no qualifying
+    transition the machine's creation default ``active`` carries forward
+    unchanged. This reconstructs the state *as of the event*, never the
+    current machine row.
+
+    Returns ``(status, None)`` on success or ``(None, reason)`` when the
+    history is misattributed, illegal, or not rebuildable
+    (``status_history_invalid``). Every stored record is counted in the
+    judgement, even one committed after the capture: the history is one
+    append-only transition chain whose edges must continue one another, so a
+    damaged record cannot hide behind the as-of boundary. A non-string stamp
+    or a stamp that no longer parses makes ordering and the as-of prefix
+    boundary undecidable; a non-string id prevents stable same-instant
+    ordering; a status outside the ``active``/``suspended`` pair, a self
+    edge, or a ``from_status`` that does not continue the carried state is a
+    misattributed/illegal transition. Such a record is reported, never
+    crashed on, repaired, rewritten, or recomputed.
+
+    The as-of state itself is formed only by transitions whose instant is not
+    later than the capture instant; later transitions are validated for chain
+    legality but do not change the state returned for the event.
+    """
+    # An unparseable (or non-string) stamp anywhere leaves ordering and the
+    # record's place relative to the capture instant undecidable: the tolerant
+    # far-future convention could push an actually earlier suspension past the
+    # boundary, which would risk accepting a state that contradicts the event.
+    # The history therefore cannot be rebuilt soundly.
+    for row in rows:
+        stamp = row.get("created_at")
+        if not isinstance(stamp, str) or _created_instant(stamp) == _FAR_FUTURE:
+            return None, _STATUS_HISTORY_INVALID
+
+    # Actual UTC instant first, then id ascending; a damaged non-string id
+    # sorts as empty for the ordering pass and is rejected below.
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            _created_instant(row.get("created_at")),
+            row.get("id") if isinstance(row.get("id"), str) else "",
+        ),
+    )
+
+    # A machine is created active and each accepted transition alternates the
+    # carried state; the as-of state starts at that active default and moves
+    # only on a not-later transition. ``carried`` validates the whole append-
+    # only chain; ``state_at_capture`` is the state for the event.
+    carried = "active"
+    state_at_capture = "active"
+    for row in ordered:
+        row_id = row.get("id")
+        from_status = row.get("from_status")
+        to_status = row.get("to_status")
+        if not isinstance(row_id, str):
+            return None, _STATUS_HISTORY_INVALID
+        if from_status not in ("active", "suspended") or to_status not in (
+            "active",
+            "suspended",
+        ):
+            return None, _STATUS_HISTORY_INVALID
+        if from_status == to_status:
+            # A self edge is never written by the status-change entry.
+            return None, _STATUS_HISTORY_INVALID
+        if from_status != carried:
+            # Misattributed/illegal edge: it does not continue the state the
+            # earlier transitions establish (e.g. a second active->suspended
+            # record once the machine is already suspended).
+            return None, _STATUS_HISTORY_INVALID
+        carried = to_status
+        if _created_instant(row.get("created_at")) <= capture_instant:
+            state_at_capture = to_status
+    return state_at_capture, None
+
+
 def _check_status_and_declarations(
     session: Session,
     *,
@@ -487,6 +628,20 @@ def _check_status_and_declarations(
     declaration_basis: dict[str, Any],
 ) -> tuple[str | None, str, bool]:
     """Validate status and declaration basis; return (problem, status, matched).
+
+    The status basis is judged in the fixed order history, state, then read
+    flags:
+
+    1. the snapshot-carried facts (status value, ownership, capture moment);
+    2. the machine's own transition history, independently rebuilt as of the
+       capture instant — ``status_history_invalid`` when misattributed,
+       illegal, or not rebuildable;
+    3. the rebuilt event-time state against the recorded status —
+       ``status_state_mismatch`` when they differ;
+    4. the read flags against the gate in force then — a suspended machine
+       reads neither declarations nor policy, an active machine reads
+       declarations and reads policy only once a declaration matched —
+       ``read_flags_mismatch`` on any disagreement.
 
     ``matched`` says whether at least one participating enabled declaration
     matched the event resource — the gate for reading policy rules. A problem
@@ -500,25 +655,38 @@ def _check_status_and_declarations(
     if status_basis["captured_at"] != event.created_at:
         return _STATUS_BASIS_MISMATCH, status, False
 
+    # Rebuild the status in effect when the snapshot was taken from the
+    # transition history — never from today's machine row, which could match
+    # the snapshot while contradicting the event instant.
+    history_rows = _load_machine_status_history(session, machine_id)
+    rebuilt, history_problem = _reconstruct_status_at(
+        history_rows, _created_instant(event.created_at)
+    )
+    if history_problem is not None:
+        return history_problem, status, False
+    if rebuilt != status:
+        return _STATUS_STATE_MISMATCH, status, False
+
     declarations_read = status == "active"
     policies_read = status_basis["policies_read"]
     if status_basis["declarations_read"] is not declarations_read:
-        return _STATUS_BASIS_MISMATCH, status, False
+        return _READ_FLAGS_MISMATCH, status, False
     if declaration_basis["read"] is not declarations_read:
-        return _DECLARATION_BASIS_MISMATCH, status, False
-
-    items = declaration_basis["declarations"]
+        return _READ_FLAGS_MISMATCH, status, False
 
     if status == "suspended":
         # A suspended machine reads neither declarations nor policy: both
-        # groups must explicitly record no read and an empty collection. The
-        # audit therefore needs no declaration/rule table reads on this path.
+        # groups must explicitly record no read and an empty collection.
         if policies_read is not False:
-            return _STATUS_BASIS_MISMATCH, status, False
-        if items:
+            return _READ_FLAGS_MISMATCH, status, False
+        if declaration_basis["declarations"]:
             return _DECLARATION_BASIS_MISMATCH, status, False
         return None, status, False
 
+    # Active: derive the declaration gate independently from the stored
+    # participating declarations as of the event, then judge the policy read
+    # flag against that gate before auditing the recorded declaration items,
+    # keeping every read-flag check ahead of declaration content.
     stored = _enabled_action_declarations(session, machine_id, event.action_type)
     event_instant = _created_instant(event.created_at)
     existing = _declarations_existing_at(stored, event_instant)
@@ -544,12 +712,18 @@ def _check_status_and_declarations(
             }
         )
 
+    # policies_read must equal the declaration gate the decision used: policy
+    # is read only when at least one participating declaration matched.
+    if policies_read is not matched_any:
+        return _READ_FLAGS_MISMATCH, status, False
+
     # Active: the recorded set must name exactly the participating enabled
     # declarations — no missing, disabled, other-action, duplicated, or
     # superfluous row. The six stored identity/value fields are compared first
     # (ignoring the derived ``matched`` flag), so a tampered match flag on an
     # otherwise exact record keeps its own ``declaration_match_mismatch``
     # category instead of collapsing into the set mismatch.
+    items = declaration_basis["declarations"]
     identity_fields = (
         "id",
         "action_type",
@@ -583,9 +757,6 @@ def _check_status_and_declarations(
     if actual_keys != expected_keys:
         return _DECLARATION_ORDER, status, False
 
-    # policies_read must equal the declaration gate the decision used.
-    if policies_read is not matched_any:
-        return _STATUS_BASIS_MISMATCH, status, False
     return None, status, matched_any
 
 

@@ -162,30 +162,64 @@ The checks verify, in a fixed order: the document parses to the five expected
 groups with sound field types and ordering; the event summary corresponds
 verbatim to the event's committed `allowed` result, `reason`, capture moment
 (`created_at`), and chain fields (`previous_event_id`, `content_hash`,
-`chain_hash`) — nothing is recomputed or filled in; a suspended machine's
-basis explicitly records that declarations and policy were not read, while an
-active machine's read flags match its status and the declaration gate; the
-declaration basis names exactly the enabled declarations that participated in
-that action and resource judgement (a missing, disabled, other-action, or
-superfluous record is an inconsistency, and each `matched` scope flag must be
-correct); the policy candidates' winner/overridden/conflict/unmatched (and
-invalid) relations, winner group, conflict pairs, and priority-first ordering
-must follow the priorities as of the event and support the final judgement; and
-the final decision equals the event's committed `allowed` flag and `reason`.
-Relations are audited against the rules and declarations that already existed
-when the event committed, so later declarations or rules never retroactively
-break a faithful historical snapshot; the audit never recomputes or repairs a
-record and never fabricates a missing basis. An event without a snapshot row
-answers `valid false`, `checked_count 0`, `broken_basis_id` equal to the event
-id, and `reason "snapshot_not_found"`. A damaged, anomalously ordered, or
-self-contradictory snapshot answers `valid false`, `checked_count 1`, the event
-id, and the stable first-anomaly category. The conclusion is compact UTF-8 JSON
-in fixed field order terminated by one newline, with no floating-point or
-non-finite value, so identical stored data audits byte-for-byte identically,
-the result persists across restarts, and machine isolation is enforced. Event
-creation, the event list, the hash chain, evidence chain, incident
-responsibility, privacy exports, diagnostics, and health-check semantics are
-unchanged.
+`chain_hash`) — nothing is recomputed or filled in; the machine status is
+reconstructed **as of the event** from the machine's own
+`machine_status_events` transition history rather than its current row; a
+suspended machine's basis explicitly records that declarations and policy
+were not read, while an active machine's read flags match its status and the
+declaration gate; the declaration basis names exactly the enabled
+declarations that participated in that action and resource judgement (a
+missing, disabled, other-action, or superfluous record is an inconsistency,
+and each `matched` scope flag must be correct); the policy candidates'
+winner/overridden/conflict/unmatched (and invalid) relations, winner group,
+conflict pairs, and priority-first ordering must follow the priorities as of
+the event and support the final judgement; and the final decision equals the
+event's committed `allowed` flag and `reason`.
+
+The event-time status is rebuilt by an independent read of the machine's
+transition history: only a transition whose actual creation instant is not
+later than the capture instant (`created_at <= capture`) forms the state
+then, same-instant transitions apply in ascending `id` order, and with no
+qualifying transition the machine's creation default `active` carries
+forward unchanged. A snapshot that merely agrees with the machine's current
+status while contradicting that event-time state is rejected. The status
+basis is judged history, then state, then read flags, giving three fixed
+categories:
+
+- `status_history_invalid` — the history is misattributed, illegal, or not
+  rebuildable: a non-text or unparseable `created_at` (the as-of boundary is
+  undecidable), a non-text `id` (same-instant ordering unstable), a status
+  outside `active`/`suspended`, a self edge, or a `from_status` that does not
+  continue the state the earlier transitions establish. Every stored
+  transition of the machine is counted, including one committed after the
+  capture (the history is one append-only chain whose edges must continue one
+  another); a damaged record is reported, never crashed on, repaired,
+  rewritten, or recomputed;
+- `status_state_mismatch` — the history rebuilds soundly but the rebuilt
+  event-time status differs from the snapshot's recorded `status`;
+- `read_flags_mismatch` — the state agrees but the recorded
+  `declarations_read`/`policies_read` flags (and the declaration group's own
+  `read` flag) contradict the gate in force then: a suspended machine reads
+  neither declarations nor policy, an active machine reads declarations, and
+  policy is read only when at least one enabled declaration matched.
+
+A real failure while reading the status history (like the event, snapshot,
+declarations, or rules) returns `500 internal_error` with no conclusion and
+no partial result, and no status history is ever fabricated. Relations are
+audited against the rules and declarations that already existed when the
+event committed, so later declarations or rules never retroactively break a
+faithful historical snapshot; the audit never recomputes or repairs a record
+and never fabricates a missing basis. An event without a snapshot row
+answers `valid false`, `checked_count 0`, `broken_basis_id` equal to the
+event id, and `reason "snapshot_not_found"`. A damaged, anomalously ordered,
+or self-contradictory snapshot answers `valid false`, `checked_count 1`, the
+event id, and the stable first-anomaly category. The conclusion is compact
+UTF-8 JSON in fixed field order terminated by one newline, with no
+floating-point or non-finite value, so identical stored data audits
+byte-for-byte identically, the result persists across restarts, and machine
+isolation is enforced. Event creation, the event list, the hash chain,
+evidence chain, incident responsibility, privacy exports, diagnostics, and
+health-check semantics are unchanged.
 
 
 ## Machine suspension and reactivation
