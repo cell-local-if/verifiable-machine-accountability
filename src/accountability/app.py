@@ -1036,6 +1036,273 @@ def list_authorization_decision_events(machine_id: str, session: SessionDep):
     return [decision_event_to_out(e) for e in events]
 
 
+# --- read-only stable incremental query over one machine's decision events ---
+
+
+class DecisionEventListChangesParams(BaseModel):
+    limit: int
+    cursor: str | None = None
+
+
+def validate_decision_event_list_changes_params(
+    request: Request,
+) -> DecisionEventListChangesParams:
+    """Validate the decision-event ``changes`` query string before any lookup.
+
+    Exactly two parameters are accepted: the required ``limit`` and the
+    optional ``cursor``; no business filter parameters and no request body.
+    ``limit`` must be a non-boolean integer in 1..100; a missing, blank,
+    fractional, boolean, non-decimal, or out-of-range value is a 422
+    ``bad_limit``. ``cursor``, when present, must be a non-empty string
+    shaped ``<created_at original text>|<event id>``; an empty,
+    non-string, or shape-mismatching value is a 422 ``invalid_cursor``.
+    The timestamp segment is accepted verbatim as stored text rather than
+    parsed here: events whose stored ``created_at`` no longer parses sort
+    last and remain pageable, so a cursor legitimately built from such a
+    record must pass shape validation; locating the named event happens in
+    the handler while the path machine's events are read, and a position
+    that names no stored event of the path machine is a 422
+    ``invalid_cursor`` there. Any other parameter name, a repeated
+    ``limit`` or ``cursor``, or a request that carries a body is a 422
+    ``invalid_query`` — a repeated name is an unknown-shape query rather
+    than a bad single value, so it is reported as ``invalid_query`` even
+    when the repeated parameter is ``limit``/``cursor``. Every check in
+    this dependency runs before the machine or any event is read.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or event is read. A present non-zero Content-Length, or a
+    # chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``limit=1&limit=2`` (and a repeated ``cursor``) as ``invalid_query``
+    # rather than silently taking one occurrence, regardless of which name
+    # was repeated.
+    if len(request.query_params.getlist("limit")) > 1:
+        raise QueryError("invalid_query")
+    if len(request.query_params.getlist("cursor")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_limit = request.query_params.get("limit")
+    if raw_limit is None or not _INTEGER_QUERY_RE.fullmatch(raw_limit):
+        raise QueryError("bad_limit")
+    limit = int(raw_limit)
+    if not 1 <= limit <= 100:
+        raise QueryError("bad_limit")
+
+    cursor = request.query_params.get("cursor")
+    if cursor is not None:
+        # Query parameters arrive as strings; an empty value carries no
+        # separator and fails the shape check. Split on the LAST separator
+        # because the position is ``<created_at original text>|<event id>``
+        # and the timestamp segment is original stored text that may itself
+        # contain ``|`` (an event with an unparseable created_at stays
+        # pageable), while the event-id segment never does. Both segments
+        # only have to be non-empty here; the pair is resolved against the
+        # path machine's stored rows in the handler, so a position naming no
+        # event is rejected there as a non-locatable cursor.
+        parts = cursor.rsplit("|", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise QueryError("invalid_cursor")
+
+    return DecisionEventListChangesParams(limit=limit, cursor=cursor)
+
+
+def _encode_decision_event_list_cursor(created_at: str, event_id: str) -> str:
+    return f"{created_at}|{event_id}"
+
+
+# A stored ``created_at`` that no longer parses is ordered after every
+# parseable record (the same tolerant convention the other changes queries
+# use), so a damaged stamp sorts deterministically last instead of crashing
+# this read-only query; ties among damaged stamps break by event id.
+_DECISION_EVENT_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _decision_event_created_instant(value: object) -> datetime:
+    """Parse a stored decision event ``created_at`` to its UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract;
+    a damaged value sorts after every parseable record instead of raising,
+    so the read-only query neither crashes nor repairs the stored text.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _DECISION_EVENT_FAR_FUTURE
+
+
+def decision_event_record_to_dict(
+    record: AuthorizationDecisionEvent,
+) -> dict[str, object]:
+    """Complete list plus chain fields of one stored decision event."""
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "action_type": record.action_type,
+        "resource": record.resource,
+        "allowed": record.allowed,
+        "reason": record.reason,
+        "created_at": record.created_at,
+        "previous_event_id": record.previous_event_id,
+        "content_hash": record.content_hash,
+        "chain_hash": record.chain_hash,
+    }
+
+
+@app.get("/machines/{machine_id}/authorization-decision-events/changes")
+def get_authorization_decision_event_list_changes(
+    machine_id: str,
+    params: Annotated[
+        DecisionEventListChangesParams,
+        Depends(validate_decision_event_list_changes_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only stable incremental, keyset-paginated query of one machine's
+    authorization decision events.
+
+    The real entry point is the ``changes`` sub-entry under the machine
+    authorization decision event path; only ``GET`` is routed, so non-GET
+    methods return ``405`` without reading events, computing a page, or
+    writing anything. The caller submits only the path machine id, a
+    required ``limit`` (a non-boolean integer from 1 to 100), and an
+    optional opaque ``cursor`` returned by a previous page — no business
+    filter parameters and no request body. Query validation
+    (``invalid_query`` for unknown parameters, repeated names, or a carried
+    body; ``bad_limit`` for a missing, blank, fractional, boolean, or
+    out-of-range ``limit``; ``invalid_cursor`` for an empty, non-string, or
+    shape-mismatching ``cursor``) completes before the machine or any event
+    is read; a well-shaped cursor that names no stored ``(created_at, id)``
+    position of the path machine is an ``invalid_cursor`` reported while
+    the events are read, so a parameter error always takes priority over
+    the machine lookup. A valid query against a missing machine is a 404
+    ``not_found`` carrying no events.
+
+    On success the response carries exactly ``{machine_id, limit, records,
+    next_cursor, has_more}`` in this fixed key order; the path machine id
+    and the page size are echoed verbatim. ``records`` contains only events
+    owned by the path machine, each with exactly the complete fields of the
+    event list view — the visible fields ``{id, machine_id, action_type,
+    resource, allowed, reason, created_at}`` exactly as stored plus
+    ``previous_event_id``, ``content_hash``, and ``chain_hash`` — with no
+    normalization or repair, so chain-damaged or misowned content is kept
+    exactly as stored. Records are ordered by the actual UTC instant of
+    ``created_at`` and then by event id ascending, so an exact-second
+    record sorts before any fractional-second record of the same second; a
+    stored ``created_at`` that no longer parses is kept verbatim and
+    deterministically sorts after every parseable instant instead of
+    crashing or being deleted.
+
+    The cursor is the exclusive position ``<created_at original
+    text>|<event id>`` pointing just after a page's last record, so a page
+    returns only records strictly after it: repeating the same cursor
+    against unchanged data returns the byte-identical next page, and a
+    newly inserted event whose sort position is earlier never makes an
+    already-returned record resurface while the current page still follows
+    the stable order. ``next_cursor`` carries the position after the page's
+    last record only when a record follows (``null`` on an empty or last
+    page), and ``has_more`` is true exactly in that case — false on an
+    empty or last page, including an empty database. The endpoint adds no
+    schema (cursors are stateless) and is strictly read-only and machine
+    isolated: it never creates, updates, deletes, repairs, recomputes, or
+    normalizes an event, leaves event registration, listing, privacy and
+    compliance exports, the hash chain, integrity audit, and authorization
+    evaluation unchanged, and never returns another machine's events. The
+    body is compact UTF-8 JSON terminated by a single newline, free of
+    floating-point, ``-0.0``, or non-finite values, byte-identical on
+    repeat calls against unchanged data, and readable across application
+    restarts. A failure while reading the events or the machine returns
+    500 ``internal_error`` with no partial page.
+    """
+    # Any failure while *reading* — the event rows, the ordering over them,
+    # the cursor position, or the machine lookup — is an internal read-layer
+    # fault: answer 500 internal_error with no partial page. Damaged stored
+    # values are not a read failure — rows read successfully are ordered and
+    # emitted verbatim, with an unparseable stamp sorting last — so the
+    # tolerant key function and cursor matching stay inside the guard but
+    # only a true read/order fault reaches the except branch.
+    try:
+        rows = session.scalars(
+            select(AuthorizationDecisionEvent).where(
+                AuthorizationDecisionEvent.machine_id == machine_id
+            )
+        ).all()
+        ordered = sorted(
+            rows,
+            key=lambda record: (
+                _decision_event_created_instant(record.created_at),
+                record.id,
+            ),
+        )
+
+        start = 0
+        if params.cursor is not None:
+            cursor_created_at, cursor_id = params.cursor.rsplit("|", 1)
+            # Exclusive keyset position. A cursor this endpoint issued always
+            # names a stored row, so locate it by its exact stored
+            # ``(created_at text, id)`` pair; a well-shaped cursor that no row
+            # of the path machine matches (deleted event, foreign position,
+            # drifted text) cannot be positioned and is rejected as a
+            # non-locatable cursor — a parameter error, reported before the
+            # machine lookup below. Matching on stored text keeps the
+            # unparseable-stamp tail pageable too.
+            positions = [
+                index
+                for index, record in enumerate(ordered)
+                if record.created_at == cursor_created_at and record.id == cursor_id
+            ]
+            if not positions:
+                return error_response(422, "invalid_cursor")
+            start = positions[0] + 1
+
+        machine = session.get(Machine, machine_id)
+    except Exception:
+        return error_response(500, "internal_error")
+
+    if machine is None:
+        return error_response(404, "not_found")
+
+    remaining = ordered[start:]
+    page = remaining[: params.limit]
+    has_more = len(remaining) > len(page)
+    next_cursor = (
+        _encode_decision_event_list_cursor(page[-1].created_at, page[-1].id)
+        if page and has_more
+        else None
+    )
+
+    payload = {
+        "machine_id": machine_id,
+        "limit": params.limit,
+        "records": [decision_event_record_to_dict(record) for record in page],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # RFC 3339 date-time expressed in UTC with a literal ``Z`` suffix. Fractional
 # seconds are optional; offset forms (``+00:00``) and a missing suffix are
 # rejected. The calendar/time fields are range-checked by ``datetime``.

@@ -1072,6 +1072,78 @@ machine's events or links, produces identical output for identical data and
 parameters on repeat calls, and reads data persisted across application
 restarts.
 
+## Read-only stable authorization decision event incremental query
+
+`GET /machines/{machine_id}/authorization-decision-events/changes` is the
+stable, keyset-paginated incremental view over one machine's authorization
+decision events — the `changes` sub-entry under the machine authorization
+decision event path. It is a separate, strictly read-only audit entry point:
+it changes neither event registration, the event list, the privacy export,
+the compliance export, the hash chain, the integrity audit, nor the
+authorization evaluation semantics, and it adds no on-disk format (cursors
+are stateless), so old and empty databases work unchanged. The caller
+submits only the path machine id, a page size, and an optional cursor — no
+business filter parameters and no request body. Validation completes before
+the machine or any event is read:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, fractional (e.g. `1.0`), boolean (`true`/`false`), non-decimal,
+  or out-of-range value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque string shaped
+  `<created_at original text>|<event id>` and returned by a previous page.
+  An empty, non-string, or shape-mismatching value returns
+  `422 {"error":{"code":"invalid_cursor"}}`; the timestamp segment is
+  original stored text rather than re-parsed, because an event whose stored
+  `created_at` no longer parses stays pageable. A well-shaped cursor whose
+  `(created_at, id)` position cannot be located among the path machine's
+  stored events (including a position naming another machine's record) is
+  rejected as `422 {"error":{"code":"invalid_cursor"}}` after the events are
+  read, with no partial page, so a parameter error always takes priority
+  over the machine lookup.
+- Any other query parameter, a repeated `limit`/`cursor`, or a request
+  carrying a body returns `422 {"error":{"code":"invalid_query"}}` in the
+  validation phase; every validation error is answered without reading any
+  machine or event.
+- The path accepts `GET` only; other methods return `405` without reading
+  events, computing a page, or writing anything.
+- A valid query against a machine that does not exist returns
+  `404 {"error":{"code":"not_found"}}` carrying no events.
+- A failure that prevents reading the events or the machine returns
+  `500 {"error":{"code":"internal_error"}}` with no partial page.
+
+The success object carries exactly `{machine_id, limit, records,
+next_cursor, has_more}` in this fixed field order; the path machine id and
+the page size are echoed verbatim, and an empty database or a machine with
+no events returns the complete empty page. `records` contains only events
+owned by the path machine, each with exactly the complete fields of the
+event list view — the seven visible fields `{id, machine_id, action_type,
+resource, allowed, reason, created_at}` emitted exactly as stored plus
+`previous_event_id`, `content_hash`, and `chain_hash` — with no filtering,
+repair, or normalization, so chain-damaged or misowned content is kept
+exactly as stored. Records are ordered by the actual UTC instant of
+`created_at` and then by event id ascending, so an exact-second record
+sorts before any fractional-second record of the same second. A stored
+`created_at` that no longer parses never crashes the query: the record is
+kept with its stored value and deterministically sorts after every
+parseable instant rather than being deleted, rewritten, or skipped.
+
+The cursor is an exclusive position over `(created_at, event id)`: it
+points just after a page's last record, so the page returns only records
+strictly after it. Repeating the same cursor against unchanged data returns
+the byte-identical next page, and a newly inserted event whose sort
+position is earlier never makes an already-returned record resurface while
+the current page still follows the stable order. `next_cursor` is the
+position after the page's last record when at least one record follows and
+`null` otherwise; `has_more` is `true` exactly when a record exists after
+the current position and `false` on both an empty and a last page.
+
+The query is strictly read-only and machine-isolated: it never creates,
+updates, deletes, repairs, recomputes, or normalizes an event, and another
+machine's records never enter the result. The body is compact UTF-8 JSON
+terminated by a single newline, free of floating-point, `-0.0`, or
+non-finite values, byte-identical on repeat calls against unchanged data,
+and readable for records persisted across application restarts.
+
 ## Read-only desensitized authorization decision event privacy export
 
 `GET /machines/{machine_id}/authorization-decision-events/privacy-export`
