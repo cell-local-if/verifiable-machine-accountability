@@ -653,7 +653,7 @@ def append_decision_event(
     attempt records exactly one joint-write diagnostic via
     :func:`run_joint_write`.
     """
-    from . import authorization
+    from . import authorization, decision_basis
 
     def _work(conn: Connection) -> dict[str, Any]:
         status = authorization.machine_status(conn, machine_id)
@@ -674,6 +674,20 @@ def append_decision_event(
             allowed=allowed,
             reason=reason,
         )
+        # Capture the immutable decision basis on the same locked connection
+        # and insert it before the transaction returns, so the event and its
+        # snapshot commit atomically (or both leave no trace). The capture
+        # reads the exact same in-tx status/declaration/rule state the
+        # decision used; a suspended machine reads neither declarations nor
+        # rules, matching the decision short-circuit.
+        basis_row = decision_basis.capture(
+            conn,
+            event=event,
+            status=status,
+            action_type=action_type,
+            resource=resource,
+        )
+        decision_basis.insert(conn, basis_row)
         # Capture the attempt's own terminal snapshot inside the lock for
         # its diagnostic: the status the decision used, the new event's chain
         # position, and the chain check including the just-committed event.

@@ -31,6 +31,7 @@ from . import (
     assignment_chain,
     authorization,
     chain,
+    decision_basis,
     declaration_integrity,
     diagnostics,
     evidence_chain,
@@ -7558,6 +7559,109 @@ def get_authorization_decision_event_accountability_trace(
         + "\n"
     )
     return Response(content=body, media_type="application/json")
+
+
+# --- read-only immutable authorization decision basis snapshot --------------
+
+
+def validate_decision_basis_params(request: Request) -> None:
+    """Validate the decision-basis request before any business read.
+
+    The basis query is keyed on the path machine and path event alone: it
+    accepts no query parameters, no repeated parameters, and no request body.
+    Any query-string content or a carried body is a 422 ``invalid_query``.
+    The check runs as a dependency before the handler reads the machine, the
+    event, or the snapshot, so a malformed request against a non-existent
+    machine still reports 422 rather than 404 and never touches a record.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+    # A body on a GET is an unknown-shape request rejected in the validation
+    # phase. A present non-zero Content-Length, or a chunked request without
+    # one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/"
+    "decision-basis"
+)
+def get_authorization_decision_event_decision_basis(
+    machine_id: str,
+    event_id: str,
+    _: Annotated[None, Depends(validate_decision_basis_params)],
+    session: SessionDep,
+):
+    """Read-only immutable decision-basis snapshot for one decision event.
+
+    The real entry point is the ``decision-basis`` sub-entry under the
+    machine authorization decision event path; only ``GET`` is routed, so
+    ``HEAD`` and every other method return ``405`` without reading the
+    snapshot, recomputing a decision, or writing anything. The caller
+    submits only the path machine id and path event id — no query
+    parameters, repeated parameters, request body, or business filter; any
+    query string or carried body is a 422 ``invalid_query`` raised during
+    validation before the machine, event, or snapshot is read, so a
+    malformed request against a non-existent machine still reports 422
+    rather than 404. A missing machine, a missing event, or an event owned
+    by another machine is a 404 ``not_found``.
+
+    On success the response carries exactly five groups in this fixed
+    order — ``event_summary`` (a single object with the event's result,
+    reason, capture moment, and chain fields), ``status_basis`` (the
+    machine status the decision used, the capture moment, and whether
+    declarations/policy were read), ``declaration_basis`` (the enabled
+    declarations participating in the judgement with the matched scope
+    flag), ``policy_candidates`` (the candidates under the existing
+    winner/overridden/conflict/unmatched priority semantics plus the
+    winner and conflict groups), and ``decision`` (the committed
+    ``{allowed, reason}``) — every collection present even when empty. A
+    suspended machine's snapshot records that declarations and policy were
+    not read; an active machine records the enabled declarations and rule
+    relations that participated. The stored basis is emitted verbatim: the
+    decision is never recomputed and the final result is the event's
+    committed result.
+
+    The query is strictly read-only and machine isolated (another
+    machine's snapshot can never enter), and the body is the captured
+    compact UTF-8 JSON in fixed field order terminated by a single
+    newline, free of floating-point, ``-0.0``, or non-finite values, so
+    repeated queries against one event are byte-for-byte identical and the
+    snapshot reads across application restarts. An event written before
+    the feature existed has no snapshot: it answers 404
+    ``snapshot_not_found`` rather than fabricating a basis from current
+    data. A real failure while reading the event or snapshot is a 500
+    ``internal_error`` carrying no summary and no partial basis.
+    """
+    # A failure while *reading* the event or its stored snapshot is an
+    # internal read-layer fault: answer 500 internal_error with no event
+    # summary and none of the basis groups. Ownership and existence are
+    # ordinary 404 outcomes, not read failures.
+    try:
+        event = get_machine_event(session, machine_id, event_id)
+        if event is None:
+            return error_response(404, "not_found")
+        document = decision_basis.load_document(
+            session, machine_id=machine_id, event_id=event_id
+        )
+    except Exception:
+        return error_response(500, "internal_error")
+
+    # Events committed before the basis feature have no immutable snapshot;
+    # never reconstruct a basis from current data.
+    if document is None:
+        return error_response(404, "snapshot_not_found")
+
+    # Re-emit the captured document byte-for-byte; only the terminating
+    # newline is added here.
+    return Response(
+        content=document + "\n",
+        media_type="application/json",
+    )
 
 
 # --- read-only joint-write transaction diagnostics -------------------------

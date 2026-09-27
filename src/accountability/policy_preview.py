@@ -22,7 +22,7 @@ stored field is ``invalid`` even when some other field happens to match.
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import Connection, text
 from sqlalchemy.orm import Session
 
 from .authorization import pattern_matches
@@ -88,7 +88,7 @@ def _is_valid_rule(stored: dict[str, Any]) -> bool:
     return True
 
 
-def load_rules(session: Session) -> list[dict[str, Any]]:
+def load_rules(session: Session | Connection) -> list[dict[str, Any]]:
     """Load every global policy rule as plain stored values.
 
     Issues reads only; values are passed through verbatim with no

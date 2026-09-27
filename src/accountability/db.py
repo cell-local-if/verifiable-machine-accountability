@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -122,6 +122,42 @@ class AuthorizationDecisionEvent(Base):
     previous_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class AuthorizationDecisionBasis(Base):
+    """Immutable decision-basis snapshot captured for one decision event.
+
+    A row is written in the same locked write transaction that appends its
+    event, so the snapshot and the event either commit together or leave no
+    trace. Rows are append-only and never updated, deleted, or recomputed
+    afterwards: the read-only ``decision-basis`` query only re-emits the
+    stored document. Events written before the feature existed have no row;
+    querying their basis answers ``404 snapshot_not_found`` rather than
+    fabricating a basis from current data. The table is created automatically
+    at startup on databases that predate the feature.
+
+    Only visible business fields are recorded (machine status, enabled
+    declaration matching scope, policy candidate relations, the event result
+    and reason, and the capture moment) — never machine keys or policy text
+    beyond the rule's existing visible columns.
+    """
+
+    __tablename__ = "authorization_decision_basis"
+
+    # One snapshot per decision event; the event id is the natural key and
+    # the machine column enforces strict path-machine isolation.
+    event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        primary_key=True,
+    )
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    # The complete five-group basis document, stored as the exact compact
+    # key-sorted JSON text later re-emitted byte-for-byte.
+    document: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class AuthorizationDecisionEvidence(Base):
