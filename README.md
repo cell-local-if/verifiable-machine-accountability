@@ -141,7 +141,8 @@ is still `422`). After validation a missing machine, a missing event, or an
 event owned by another machine returns
 `404 {"error":{"code":"not_found"}}` with no audit conclusion. Only `GET` is
 routed; `HEAD` and every other method return `405` without reading or writing.
-A real failure while reading the event, snapshot, declarations, or rules
+A real failure while reading the event, snapshot, status history,
+declarations, or rules
 returns `500 {"error":{"code":"internal_error"}}` with no conclusion and no
 partial result.
 
@@ -162,7 +163,16 @@ The checks verify, in a fixed order: the document parses to the five expected
 groups with sound field types and ordering; the event summary corresponds
 verbatim to the event's committed `allowed` result, `reason`, capture moment
 (`created_at`), and chain fields (`previous_event_id`, `content_hash`,
-`chain_hash`) — nothing is recomputed or filled in; a suspended machine's
+`chain_hash`) — nothing is recomputed or filled in; the recorded machine
+status is checked against the machine's own status-transition history
+independently replayed to the capture instant (transitions created no later
+than the capture moment, same-moment records by ascending id, the unchanged
+initial state being `active`): a misattributed, illegal, or
+unreconstructible history is `status_history_invalid`, a readable history
+whose reconstructed event-moment status contradicts the snapshot is
+`status_state_mismatch` — agreeing only with the machine's *current* status
+is not accepted — and a matching status whose read flags contradict the gate
+in force at that moment is `read_flags_mismatch`; a suspended machine's
 basis explicitly records that declarations and policy were not read, while an
 active machine's read flags match its status and the declaration gate; the
 declaration basis names exactly the enabled declarations that participated in

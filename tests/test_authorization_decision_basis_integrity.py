@@ -367,6 +367,7 @@ def test_missing_snapshot_reports_snapshot_not_found_without_fabrication(client)
         "authorization_decision_basis",
         "behavior_declarations",
         "policy_rules",
+        "machine_status_events",
     ],
 )
 def test_real_read_failure_is_internal_error_without_partial_result(
@@ -640,11 +641,11 @@ def test_status_read_flags_must_match_status(client):
     )
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "status_basis_mismatch",
+        "read_flags_mismatch",
     )
 
 
-def test_suspended_basis_with_records_or_read_flag_is_status_mismatch(client):
+def test_suspended_basis_with_records_or_read_flag_is_read_flags_mismatch(client):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -660,8 +661,169 @@ def test_suspended_basis_with_records_or_read_flag_is_status_mismatch(client):
     )
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "status_basis_mismatch",
+        "read_flags_mismatch",
     )
+
+
+def tamper_status_history(client, machine_id, set_clause):
+    """Rewrite the machine's stored status-transition records directly."""
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                f"UPDATE machine_status_events SET {set_clause} "
+                "WHERE machine_id = :mid"
+            ).bindparams(mid=machine_id)
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Status basis against the machine's event-moment status history
+# --------------------------------------------------------------------------- #
+
+
+def test_later_status_change_never_breaks_a_historical_snapshot(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id)
+    create_rule(client)
+    event = record_event(client, machine_id).json()
+    assert event["allowed"] is True
+
+    # Suspending (and reactivating) after the event does not change the
+    # status the event moment saw, so the faithful snapshot still verifies.
+    client.post(f"/machines/{machine_id}/status", json={"status": "suspended"})
+    assert audit(client, machine_id, event["id"]).json()["valid"] is True
+    client.post(f"/machines/{machine_id}/status", json={"status": "active"})
+    assert audit(client, machine_id, event["id"]).json()["valid"] is True
+
+
+def test_later_reactivation_never_breaks_a_suspended_snapshot(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id)
+    create_rule(client)
+    client.post(f"/machines/{machine_id}/status", json={"status": "suspended"})
+    event = record_event(client, machine_id).json()
+    assert event["reason"] == "machine_suspended"
+
+    client.post(f"/machines/{machine_id}/status", json={"status": "active"})
+    assert audit(client, machine_id, event["id"]).json()["valid"] is True
+
+
+def test_status_matching_only_current_state_is_state_mismatch(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id)
+    create_rule(client)
+    client.post(f"/machines/{machine_id}/status", json={"status": "suspended"})
+    event = record_event(client, machine_id).json()
+    assert event["reason"] == "machine_suspended"
+    # The machine is active again now: a snapshot claiming "active" agrees
+    # with the current state but contradicts the event-moment history.
+    client.post(f"/machines/{machine_id}/status", json={"status": "active"})
+
+    tamper_snapshot(
+        client, event["id"], lambda doc: doc["status_basis"].__setitem__(
+            "status", "active"
+        )
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_state_mismatch",
+    )
+
+
+def test_active_snapshot_claiming_suspension_is_state_mismatch(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id)
+    create_rule(client)
+    event = record_event(client, machine_id).json()
+
+    tamper_snapshot(
+        client, event["id"], lambda doc: doc["status_basis"].__setitem__(
+            "status", "suspended"
+        )
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_state_mismatch",
+    )
+
+
+def test_unknown_snapshot_status_is_state_mismatch(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id)
+    create_rule(client)
+    event = record_event(client, machine_id).json()
+
+    tamper_snapshot(
+        client, event["id"], lambda doc: doc["status_basis"].__setitem__(
+            "status", "paused"
+        )
+    )
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_state_mismatch",
+    )
+
+
+def test_illegal_status_transition_record_is_status_history_invalid(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id)
+    create_rule(client)
+    client.post(f"/machines/{machine_id}/status", json={"status": "suspended"})
+    event = record_event(client, machine_id).json()
+
+    tamper_status_history(client, machine_id, "to_status = 'paused'")
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_history_invalid",
+    )
+
+
+def test_broken_status_chain_is_status_history_invalid(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id)
+    create_rule(client)
+    client.post(f"/machines/{machine_id}/status", json={"status": "suspended"})
+    event = record_event(client, machine_id).json()
+
+    # The transition no longer continues the machine's initial active state.
+    tamper_status_history(client, machine_id, "from_status = 'suspended'")
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_history_invalid",
+    )
+
+
+def test_unparseable_history_timestamp_is_status_history_invalid(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id)
+    create_rule(client)
+    client.post(f"/machines/{machine_id}/status", json={"status": "suspended"})
+    event = record_event(client, machine_id).json()
+
+    tamper_status_history(client, machine_id, "created_at = 'not-a-time'")
+    _assert_broken(
+        audit(client, machine_id, event["id"]), event["id"],
+        "status_history_invalid",
+    )
+
+
+def test_other_machine_damaged_history_never_enters(client):
+    one = create_machine(client, external_id="machine-1")
+    two = create_machine(client, external_id="machine-2")
+    for machine_id in (one, two):
+        declare(client, machine_id, resource_pattern="*")
+    create_rule(client, resource_pattern="*", effect="allow", priority=0)
+    client.post(f"/machines/{two}/status", json={"status": "suspended"})
+    event_one = record_event(client, one, resource="a").json()
+    event_two = record_event(client, two, resource="b").json()
+
+    # Machine two's damaged history breaks only its own audit.
+    tamper_status_history(client, two, "to_status = 'paused'")
+    _assert_broken(
+        audit(client, two, event_two["id"]), event_two["id"],
+        "status_history_invalid",
+    )
+    assert audit(client, one, event_one["id"]).json()["valid"] is True
 
 
 def test_extra_declaration_record_is_declaration_basis_mismatch(client):

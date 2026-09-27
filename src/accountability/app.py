@@ -7701,8 +7701,14 @@ def get_authorization_decision_event_decision_basis_integrity(
     conclusion, ``null`` on success), and ``reason`` (``null`` on success,
     the fixed ``snapshot_not_found`` for a missing row, otherwise the stable
     first-anomaly category). The event summary is compared verbatim with
-    the committed result, reason, capture moment, and chain fields; a
-    suspended machine's basis must record that declarations and policy were
+    the committed result, reason, capture moment, and chain fields; the
+    recorded machine status is checked against the machine's own
+    status-transition history independently replayed to the capture instant
+    (a misattributed, illegal, or unreconstructible history is
+    ``status_history_invalid``, a reconstructed status contradicting the
+    snapshot is ``status_state_mismatch``, and read flags contradicting the
+    gate in force at that moment are ``read_flags_mismatch``); a suspended
+    machine's basis must record that declarations and policy were
     not read; the declaration basis may name only the participating enabled
     declarations; candidate winner/overridden/conflict/unmatched relations
     and the conflict group must follow the priority as of the event and
@@ -7714,13 +7720,14 @@ def get_authorization_decision_event_decision_basis_integrity(
     single newline, with no floating-point or non-finite value, so repeated
     queries against the same stored rows are byte-for-byte identical and the
     audit reads persistent snapshots across restarts. A real failure while
-    reading the event, snapshot, declarations, or rules is a 500
-    ``internal_error`` carrying no conclusion and no partial result.
+    reading the event, snapshot, status history, declarations, or rules is
+    a 500 ``internal_error`` carrying no conclusion and no partial result.
     """
     # Ownership and existence are ordinary 404 outcomes; every real read
-    # failure below (event, snapshot, declarations, rules) is a read-layer
-    # fault answered 500 with none of the four conclusions. Damaged snapshot
-    # *content* never raises — verify reports it as a false conclusion.
+    # failure below (event, snapshot, status history, declarations, rules)
+    # is a read-layer fault answered 500 with none of the four conclusions.
+    # Damaged snapshot *content* never raises — verify reports it as a
+    # false conclusion.
     try:
         event = get_machine_event(session, machine_id, event_id)
         if event is None:

@@ -40,6 +40,21 @@ declarations for the action that already existed at the event instant: the
 stored set is only allowed to name the declarations participating in this
 action/resource judgement, so a missing, disabled, other-action, or
 superfluous record is an inconsistency.
+
+The recorded machine status is audited against the machine's own
+status-transition history, independently read and replayed to the capture
+instant: transitions whose recorded creation moment is not later than the
+capture moment (same-moment records ordered by id) form the status the
+decision saw, and a machine with no earlier transition was still in its
+initial ``active`` state. The snapshot must agree with that reconstructed
+event-moment status — agreeing only with the machine's *current* status is
+not acceptable. A misattributed, illegal, or unreconstructible history is
+``status_history_invalid``; a readable history whose reconstructed status
+contradicts the snapshot is ``status_state_mismatch``; a matching status
+whose read flags contradict the gate in force at that moment is
+``read_flags_mismatch``. Damaged history records are counted in the
+judgement and stably attributed — never skipped, repaired, rewritten, or
+recomputed.
 """
 
 from datetime import datetime, timezone
@@ -51,7 +66,7 @@ from sqlalchemy.orm import Session
 
 from .authorization import pattern_matches
 from . import policy_preview
-from .db import BehaviorDeclaration
+from .db import BehaviorDeclaration, MachineStatusEvent
 
 _FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
 
@@ -119,6 +134,9 @@ _MALFORMED_POLICY_CANDIDATES = "malformed_policy_candidates"
 _MALFORMED_DECISION = "malformed_decision"
 _EVENT_SUMMARY_MISMATCH = "event_summary_mismatch"
 _STATUS_BASIS_MISMATCH = "status_basis_mismatch"
+_STATUS_HISTORY_INVALID = "status_history_invalid"
+_STATUS_STATE_MISMATCH = "status_state_mismatch"
+_READ_FLAGS_MISMATCH = "read_flags_mismatch"
 _DECLARATION_BASIS_MISMATCH = "declaration_basis_mismatch"
 _DECLARATION_MATCH_MISMATCH = "declaration_match_mismatch"
 _DECLARATION_ORDER = "declaration_order"
@@ -129,6 +147,9 @@ _CANDIDATE_ORDER = "candidate_order"
 _DECISION_MISMATCH = "decision_mismatch"
 
 _DECLARATION_TABLE = BehaviorDeclaration.__table__
+_STATUS_HISTORY_TABLE = MachineStatusEvent.__table__
+_STATUS_HISTORY_FIELDS = ("id", "machine_id", "from_status", "to_status", "created_at")
+_MACHINE_STATUSES = frozenset(("active", "suspended"))
 
 
 def _created_instant(value: object) -> datetime:
@@ -429,6 +450,92 @@ def _candidate_shape_problem(candidate: Any) -> str | None:
     return None
 
 
+# --- machine status history at the capture instant ---------------------------
+
+
+def _parseable_created_at(value: object) -> bool:
+    """Whether a stored ``created_at`` still parses to a UTC instant."""
+    if isinstance(value, str):
+        try:
+            datetime.fromisoformat(value[:-1] + "+00:00")
+            return True
+        except (ValueError, OverflowError):
+            pass
+    return False
+
+
+def _load_status_history(
+    session: Session, machine_id: str
+) -> list[dict[str, Any]]:
+    """One machine's stored status-transition records, values verbatim.
+
+    Read-only and scoped to the path machine, so another machine's history
+    can never enter the reconstruction. A real storage failure propagates
+    to the caller (``500 internal_error``); damaged *content* is judged
+    below, never raised.
+    """
+    rows = session.execute(
+        select(
+            *[_STATUS_HISTORY_TABLE.c[name] for name in _STATUS_HISTORY_FIELDS]
+        ).where(_STATUS_HISTORY_TABLE.c.machine_id == machine_id)
+    ).all()
+    return [dict(row._mapping) for row in rows]
+
+
+def _reconstructed_status_at(
+    rows: list[dict[str, Any]], machine_id: str, capture_instant: datetime
+) -> str | None:
+    """Machine status at the capture instant replayed from the history.
+
+    Every machine commits its first write as ``active``, so the replay
+    starts there; each transition whose own recorded creation instant is
+    not later than the capture moment applies in (instant, id) order —
+    same-moment records by ascending id — and the last applicable
+    ``to_status`` is the status the capture saw. With no applicable
+    transition the machine was still in its unchanged initial ``active``
+    state.
+
+    Returns ``None`` when the history is misattributed, illegal, or cannot
+    be reconstructed: a record owned by another machine, a non-string id,
+    an unknown or same-valued status edge, an unparseable creation stamp,
+    or a ``from_status`` that does not continue the running state. Damaged
+    records are counted in the judgement and stably attributed — never
+    skipped, repaired, rewritten, or recomputed.
+    """
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            _created_instant(row.get("created_at")),
+            row.get("id") if isinstance(row.get("id"), str) else "",
+        ),
+    )
+    state = "active"
+    at_capture = "active"
+    for row in ordered:
+        if not isinstance(row.get("id"), str):
+            return None
+        if row.get("machine_id") != machine_id:
+            return None
+        from_status = row.get("from_status")
+        to_status = row.get("to_status")
+        if (
+            not isinstance(from_status, str)
+            or not isinstance(to_status, str)
+            or from_status not in _MACHINE_STATUSES
+            or to_status not in _MACHINE_STATUSES
+            or from_status == to_status
+        ):
+            return None
+        if not _parseable_created_at(row.get("created_at")):
+            return None
+        if from_status != state:
+            return None
+        state = to_status
+        if _created_instant(row["created_at"]) <= capture_instant:
+            at_capture = to_status
+    return at_capture
+
+
 # --- status and declaration basis -------------------------------------------
 
 
@@ -493,17 +600,30 @@ def _check_status_and_declarations(
     category ends the audit; on success ``problem`` is ``None``.
     """
     status = status_basis["status"]
-    if status not in ("active", "suspended"):
-        return _STATUS_BASIS_MISMATCH, status, False
     if status_basis["machine_id"] != machine_id:
         return _STATUS_BASIS_MISMATCH, status, False
     if status_basis["captured_at"] != event.created_at:
         return _STATUS_BASIS_MISMATCH, status, False
 
+    # Independently replay the machine's own status-transition history to
+    # the capture instant: the recorded status must agree with the status
+    # the event moment actually saw — agreeing only with the machine's
+    # *current* status is not acceptable. History first, then the
+    # reconstructed state, then the read flags against the gate in force
+    # at that moment.
+    history = _load_status_history(session, machine_id)
+    reconstructed = _reconstructed_status_at(
+        history, machine_id, _created_instant(event.created_at)
+    )
+    if reconstructed is None:
+        return _STATUS_HISTORY_INVALID, status, False
+    if status != reconstructed:
+        return _STATUS_STATE_MISMATCH, status, False
+
     declarations_read = status == "active"
     policies_read = status_basis["policies_read"]
     if status_basis["declarations_read"] is not declarations_read:
-        return _STATUS_BASIS_MISMATCH, status, False
+        return _READ_FLAGS_MISMATCH, status, False
     if declaration_basis["read"] is not declarations_read:
         return _DECLARATION_BASIS_MISMATCH, status, False
 
@@ -514,7 +634,7 @@ def _check_status_and_declarations(
         # groups must explicitly record no read and an empty collection. The
         # audit therefore needs no declaration/rule table reads on this path.
         if policies_read is not False:
-            return _STATUS_BASIS_MISMATCH, status, False
+            return _READ_FLAGS_MISMATCH, status, False
         if items:
             return _DECLARATION_BASIS_MISMATCH, status, False
         return None, status, False
@@ -585,7 +705,7 @@ def _check_status_and_declarations(
 
     # policies_read must equal the declaration gate the decision used.
     if policies_read is not matched_any:
-        return _STATUS_BASIS_MISMATCH, status, False
+        return _READ_FLAGS_MISMATCH, status, False
     return None, status, matched_any
 
 
