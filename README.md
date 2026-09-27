@@ -1400,6 +1400,79 @@ traversal, produces identical output for identical data and parameters on
 repeat calls, reads links persisted across application restarts, and needs no
 migration on an empty or old database (it adds no schema).
 
+## Read-only stable causal-link incremental query
+
+`GET /machines/{machine_id}/authorization-decision-events/causal-links/changes`
+is the stable, keyset-paginated incremental view over one machine's causal
+links — the `changes` sub-entry under the machine authorization-event
+causal-links path. It is a separate, strictly read-only audit entry point:
+it changes neither causal-link creation, the per-event causal-link listing,
+the bounded causal trace, the single-event closed-loop trace, the window and
+compliance exports, the causal-link integrity audit, nor any other machine
+interface, and it adds no on-disk format (cursors are stateless), so old and
+empty databases work unchanged. The caller submits only the path machine id,
+a page size, and an optional cursor — no business filter parameters and no
+request body. Validation completes before the machine or any causal link is
+read:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, fractional (e.g. `1.0`), boolean (`true`/`false`), non-decimal,
+  or out-of-range value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque string shaped
+  `<created_at original text>|<causal link id>` and returned by a previous
+  page. An empty, non-string, or shape-mismatching value returns
+  `422 {"error":{"code":"invalid_cursor"}}`; the timestamp segment is
+  original stored text rather than re-parsed, because a link whose stored
+  `created_at` no longer parses stays pageable. A well-shaped cursor whose
+  `(created_at, id)` position cannot be located among the path machine's
+  stored links (including a position naming another machine's link) is
+  rejected as `422 {"error":{"code":"invalid_cursor"}}` while the links are
+  read, so a parameter error always takes priority over the machine lookup.
+- Any other query parameter, a repeated `limit`/`cursor`, or a request
+  carrying a body returns `422 {"error":{"code":"invalid_query"}}` in the
+  validation phase; every validation error is answered without reading any
+  machine or causal link.
+- The path accepts `GET` only; other methods return `405` without reading
+  links, computing a page, or writing anything.
+- A valid query against a machine that does not exist returns
+  `404 {"error":{"code":"not_found"}}` carrying no link records.
+- A failure that prevents reading the links or the machine returns
+  `500 {"error":{"code":"internal_error"}}` with no partial page.
+
+The success object carries exactly `{machine_id, limit, records,
+next_cursor, has_more}` in this fixed field order; the path machine id and
+the page size are echoed back, and an empty database or a machine with no
+causal links returns the complete empty page. Each item of `records` is
+exactly `{group, record}` with the fixed group tag `causal_links`, and
+`record` carries exactly the complete causal-link fields of the list
+endpoint — `{id, machine_id, cause_event_id, effect_event_id, created_at}`
+— emitted exactly as stored with no filtering, repair, or normalization: a
+cause or effect event that is missing, owned by another machine, duplicated,
+or otherwise damaged is kept verbatim, and the events table is never
+consulted. Items are ordered by the actual UTC instant of the link's own
+`created_at`, then by the category tag, then by link id ascending, so an
+exact-second link sorts before any fractional-second link of the same
+second. A stored `created_at` that no longer parses never crashes the
+query: the link is kept with its stored value and deterministically sorts
+after every parseable instant rather than being deleted.
+
+The cursor is an exclusive position over `(created_at, link id)`: it points
+just after a page's last link, so the page returns only links strictly
+after it. Repeating the same cursor against unchanged data returns the
+byte-identical next page, and a newly created link whose sort position is
+earlier never makes an already-returned link resurface while the current
+page still follows the stable order. `next_cursor` is the position after
+the page's last link when at least one link follows and `null` otherwise;
+`has_more` is `true` exactly in that case and `false` on both an empty and
+a last page.
+
+The query is strictly read-only and machine-isolated: it never creates,
+updates, deletes, repairs, recomputes, or normalizes a link, and another
+machine's links never enter the result. The body is compact UTF-8 JSON
+terminated by a single newline, free of floating-point, `-0.0`, or
+non-finite values, byte-identical on repeat calls against unchanged data,
+and readable for links persisted across application restarts.
+
 ## Read-only evidence compliance export
 
 `GET /machines/{machine_id}/authorization-decision-events/evidence/compliance-export`
