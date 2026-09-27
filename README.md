@@ -1275,6 +1275,78 @@ machine's evidence, produces identical output for identical data and
 parameters on repeat calls, and reads data persisted across application
 restarts.
 
+## Read-only stable evidence compliance incremental query
+
+`GET /machines/{machine_id}/authorization-decision-events/evidence/compliance-export/changes`
+is the stable, keyset-paginated incremental view over one machine's evidence
+records — the `changes` sub-entry under the evidence compliance-export path.
+It is a separate, strictly read-only audit entry point: it changes neither
+evidence registration, the evidence list, the window compliance export, the
+event hash chain, nor the integrity audits, and it adds no on-disk format
+(cursors are stateless), so old and empty databases work unchanged. The
+caller submits only the path machine id, a page size, and an optional cursor
+— no business filter parameters and no request body. Validation completes
+before the machine or any evidence record is read:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, fractional (e.g. `1.0`), boolean (`true`/`false`), non-decimal,
+  or out-of-range value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque string shaped
+  `<created_at original text>|<record id>` and returned by a previous
+  page. An empty, non-string, or shape-mismatching value returns
+  `422 {"error":{"code":"invalid_cursor"}}`; the timestamp segment is
+  original stored text rather than re-parsed, because an evidence record
+  whose stored `created_at` no longer parses stays pageable. A well-shaped
+  cursor whose `(created_at, id)` position cannot be located among the path
+  machine's stored evidence (including a position naming another machine's
+  record) is rejected as `422 {"error":{"code":"invalid_cursor"}}` while the
+  records are read, so a parameter error always takes priority over the
+  machine lookup.
+- Any other query parameter, a repeated `limit`/`cursor`, or a request
+  carrying a body returns `422 {"error":{"code":"invalid_query"}}` in the
+  validation phase; every validation error is answered without reading any
+  machine or evidence record.
+- The path accepts `GET` only; other methods return `405` without reading
+  evidence, computing a page, or writing anything.
+- A valid query against a machine that does not exist returns
+  `404 {"error":{"code":"not_found"}}` carrying no evidence records.
+- A failure that prevents reading the records or the machine returns
+  `500 {"error":{"code":"internal_error"}}` with no partial page.
+
+The success object carries exactly `{machine_id, limit, records,
+next_cursor, has_more}` in this fixed field order, echoing the path machine
+id and page size; an empty database and a machine with no evidence return
+the complete empty page. `records` contains only evidence owned by the path
+machine, each with exactly the complete fields of the evidence window
+export — the six visible fields `{id, machine_id, event_id, evidence_type,
+content_hash, created_at}` emitted exactly as stored plus
+`previous_evidence_id` and `chain_hash` — with no filtering, repair, or
+normalization. Records are ordered by the actual UTC instant of
+`created_at` and then by record id ascending, so an exact-second record
+sorts before any fractional-second record of the same second. A stored
+`created_at` that no longer parses never crashes the query: the record is
+kept with its stored value and deterministically sorts after every
+parseable instant rather than being deleted or skipped; damaged, missing,
+misowned, or duplicated values are likewise emitted exactly as stored.
+
+The cursor is an exclusive position over `(created_at, record id)`: it
+points just after a page's last record, so the page returns only records
+strictly after it. Repeating the same cursor against unchanged data returns
+the byte-identical next page, and a newly registered evidence record whose
+sort position is earlier never makes an already-returned record resurface
+while the current page still follows the stable order. `next_cursor` is the
+position after the page's last record when at least one record follows and
+`null` otherwise; `has_more` is `true` exactly when a record exists after
+the current position and `false` on both an empty and a last page.
+
+The query is strictly read-only and machine-isolated: it never creates,
+updates, deletes, repairs, recomputes, or normalizes an evidence record,
+and another machine's evidence never enters the result. The body is
+compact UTF-8 JSON terminated by a single newline, free of
+floating-point, `-0.0`, or non-finite values, byte-identical on repeat
+calls against unchanged data, and readable for records persisted across
+application restarts.
+
 
 
 ## Read-only incident status history compliance export
