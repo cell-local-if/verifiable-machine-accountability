@@ -458,17 +458,83 @@ def _diagnostic_order(rows: list[Any]) -> list[Any]:
     return sorted(rows, key=key)
 
 
+def _recompute_content_hash(mapping: Any, machine_id: str) -> str | None:
+    """Recompute a row's content digest with a specific owning machine id.
+
+    The six other business fields are kept exactly as stored; only the
+    ownership field is substituted. Returns ``None`` when a stored field is
+    too damaged to serialize into a digest.
+    """
+    try:
+        values = {key: mapping[key] for key in _CONTENT_COLUMNS}
+    except (KeyError, TypeError):
+        return None
+    values["machine_id"] = machine_id
+    try:
+        return compute_content_hash(**values)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_content_owner(
+    mapping: Any, candidate_machine_ids: list[str]
+) -> str | None:
+    """Cryptographically attribute a row to its owning machine, if provable.
+
+    The content digest covers the ownership field, so it is authoritative:
+
+    * the stored ``machine_id`` is the owner when the stored digest equals
+      the digest recomputed with it;
+    * otherwise the row is ownership-damaged, and a candidate machine id
+      for which the recomputed digest equals the stored digest is the
+      authentic owner (the stored ownership field was overwritten after the
+      digest was minted);
+    * if the stored digest matches no candidate (another business field is
+      also damaged), attribution is not provable and ``None`` is returned.
+
+    ``candidate_machine_ids`` is a deterministic ordering of every stored
+    machine id in the table plus the path machine id; the short-circuit on
+    the stored id and the deterministic list keep the result stable (two
+    distinct owners cannot share one SHA-256 digest in practice).
+    """
+    stored_digest = mapping["content_hash"]
+    stored_machine_id = mapping["machine_id"]
+    if stored_digest is None:
+        return None
+    if _recompute_content_hash(mapping, stored_machine_id) == stored_digest:
+        return stored_machine_id
+    for candidate in candidate_machine_ids:
+        if candidate == stored_machine_id:
+            continue
+        if _recompute_content_hash(mapping, candidate) == stored_digest:
+            return candidate
+    return None
+
+
 def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
     """Diagnose one machine's privacy access chain, record by record, read-only.
 
-    Only the path machine's records are examined, in the same chain order used
-    to build and verify the chain: the actual UTC instant of ``accessed_at``
-    and then ``id``. A stored ``accessed_at`` that no longer parses sorts after
-    every parseable record (the tolerant audit convention) instead of crashing
-    and is flagged on that record; other damaged stored values are judged as
+    A row is a member of the path machine's chain when its authentic owner —
+    resolved from its content digest, which covers the ownership field — is
+    the path machine, or, when ownership is not cryptographically provable
+    (another business field is damaged too), when its stored ``machine_id``
+    names the path machine. This both keeps a record whose ownership field
+    was overwritten to another machine visible to its real owner (flagged
+    ``bad_ownership``) and keeps a genuinely foreign record out: a row whose
+    digest proves it belongs to a different machine never enters this
+    machine's diagnosis, even when its corrupted ownership column happens
+    to name this machine. A row whose ownership column is intact but whose
+    other business fields are damaged still belongs to its stored machine
+    and stays in that machine's total.
+
+    Members are examined in the same chain order used to build and verify
+    the chain: the actual UTC instant of ``accessed_at`` and then ``id``. A
+    stored ``accessed_at`` that no longer parses sorts after every parseable
+    record (the tolerant audit convention) instead of crashing and is
+    flagged on that record; other damaged stored values are judged as
     anomalies, never repaired or normalized.
 
-    Every record is returned — including records after the first anomaly. The
+    Every member is returned — including records after the first anomaly. The
     overall ``valid`` flag is false once any record carries at least one
     anomaly; each record's ``errors`` array keeps every anomaly that applies
     to it, in the fixed error-code order. Content and chain digests follow the
@@ -483,13 +549,36 @@ def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
     "chain_hash", "errors"}`` with ``position`` numbered from one. Issues no
     writes.
     """
-    rows = _diagnostic_order(
-        list(
-            session.execute(
-                _TABLE.select().where(_TABLE.c.machine_id == machine_id)
-            )
-        )
+    all_rows = list(session.execute(_TABLE.select()))
+    # Candidate owners for an ownership-damaged row: every distinct stored
+    # machine id in the table (deterministically ordered) plus the path
+    # machine, so even a machine whose only row was relabeled away can
+    # recover it. The content digest pins the authentic owner to at most one
+    # candidate.
+    candidate_machine_ids = sorted(
+        {
+            machine_id,
+            *(
+                row._mapping["machine_id"]
+                for row in all_rows
+                if isinstance(row._mapping["machine_id"], str)
+            ),
+        }
     )
+    members = []
+    for row in all_rows:
+        mapping = row._mapping
+        authentic_owner = _resolve_content_owner(mapping, candidate_machine_ids)
+        if authentic_owner is not None:
+            belongs = authentic_owner == machine_id
+        else:
+            # Ownership not cryptographically provable (another business
+            # field is damaged too): trust the ownership column so a damaged
+            # own record stays in its stored machine's total.
+            belongs = mapping["machine_id"] == machine_id
+        if belongs:
+            members.append(row)
+    rows = _diagnostic_order(members)
 
     records: list[dict[str, Any]] = []
     overall_valid = True
@@ -538,18 +627,19 @@ def diagnose_chain(session, machine_id: str) -> dict[str, Any]:
             elif stored_previous != expected_previous_id:
                 errors.append(ERROR_BAD_PREVIOUS)
 
-        # Content digest over the seven stored business fields, then the chain
+        # Content digest over the seven business fields, then the chain
         # digest running from the empty prefix in chain order — the same
-        # recomputation the integrity audit uses. A damaged business field
-        # (e.g. a non-string or non-integer stored value) makes the digest
-        # uncomputable; that is a content-digest anomaly, never a crash, and
-        # such a record also cannot extend the chain continuation.
-        try:
-            expected_content_hash = compute_content_hash(
-                **{key: mapping[key] for key in _CONTENT_COLUMNS}
-            )
-        except (TypeError, ValueError):
-            expected_content_hash = None
+        # recomputation the integrity audit uses. A member row's business
+        # fields are judged under the path machine's ownership: an
+        # ownership-damaged row that is still this machine's record carries
+        # another value in its stored ``machine_id`` column, but the stored
+        # content digest was minted with the path machine id, so it is
+        # recomputed with that ownership restored (the other six fields
+        # verbatim). That keeps a pure ownership tamper a single
+        # ``bad_ownership`` instead of cascading into digest errors; a
+        # genuinely damaged other business field still fails the digest
+        # and such a record cannot extend the chain continuation.
+        expected_content_hash = _recompute_content_hash(mapping, machine_id)
         if (
             expected_content_hash is None
             or stored_content_hash != expected_content_hash

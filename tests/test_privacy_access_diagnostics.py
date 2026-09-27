@@ -563,6 +563,117 @@ def test_other_machines_damaged_records_never_affect_result(client, tmp_path):
     assert diagnose(client, machine_two)["valid"] is False
 
 
+def test_overwritten_ownership_is_bad_ownership_counted_with_successors(
+    client, tmp_path
+):
+    # A row minted for machine one whose stored machine_id is later
+    # overwritten to machine two must still be diagnosed as machine one's
+    # record: it enters machine one's total, is flagged bad_ownership, and
+    # the records after it are still listed in their positions.
+    machine_id = create_machine(client)
+    first = register(client, machine_id, accessed_at=T0)
+    damaged = register(client, machine_id, accessed_at=T1)
+    third = register(client, machine_id, accessed_at=T2)
+
+    other = create_machine(client, "machine-2")
+    tamper(
+        tmp_path / "test.db",
+        "UPDATE privacy_accesses SET machine_id = ? WHERE id = ?",
+        (other, damaged["id"]),
+    )
+
+    result = diagnose(client, machine_id)
+    assert result["valid"] is False
+    assert result["checked_count"] == 3
+    assert [r["id"] for r in result["records"]] == [
+        first["id"],
+        damaged["id"],
+        third["id"],
+    ]
+    damaged_record = result["records"][1]
+    assert damaged_record["position"] == 2
+    # A pure ownership tamper is exactly bad_ownership: the stored content
+    # digest was minted with the original machine id and still verifies
+    # under it, so it does not cascade into content/chain anomalies.
+    assert damaged_record["errors"] == ["bad_ownership"]
+    # The successor is still listed, and its chain link is sound.
+    successor = result["records"][2]
+    assert successor["position"] == 3
+    assert successor["previous_access_id"] == damaged["id"]
+    assert successor["errors"] == []
+
+
+def test_overwritten_ownership_does_not_leak_into_the_named_machine(
+    client, tmp_path
+):
+    # The relabeled row's content digest commits to machine one, so it must
+    # never be counted as machine two's record merely because the corrupted
+    # ownership column names machine two.
+    machine_one = create_machine(client, "machine-1")
+    machine_two = create_machine(client, "machine-2")
+    register(client, machine_one, accessed_at=T0)
+    damaged = register(client, machine_one, accessed_at=T1)
+
+    tamper(
+        tmp_path / "test.db",
+        "UPDATE privacy_accesses SET machine_id = ? WHERE id = ?",
+        (machine_two, damaged["id"]),
+    )
+
+    two = diagnose(client, machine_two)
+    assert two["valid"] is True
+    assert two["checked_count"] == 0
+    assert two["records"] == []
+
+
+def test_overwritten_ownership_on_only_record_stays_owned_and_counted(
+    client, tmp_path
+):
+    # Even the machine's single row does not vanish when its ownership is
+    # overwritten: it is recovered by its content digest.
+    machine_id = create_machine(client)
+    only = register(client, machine_id, accessed_at=T0)
+    other = create_machine(client, "machine-2")
+
+    tamper(
+        tmp_path / "test.db",
+        "UPDATE privacy_accesses SET machine_id = ? WHERE id = ?",
+        (other, only["id"]),
+    )
+
+    result = diagnose(client, machine_id)
+    assert result["checked_count"] == 1
+    assert result["valid"] is False
+    assert result["records"][0]["id"] == only["id"]
+    assert result["records"][0]["errors"] == ["bad_ownership"]
+
+
+def test_ownership_damage_plus_other_damage_keeps_each_anomaly(
+    client, tmp_path
+):
+    # When the ownership field and another business field are both damaged,
+    # the digest cannot verify under any machine; the row is still retained
+    # by its (corrupted) stored ownership for the path machine only when it
+    # names it — a row moved to another machine whose digest is otherwise
+    # broken is not attributable and does not enter the original machine.
+    machine_id = create_machine(client)
+    register(client, machine_id, accessed_at=T0)
+    damaged = register(client, machine_id, accessed_at=T1)
+    other = create_machine(client, "machine-2")
+
+    db = tmp_path / "test.db"
+    tamper(db, "UPDATE privacy_accesses SET machine_id = ? WHERE id = ?",
+           (other, damaged["id"]))
+    tamper(db, "UPDATE privacy_accesses SET result = 'failed' WHERE id = ?",
+           (damaged["id"],))
+
+    # The digest now proves ownership of neither machine; the original
+    # machine's total only retains its first sound record.
+    result = diagnose(client, machine_id)
+    assert result["checked_count"] == 1
+    assert [r["id"] for r in result["records"]] != [damaged["id"]]
+
+
 # --------------------------------------------------------------------------- #
 # Serialization, read-only, persistence
 # --------------------------------------------------------------------------- #
