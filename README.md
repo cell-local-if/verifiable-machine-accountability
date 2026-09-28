@@ -391,6 +391,55 @@ contains no floating-point or non-finite values. The query only reads: it
 never creates, updates, deletes, repairs, or normalizes status, history, or
 any other record, and another machine's records never enter the result.
 
+## Read-only machine status-history compliance export
+
+`GET /machines/{machine_id}/status-history/compliance-export` returns a
+deterministic, read-only compliance slice of the machine's own status
+transitions over a closed creation-time window. The caller submits only the
+path machine id and the two required bounds; both are validated before the
+machine is looked up, so a parameter error returns `422` even when the
+machine does not exist and an invalid query never reads machine data:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; surrounding whitespace, offset forms such as
+  `+00:00`, a missing suffix, and out-of-range calendar/time values are
+  rejected); `from_created_at` must not be later than `to_created_at` (equal
+  bounds are allowed). A missing, blank, malformed, or inverted bound returns
+  `422 {"error":{"code":"bad_time"}}`.
+- An unknown parameter, a repeated `from_created_at`/`to_created_at`, or a
+  request body returns `422 {"error":{"code":"invalid_query"}}`.
+- The path accepts `GET` only; `HEAD` and every other method return `405`
+  without reading records, filtering, or computing a result.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}` with no partial export, and a real
+failure while reading the records returns
+`500 {"error":{"code":"internal_error"}}` with no partial records.
+
+The response is `{machine_id, from_created_at, to_created_at,
+status_history}` in that fixed key order; the bounds are echoed verbatim and
+`status_history` is always present, an empty array when the window contains
+nothing (including an empty database). The array contains only existing
+status-transition records owned by the path machine whose own `created_at`
+falls inside the closed interval `[from_created_at, to_created_at]`, each
+carrying exactly the status-history list endpoint fields
+`{id, machine_id, from_status, to_status, created_at}`. Records are ordered
+by the actual UTC instant of `created_at` and then by id, so an exact-second
+record sorts before any fractional-second record of the same second; a
+stored stamp that no longer parses sorts after every parseable instant and
+therefore never falls inside a finite window.
+
+In-window records are exported exactly as stored — a corrupt status edge is
+never filtered out, repaired, or normalized — and another machine's records
+can never enter the result. The query is strictly read-only and adds no
+persisted state: it never creates, updates, deletes, repairs, recomputes, or
+normalizes a record, repeated calls against unchanged data are byte
+identical, results read across application restarts, and an empty or old
+database is usable without migration. The body is compact UTF-8 JSON
+terminated by a single newline and contains no floating-point, `-0.0`, or
+non-finite values. Status changes, the status-history list, the incremental
+`changes` query, diagnostics, and the health check are unchanged.
+
 ## Read-only joint-write transaction diagnostics
 
 `GET /machines/{machine_id}/diag` exposes read-only observability over the
