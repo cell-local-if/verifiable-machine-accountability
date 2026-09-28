@@ -162,7 +162,22 @@ The checks verify, in a fixed order: the document parses to the five expected
 groups with sound field types and ordering; the event summary corresponds
 verbatim to the event's committed `allowed` result, `reason`, capture moment
 (`created_at`), and chain fields (`previous_event_id`, `content_hash`,
-`chain_hash`) — nothing is recomputed or filled in; the machine status is
+`chain_hash`) — nothing is recomputed or filled in.
+
+The stable document/decision classification is:
+
+- `malformed_document` — the document itself cannot be read as the captured
+  record: it does not parse (or parses to a non-object), a top-level group
+  is missing, extra, or out of order, a nested field is missing, extra, or
+  out of order, a field anywhere (including the final decision group) has
+  the wrong type, or a collection — the declarations or the policy
+  candidates — is in an anomalous order. Every parse, grouping, type, and
+  ordering anomaly shares this one document-level category;
+- `malformed_decision` — the document is structurally complete and
+  well-typed, but the final judgement is illegal or contradicts the
+  event's committed result: the recorded `decision` does not equal the
+  committed `{allowed, reason}` or is not the decision the audited basis
+  supports. the machine status is
 reconstructed **as of the event** from the machine's own
 `machine_status_events` transition history rather than its current row; a
 suspended machine's basis explicitly records that declarations and policy
@@ -220,6 +235,79 @@ byte-for-byte identically, the result persists across restarts, and machine
 isolation is enforced. Event creation, the event list, the hash chain,
 evidence chain, incident responsibility, privacy exports, diagnostics, and
 health-check semantics are unchanged.
+
+### Incrementally querying basis snapshots
+
+`GET /machines/{machine_id}/authorization-decision-events/decision-basis/changes`
+is the stable, keyset-paginated incremental view over one machine's
+immutable decision-basis snapshots — the `changes` sub-entry under the
+machine authorization decision basis path. It is a separate, strictly
+read-only audit entry point: it changes neither event creation, the
+single-snapshot query, the consistency audit, the hash chain, privacy
+exports, diagnostics, nor health-check semantics, and it adds no on-disk
+format (cursors are stateless), so old and empty databases work unchanged.
+The caller submits only the path machine id, a page size, and an optional
+cursor — no business filter parameters and no request body. Validation
+completes before the machine or any snapshot is read:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, fractional (e.g. `1.0`), boolean (`true`/`false`), non-decimal,
+  or out-of-range value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque string shaped
+  `<created_at original text>|<event id>` and returned by a previous page.
+  An empty or shape-mismatching value returns
+  `422 {"error":{"code":"invalid_cursor"}}`; the timestamp segment is
+  original stored text rather than re-parsed, because a snapshot whose
+  stored `created_at` no longer parses stays pageable. A well-shaped
+  cursor whose `(created_at, event id)` position cannot be located among
+  the path machine's stored basis snapshots — including an event that has
+  no snapshot or a position naming another machine's record — is rejected
+  as `422 {"error":{"code":"invalid_cursor"}}` after the snapshots are
+  read, with no partial page, so a parameter error always takes priority
+  over the machine lookup.
+- Any other query parameter, a repeated `limit`/`cursor`, or a request
+  carrying a body returns `422 {"error":{"code":"invalid_query"}}` in the
+  validation phase; every validation error is answered without reading
+  any machine or snapshot.
+- The path accepts `GET` only; `HEAD` and other methods return `405`
+  without reading snapshots, computing a page, or writing anything.
+- A valid query against a machine that does not exist returns
+  `404 {"error":{"code":"not_found"}}` carrying no records.
+- A real failure that prevents reading the snapshots or the machine
+  returns `500 {"error":{"code":"internal_error"}}` with no partial page.
+
+The success object carries exactly `{machine_id, limit, records,
+next_cursor, has_more}` in this fixed field order; the path machine id and
+the page size are echoed verbatim, and an empty database or a machine with
+no snapshots returns the complete empty page. Only events that already
+have a snapshot enter the page: a historical event without a snapshot is
+neither fabricated nor placed on the cursor. Each record is tagged
+`"kind":"decision_basis"` and then carries exactly the five groups the
+single snapshot query exposes, in their stored order — `event_summary`,
+`status_basis`, `declaration_basis`, `policy_candidates`, `decision` —
+re-emitted from the stored document byte-for-byte without reparsing,
+repairing, or recomputing it. Records are ordered by the actual UTC
+instant of the snapshot `created_at` and then by event id ascending, so an
+exact-second record sorts before any fractional-second record of the same
+second. A stored `created_at` that no longer parses never crashes the
+query: the record is kept with its stored value and deterministically
+sorts after every parseable instant rather than being repaired, skipped,
+or deleted.
+
+The cursor is an exclusive position over `(created_at, event id)`: it
+points just after a page's last record, so the page returns only records
+strictly after it. Repeating the same cursor against unchanged data
+returns the byte-identical next page, and a newly captured snapshot whose
+sort position is earlier never makes an already-returned record resurface
+while the current page still follows the stable order. `next_cursor` is
+the position after the page's last record when at least one record
+follows and `null` otherwise; `has_more` is `true` exactly then and
+`false` on both an empty and a last page. The query is strictly
+read-only and machine-isolated — another machine's snapshot never enters
+— and the body is compact UTF-8 JSON terminated by a single newline, free
+of floating-point, `-0.0`, or non-finite values, byte-identical on repeat
+calls against unchanged data, and readable for snapshots persisted across
+application restarts.
 
 
 ## Machine suspension and reactivation

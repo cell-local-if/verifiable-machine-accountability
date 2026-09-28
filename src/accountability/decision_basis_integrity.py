@@ -23,10 +23,23 @@ The conclusion is fixed at four fields:
 
 The audit never fabricates a basis: an event without a snapshot row is
 ``(False, 0, event_id, "snapshot_not_found")`` regardless of the current
-declarations or rules. A damaged document (unparseable JSON, a missing or
-misshapen group, wrong field types, anomalous ordering, or mutually
-contradictory contents) is ``(False, 1, event_id, <category>)`` — the first
-category in the fixed examination order, so repeated queries are stable.
+declarations or rules. A damaged document is ``(False, 1, event_id,
+<category>)`` — the first category in the fixed examination order, so
+repeated queries are stable. The stable classification is:
+
+* ``malformed_document`` — the document itself cannot be read as the
+  captured record: it does not parse (or parses to a non-object), a
+  top-level group is missing, extra, or out of order, a nested field is
+  missing, extra, or out of order, a field has the wrong type, or a
+  collection (the declarations or the policy candidates) is in an
+  anomalous order. Every parse, grouping, type, and ordering anomaly
+  across all five groups shares this one document-level category,
+  reported as soon as the anomaly is found;
+* ``malformed_decision`` — the document is structurally complete and
+  well-typed, but the final judgement field is illegal or contradicts the
+  event's committed result: the recorded ``decision`` does not equal the
+  committed ``{allowed, reason}`` or is not the decision the audited
+  basis supports.
 
 The policy relations are audited against the rules *as they existed when the
 event committed*: winner/overridden/conflict/unmatched/invalid are rebuilt
@@ -139,15 +152,16 @@ _REFERENCE_FIELDS = ("id", "effect", "priority", "created_at")
 _RELATIONS = frozenset(("winner", "overridden", "conflict", "unmatched", "invalid"))
 
 # Outcome reasons for a false conclusion, kept as stable fixed strings. The
-# snapshot-missing case is fixed by contract; every other category names the
-# first damaged/contradictory part in examination order.
+# snapshot-missing case is fixed by contract. Every anomaly in the document
+# itself — a parse failure, a missing/extra/reordered group or field, a
+# wrong field type anywhere, or an anomalous declaration/candidate ordering
+# — is the single stable ``malformed_document`` category. A structurally
+# complete document whose final decision value is illegal or contradicts
+# the committed event (or is not what the audited basis supports) is
+# ``malformed_decision``. The remaining cross-group/event correspondence
+# and status categories keep their own stable strings below.
 SNAPSHOT_NOT_FOUND = "snapshot_not_found"
-_CORRUPT_DOCUMENT = "corrupt_document"
-_MALFORMED_STRUCTURE = "malformed_structure"
-_MALFORMED_EVENT_SUMMARY = "malformed_event_summary"
-_MALFORMED_STATUS_BASIS = "malformed_status_basis"
-_MALFORMED_DECLARATION_BASIS = "malformed_declaration_basis"
-_MALFORMED_POLICY_CANDIDATES = "malformed_policy_candidates"
+_MALFORMED_DOCUMENT = "malformed_document"
 _MALFORMED_DECISION = "malformed_decision"
 _EVENT_SUMMARY_MISMATCH = "event_summary_mismatch"
 _STATUS_HISTORY_INVALID = "status_history_invalid"
@@ -156,12 +170,9 @@ _READ_FLAGS_MISMATCH = "read_flags_mismatch"
 _STATUS_BASIS_MISMATCH = "status_basis_mismatch"
 _DECLARATION_BASIS_MISMATCH = "declaration_basis_mismatch"
 _DECLARATION_MATCH_MISMATCH = "declaration_match_mismatch"
-_DECLARATION_ORDER = "declaration_order"
 _POLICY_CANDIDATE_MISMATCH = "policy_candidate_mismatch"
 _POLICY_WINNER_MISMATCH = "policy_winner_mismatch"
 _POLICY_CONFLICT_MISMATCH = "policy_conflict_mismatch"
-_CANDIDATE_ORDER = "candidate_order"
-_DECISION_MISMATCH = "decision_mismatch"
 
 _DECLARATION_TABLE = BehaviorDeclaration.__table__
 _HISTORY_TABLE = MachineStatusEvent.__table__
@@ -223,9 +234,9 @@ def verify(
     try:
         parsed = json_loads(document)
     except (ValueError, TypeError):
-        return _result(False, 1, event_id, _CORRUPT_DOCUMENT)
+        return _result(False, 1, event_id, _MALFORMED_DOCUMENT)
     if not isinstance(parsed, dict):
-        return _result(False, 1, event_id, _CORRUPT_DOCUMENT)
+        return _result(False, 1, event_id, _MALFORMED_DOCUMENT)
 
     structural = _structural_problem(parsed)
     if structural is not None:
@@ -277,8 +288,12 @@ def verify(
         return _result(False, 1, event_id, policy_problem)
 
     # --- final decision: identical to the committed event and supported -----
+    # The document is structurally complete past this point; an illegal final
+    # judgement or one that contradicts the event's committed result (or is
+    # not the decision the audited status/declaration/policy basis supports)
+    # is the stable ``malformed_decision`` category.
     if decision.get("allowed") != event.allowed or decision.get("reason") != event.reason:
-        return _result(False, 1, event_id, _DECISION_MISMATCH)
+        return _result(False, 1, event_id, _MALFORMED_DECISION)
     if status == "suspended":
         supported = (False, "machine_suspended")
     elif not matched_any:
@@ -286,7 +301,7 @@ def verify(
     else:
         supported = derived_decision
     if (event.allowed, event.reason) != supported:
-        return _result(False, 1, event_id, _DECISION_MISMATCH)
+        return _result(False, 1, event_id, _MALFORMED_DECISION)
 
     return _result(True, 1, None, None)
 
@@ -311,11 +326,16 @@ def _structural_problem(document: dict[str, Any]) -> str | None:
     """First structural anomaly across the five groups, or ``None`` when sound.
 
     Only shape is judged here (groups present, exact key sets, value types);
-    cross-group and event correspondence are checked afterwards.
+    cross-group and event correspondence are checked afterwards. Every
+    parse, grouping, and field-type anomaly across all five groups —
+    including a wrong type in the final decision group — is reported under
+    the single stable ``malformed_document`` category; ``malformed_decision``
+    is reserved for a structurally complete document whose final judgement
+    value is illegal or contradicts the committed event.
     """
     if tuple(document.keys()) != _GROUPS:
         # Covers a missing group, a superfluous group, and wrong group order.
-        return _MALFORMED_STRUCTURE
+        return _MALFORMED_DOCUMENT
 
     summary = document["event_summary"]
     summary_problem = _check_object_shape(
@@ -335,7 +355,7 @@ def _structural_problem(document: dict[str, Any]) -> str | None:
         nullable_str_fields=("previous_event_id",),
     )
     if summary_problem:
-        return _MALFORMED_EVENT_SUMMARY
+        return _MALFORMED_DOCUMENT
 
     status_problem = _check_object_shape(
         document["status_basis"],
@@ -344,18 +364,18 @@ def _structural_problem(document: dict[str, Any]) -> str | None:
         bool_fields=("declarations_read", "policies_read"),
     )
     if status_problem:
-        return _MALFORMED_STATUS_BASIS
+        return _MALFORMED_DOCUMENT
 
     declaration_basis = document["declaration_basis"]
     if not isinstance(declaration_basis, dict):
-        return _MALFORMED_DECLARATION_BASIS
+        return _MALFORMED_DOCUMENT
     if tuple(declaration_basis.keys()) != ("read", "declarations"):
-        return _MALFORMED_DECLARATION_BASIS
+        return _MALFORMED_DOCUMENT
     if not isinstance(declaration_basis["read"], bool):
-        return _MALFORMED_DECLARATION_BASIS
+        return _MALFORMED_DOCUMENT
     items = declaration_basis["declarations"]
     if not isinstance(items, list):
-        return _MALFORMED_DECLARATION_BASIS
+        return _MALFORMED_DOCUMENT
     for item in items:
         if _check_object_shape(
             item,
@@ -369,23 +389,23 @@ def _structural_problem(document: dict[str, Any]) -> str | None:
             ),
             bool_fields=("enabled", "matched"),
         ):
-            return _MALFORMED_DECLARATION_BASIS
+            return _MALFORMED_DOCUMENT
 
     policy_basis = document["policy_candidates"]
     if not isinstance(policy_basis, dict):
-        return _MALFORMED_POLICY_CANDIDATES
+        return _MALFORMED_DOCUMENT
     if tuple(policy_basis.keys()) != ("read", "candidates", "winners", "conflicts"):
-        return _MALFORMED_POLICY_CANDIDATES
+        return _MALFORMED_DOCUMENT
     if not isinstance(policy_basis["read"], bool):
-        return _MALFORMED_POLICY_CANDIDATES
+        return _MALFORMED_DOCUMENT
     if not isinstance(policy_basis["candidates"], list):
-        return _MALFORMED_POLICY_CANDIDATES
+        return _MALFORMED_DOCUMENT
     for candidate in policy_basis["candidates"]:
         problem = _candidate_shape_problem(candidate)
         if problem is not None:
             return problem
     if not isinstance(policy_basis["winners"], list):
-        return _MALFORMED_POLICY_CANDIDATES
+        return _MALFORMED_DOCUMENT
     for winner in policy_basis["winners"]:
         if _check_object_shape(
             winner,
@@ -393,7 +413,7 @@ def _structural_problem(document: dict[str, Any]) -> str | None:
             str_fields=("id", "effect", "created_at"),
             int_fields=("priority",),
         ):
-            return _MALFORMED_POLICY_CANDIDATES
+            return _MALFORMED_DOCUMENT
     conflicts = policy_basis["conflicts"]
     if not isinstance(conflicts, list) or any(
         not isinstance(pair, list)
@@ -401,7 +421,7 @@ def _structural_problem(document: dict[str, Any]) -> str | None:
         or not all(isinstance(side, str) for side in pair)
         for pair in conflicts
     ):
-        return _MALFORMED_POLICY_CANDIDATES
+        return _MALFORMED_DOCUMENT
 
     if _check_object_shape(
         document["decision"],
@@ -409,7 +429,10 @@ def _structural_problem(document: dict[str, Any]) -> str | None:
         str_fields=("reason",),
         bool_fields=("allowed",),
     ):
-        return _MALFORMED_DECISION
+        # A missing key or wrong field type is a document-level field
+        # anomaly; ``malformed_decision`` applies only to a structurally
+        # complete decision whose value is illegal or contradictory.
+        return _MALFORMED_DOCUMENT
     return None
 
 
@@ -446,22 +469,23 @@ def _candidate_shape_problem(candidate: Any) -> str | None:
     A candidate marked ``invalid`` may carry damaged stored field values (it
     records that the row could not participate), so its seven rule fields are
     only type-checked for the four usable relations. The relation marker
-    itself and the exact eight-key set must always be sound.
+    itself and the exact eight-key set must always be sound. A shape or type
+    anomaly here is the document-level ``malformed_document`` category.
     """
     if not isinstance(candidate, dict) or tuple(candidate.keys()) != _CANDIDATE_FIELDS:
-        return _MALFORMED_POLICY_CANDIDATES
+        return _MALFORMED_DOCUMENT
     relation = candidate["relation"]
     if relation not in _RELATIONS:
-        return _MALFORMED_POLICY_CANDIDATES
+        return _MALFORMED_DOCUMENT
     if relation == "invalid":
         return None
     if not all(
         isinstance(candidate[name], str)
         for name in ("id", "action_type", "resource_pattern", "effect", "created_at", "updated_at")
     ):
-        return _MALFORMED_POLICY_CANDIDATES
+        return _MALFORMED_DOCUMENT
     if not _is_int(candidate["priority"]):
-        return _MALFORMED_POLICY_CANDIDATES
+        return _MALFORMED_DOCUMENT
     return None
 
 
@@ -755,7 +779,10 @@ def _check_status_and_declarations(
     ]
     actual_keys = [(_created_instant(item["created_at"]), item["id"]) for item in items]
     if actual_keys != expected_keys:
-        return _DECLARATION_ORDER, status, False
+        # An anomalous collection order is a document-level malformation:
+        # the set and match flags are sound but the recorded sequence no
+        # longer follows the fixed capture ordering.
+        return _MALFORMED_DOCUMENT, status, False
 
     return None, status, matched_any
 
@@ -823,8 +850,9 @@ def _check_policy_candidates(
 
     # Content first (missing/extra/superfluous candidate, a wrong stored
     # field, or a wrong winner/overridden/conflict/unmatched/invalid
-    # relation), order second so an ordering-only anomaly keeps its own
-    # category even when the recorded set is otherwise complete.
+    # relation), the candidate sequence order second: an anomalous
+    # collection order is the document-level ``malformed_document``
+    # category, even when the recorded set is otherwise complete.
     if sorted(_canonical(candidate) for candidate in candidates) != sorted(
         _canonical(candidate) for candidate in expected_candidates
     ):
@@ -832,7 +860,7 @@ def _check_policy_candidates(
     if [_canonical(candidate) for candidate in candidates] != [
         _canonical(candidate) for candidate in expected_candidates
     ]:
-        return _CANDIDATE_ORDER, None
+        return _MALFORMED_DOCUMENT, None
     if winners != expected_winners:
         return _POLICY_WINNER_MISMATCH, None
     if conflicts != expected_conflicts:

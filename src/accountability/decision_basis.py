@@ -224,3 +224,26 @@ def load_document(
             _TABLE.c.machine_id == machine_id,
         )
     ).scalar()
+
+
+def list_snapshots(session: Session | Connection, *, machine_id: str) -> list[Any]:
+    """Return every stored basis snapshot row owned by the path machine.
+
+    Read-only and scoped to the path machine, so another machine's snapshot
+    can never enter the incremental query. Only events that actually have a
+    snapshot row are represented: an event without one is never fabricated
+    and never enters the changes feed. The rows carry the stored
+    ``(event_id, machine_id, created_at, document)`` values verbatim; the
+    caller orders and paginates them without ever re-parsing a document.
+    """
+    return [
+        row
+        for row in session.execute(
+            select(
+                _TABLE.c.event_id,
+                _TABLE.c.machine_id,
+                _TABLE.c.created_at,
+                _TABLE.c.document,
+            ).where(_TABLE.c.machine_id == machine_id)
+        ).all()
+    ]
