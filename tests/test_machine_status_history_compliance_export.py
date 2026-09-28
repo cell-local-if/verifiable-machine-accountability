@@ -504,7 +504,11 @@ def test_export_items_have_exactly_the_list_endpoint_fields(client):
 
     assert response.status_code == 200
     exported = response.json()["status_history"]
-    assert exported == listed
+    # The export keeps its five-field shape; the status-history list now also
+    # carries the chain fields, so compare on the export's field set.
+    assert exported == [
+        {key: item[key] for key in RECORD_KEYS} for item in listed
+    ]
     assert list(exported[0].keys()) == RECORD_KEYS
 
 

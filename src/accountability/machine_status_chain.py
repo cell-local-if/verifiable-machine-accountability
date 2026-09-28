@@ -1,0 +1,426 @@
+"""Per-machine tamper-evident hash chains for machine status history.
+
+Each machine's ``machine_status_events`` transition records form an ordered
+chain, ordered by the actual UTC instant of ``created_at`` and then by ``id``,
+following the same rules as the other per-machine chains:
+
+* ``content_hash`` = SHA-256 of the compact, key-sorted JSON document built
+  from the record's own fields: ``{id, machine_id, from_status, to_status,
+  created_at}`` — the record, its ownership, the status edge, and the creation
+  moment.
+* ``chain_hash`` = SHA-256 of ``<previous chain_hash>:<content_hash>``; the
+  first record uses the empty string as the previous chain hash.
+* ``previous_status_event_id`` is ``None`` for a machine's first record and
+  the prior record's id otherwise.
+
+A successful status change updates the machine row and appends the linked
+history record inside the single locked joint write transaction, so the
+machine update, the history record, and its chain link commit together or not
+at all, and concurrent status changes cannot lose records, fork the chain, or
+break a link.
+
+Beyond the hash checks, read-only verification also enforces the existing
+active/suspended semantics of the history: every edge stays inside the
+``active``/``suspended`` pair, no edge is a self loop, and each edge's
+``from_status`` continues the state the earlier transitions establish. A
+damaged creation moment, record id, ownership, status edge, predecessor,
+content digest, or chain digest never crashes the audit: the record stays in
+the total and is reported as the first broken record, never repaired.
+"""
+
+import hashlib
+import json
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy import Connection, Engine, inspect, text
+
+from .chain import _run_with_lock_retry
+from .db import MachineStatusEvent
+
+_HASH_LEN = 64
+
+_TABLE = MachineStatusEvent.__table__
+_CONTENT_COLUMNS = (
+    "id",
+    "machine_id",
+    "from_status",
+    "to_status",
+    "created_at",
+)
+
+_STATUSES = ("active", "suspended")
+
+
+def compute_content_hash(
+    *,
+    id: str,
+    machine_id: str,
+    from_status: str,
+    to_status: str,
+    created_at: str,
+) -> str:
+    document = json.dumps(
+        {
+            "id": id,
+            "machine_id": machine_id,
+            "from_status": from_status,
+            "to_status": to_status,
+            "created_at": created_at,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(document.encode("utf-8")).hexdigest()
+
+
+def compute_chain_hash(previous_chain_hash: str, content_hash: str) -> str:
+    message = f"{previous_chain_hash}:{content_hash}"
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+
+def migrate_schema(engine: Engine) -> None:
+    """Add chain columns to databases created before the chain feature."""
+    inspector = inspect(engine)
+    existing = {column["name"] for column in inspector.get_columns(_TABLE.name)}
+    additions = {
+        "previous_status_event_id": "VARCHAR(36)",
+        "content_hash": f"VARCHAR({_HASH_LEN})",
+        "chain_hash": f"VARCHAR({_HASH_LEN})",
+    }
+    with engine.begin() as conn:
+        for name, column_type in additions.items():
+            if name not in existing:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {_TABLE.name} ADD COLUMN {name} {column_type}"
+                    )
+                )
+
+
+_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _created_instant(value: object) -> datetime:
+    """Parse a stored ``created_at`` to its actual UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract, so
+    parsing cannot fail for them; a damaged value that no longer parses sorts
+    after every parseable record (its content hash cannot verify anyway)
+    instead of crashing the read-only audit.
+    """
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            pass
+    return _FAR_FUTURE
+
+
+def _created_at_parseable(value: object) -> bool:
+    """Whether a stored ``created_at`` still parses to a UTC instant."""
+    if isinstance(value, str):
+        try:
+            datetime.fromisoformat(value[:-1] + "+00:00")
+            return True
+        except ValueError:
+            pass
+    return False
+
+
+def _chain_order(rows: list[Any]) -> list[Any]:
+    """Order status-history rows by the actual UTC instant of ``created_at``.
+
+    Ordering is by the parsed UTC instant and then by ``id``, so an
+    exact-second stamp sorts before any fractional-second stamp of the same
+    second (ISO text alone cannot express that, since ``.`` precedes ``Z``).
+    A stamp that no longer parses sorts deterministically last, and a damaged
+    non-string id sorts as empty rather than crashing the comparison.
+    """
+    return sorted(
+        rows,
+        key=lambda row: (
+            _created_instant(row._mapping["created_at"]),
+            row._mapping["id"] if isinstance(row._mapping["id"], str) else "",
+        ),
+    )
+
+
+def _load_records(conn: Connection, machine_id: str) -> list[Any]:
+    """Load one machine's status history in chain (instant, id) order."""
+    rows = list(
+        conn.execute(_TABLE.select().where(_TABLE.c.machine_id == machine_id))
+    )
+    return _chain_order(rows)
+
+
+def _recompute_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    updates: list[dict[str, Any]] = []
+    previous_status_event_id: str | None = None
+    previous_chain_hash = ""
+    for row in rows:
+        mapping = row._mapping
+        content_hash = compute_content_hash(
+            **{key: mapping[key] for key in _CONTENT_COLUMNS}
+        )
+        chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+        if (
+            mapping["previous_status_event_id"] != previous_status_event_id
+            or mapping["content_hash"] != content_hash
+            or mapping["chain_hash"] != chain_hash
+        ):
+            updates.append(
+                {
+                    "id": mapping["id"],
+                    "previous_status_event_id": previous_status_event_id,
+                    "content_hash": content_hash,
+                    "chain_hash": chain_hash,
+                }
+            )
+        previous_status_event_id = mapping["id"]
+        previous_chain_hash = chain_hash
+    return updates
+
+
+def backfill_chains(engine: Engine) -> None:
+    """Fill missing chain data on records written before the chain feature.
+
+    Processing is per machine in (created-at instant, id) order. The
+    recomputation is deterministic, so a restart over an already complete
+    database issues no writes. Each machine is handled inside a locked
+    transaction so a concurrent writer can neither interleave with the
+    backfill nor fork.
+    """
+    with engine.connect() as conn:
+        machine_ids = [
+            row[0]
+            for row in conn.execute(
+                text(
+                    f"SELECT DISTINCT machine_id FROM {_TABLE.name} "
+                    "ORDER BY machine_id"
+                )
+            )
+        ]
+
+    for machine_id in machine_ids:
+
+        def _work(conn: Connection, machine_id=machine_id) -> None:
+            rows = _load_records(conn, machine_id)
+            # previous_status_event_id is NULL on the first record, so
+            # completeness is determined by the two hashes being present
+            # everywhere.
+            if not rows or any(
+                row._mapping["content_hash"] is None
+                or row._mapping["chain_hash"] is None
+                for row in rows
+            ):
+                for values in _recompute_rows(rows):
+                    status_event_id = values.pop("id")
+                    conn.execute(
+                        _TABLE.update()
+                        .where(_TABLE.c.id == status_event_id)
+                        .values(**values)
+                    )
+
+        from .chain import _run_with_lock_retry
+
+        _run_with_lock_retry(engine, _work)
+
+
+def mint_tail_link(
+    conn: Connection,
+    *,
+    machine_id: str,
+    from_status: str,
+    to_status: str,
+    created_at: str,
+) -> dict[str, Any]:
+    """Read the machine's chain tail and insert one linked status event.
+
+    Must run inside the locked joint write transaction (the same transaction
+    that updates the machine's status), so the status update, the history
+    record, and its chain link commit together or not at all. ``created_at``
+    is the transaction's commit-moment clock read, shared with the machine's
+    ``updated_at``; the record id is minted here and, when the new record
+    shares the tail's instant, regenerated until it sorts strictly after the
+    tail id, so the predecessor link always matches the order used by
+    backfill and verification even under same-instant serialization.
+    """
+    rows = _load_records(conn, machine_id)
+    # Normally the startup backfill leaves every row complete. If any row is
+    # missing chain data (e.g. an external writer), rebuild the whole machine
+    # chain before appending so the new link has a sound tail.
+    if any(
+        row._mapping["content_hash"] is None or row._mapping["chain_hash"] is None
+        for row in rows
+    ):
+        for values in _recompute_rows(rows):
+            status_event_id = values.pop("id")
+            conn.execute(
+                _TABLE.update()
+                .where(_TABLE.c.id == status_event_id).values(**values)
+            )
+        rows = _load_records(conn, machine_id)
+
+    tail = rows[-1] if rows else None
+
+    status_event_id = str(uuid.uuid4())
+    if tail is not None:
+        tail_created_at = tail._mapping["created_at"]
+        tail_id = tail._mapping["id"]
+        # The joint write lock serializes status changes and ``created_at`` is
+        # the caller's commit-moment stamp (shared with the machine's
+        # ``updated_at``), so it never precedes the tail under normal
+        # operation. The caller's stamp is kept verbatim — it must stay equal
+        # to ``updated_at`` — and only a same-instant tie is broken by
+        # regenerating the id until it sorts strictly after the tail id. A
+        # damaged tail stamp/id is never adopted for the new record.
+        if (
+            isinstance(tail_id, str)
+            and _created_at_parseable(tail_created_at)
+            and _created_instant(created_at) == _created_instant(tail_created_at)
+        ):
+            while status_event_id <= tail_id:
+                status_event_id = str(uuid.uuid4())
+
+    if tail is None:
+        previous_status_event_id = None
+        previous_chain_hash = ""
+    else:
+        previous_status_event_id = tail._mapping["id"]
+        previous_chain_hash = tail._mapping["chain_hash"]
+
+    content_hash = compute_content_hash(
+        id=status_event_id,
+        machine_id=machine_id,
+        from_status=from_status,
+        to_status=to_status,
+        created_at=created_at,
+    )
+    chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+    conn.execute(
+        _TABLE.insert().values(
+            id=status_event_id,
+            machine_id=machine_id,
+            from_status=from_status,
+            to_status=to_status,
+            created_at=created_at,
+            previous_status_event_id=previous_status_event_id,
+            content_hash=content_hash,
+            chain_hash=chain_hash,
+        )
+    )
+    return {
+        "id": status_event_id,
+        "machine_id": machine_id,
+        "from_status": from_status,
+        "to_status": to_status,
+        "created_at": created_at,
+        "previous_status_event_id": previous_status_event_id,
+        "content_hash": content_hash,
+        "chain_hash": chain_hash,
+    }
+
+
+def verify_machine_chain(
+    session, machine_id: str
+) -> tuple[bool, int, str | None]:
+    """Read-only verification of one machine's machine-status chain.
+
+    Tolerant of damaged stored values so a corrupted ``created_at``, ``id``,
+    ownership, status edge, predecessor reference, or digest never crashes the
+    query, is never repaired or recomputed for storage, and never removes the
+    record from the total. Returns
+    ``(valid, checked_count, broken_status_event_id)``.
+
+    Records are examined in the order of the actual UTC instant of
+    ``created_at`` and then ``id`` (an exact-second stamp precedes any
+    fractional-second stamp of the same second). A record whose ``created_at``
+    no longer parses still enters the total and is itself reported as broken,
+    instead of crashing the scan or blaming its chain successor. Each record
+    must:
+
+    * carry a parseable creation moment and a text ``id``;
+    * stay owned by the path machine;
+    * keep a legal status edge — both ends inside ``active``/``suspended``,
+      no self loop, and ``from_status`` continuing the state established by
+      the earlier transitions (a machine is created ``active`` and accepted
+      changes alternate);
+    * have ``previous_status_event_id`` empty on the machine's first record
+      and equal to the immediately preceding record's id afterwards;
+    * carry stored ``content_hash``/``chain_hash`` equal to the digests
+      recomputed under the public creation-time rules — nothing is written
+      back when they do not.
+
+    The first failing record sets the broken id; later records cannot change
+    it. Only rows whose stored ``machine_id`` equals the path machine are
+    examined, so another machine's damaged records never change this result.
+    """
+    rows = _chain_order(
+        list(
+            session.execute(
+                _TABLE.select().where(_TABLE.c.machine_id == machine_id)
+            )
+        )
+    )
+
+    previous_status_event_id: str | None = None
+    previous_chain_hash = ""
+    carried = "active"
+    for row in rows:
+        mapping = row._mapping
+        raw_id = mapping["id"]
+        # A damaged non-text id is reported with a stable JSON-safe rendering
+        # (``str`` of a stored BLOB is deterministic), never crashing the
+        # read-only audit or producing a non-serializable conclusion.
+        row_id = raw_id if isinstance(raw_id, str) else str(raw_id)
+
+        # Creation moment and identifier: an unparseable stamp sorts last but
+        # is itself broken (its place relative to other records is otherwise
+        # undecidable); a non-text id makes same-instant ordering unstable.
+        if not _created_at_parseable(mapping["created_at"]) or not isinstance(
+            raw_id, str
+        ):
+            return False, len(rows), row_id
+
+        # Strict machine attribution: a record the path filter surfaced must
+        # still name this machine.
+        if mapping["machine_id"] != machine_id:
+            return False, len(rows), row_id
+
+        # The status edge must preserve the existing active/suspended history
+        # semantics: both ends legal, no self loop, and the edge continues the
+        # state the earlier transitions establish.
+        from_status = mapping["from_status"]
+        to_status = mapping["to_status"]
+        if (
+            from_status not in _STATUSES
+            or to_status not in _STATUSES
+            or from_status == to_status
+            or from_status != carried
+        ):
+            return False, len(rows), row_id
+        carried = to_status
+
+        try:
+            content_hash = compute_content_hash(
+                **{key: mapping[key] for key in _CONTENT_COLUMNS}
+            )
+            chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+        except (TypeError, ValueError):
+            # A damaged stored value (e.g. a non-text field) cannot produce
+            # the published digest; the record is broken, not a reason to
+            # crash the read-only audit.
+            return False, len(rows), row_id
+        if (
+            mapping["content_hash"] != content_hash
+            or mapping["previous_status_event_id"] != previous_status_event_id
+            or mapping["chain_hash"] != chain_hash
+        ):
+            return False, len(rows), row_id
+        previous_status_event_id = row_id
+        previous_chain_hash = chain_hash
+
+    return True, len(rows), None

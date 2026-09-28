@@ -379,17 +379,81 @@ databases that predate the feature, without touching existing records.
 
 `GET /machines/{machine_id}/status-history` returns the machine's own
 transition records as a JSON array — empty when the machine has never changed
-status. The query accepts no parameters: any query parameter is a
-`422 {"error":{"code":"invalid_query"}}` raised before the machine is looked
-up, a missing machine is `404 {"error":{"code":"not_found"}}`, and only `GET`
-is routed (other methods return `405`). Each item carries exactly
-`{id, machine_id, from_status, to_status, created_at}` in this fixed field
-order, with `created_at` the UTC commit-moment stamp ending in `Z`. Records
-are ordered by the actual UTC instant of `created_at`, then by `id`. The
-response body is compact UTF-8 JSON terminated by a single newline and
-contains no floating-point or non-finite values. The query only reads: it
-never creates, updates, deletes, repairs, or normalizes status, history, or
-any other record, and another machine's records never enter the result.
+status. The query accepts no parameters: any query parameter (or request
+body) is a `422 {"error":{"code":"invalid_query"}}` raised before the machine
+is looked up, a missing machine is `404 {"error":{"code":"not_found"}}`, and
+only `GET` is routed (other methods, including `HEAD`, return `405`). Each
+item carries the five transition fields `{id, machine_id, from_status,
+to_status, created_at}` in this fixed field order, with `created_at` the UTC
+commit-moment stamp ending in `Z`, followed in the same positions by the
+per-machine tamper-evident chain fields `previous_status_event_id`,
+`content_hash`, and `chain_hash` described below. Records are ordered by the
+actual UTC instant of `created_at`, then by `id`. The response body is
+compact UTF-8 JSON terminated by a single newline and contains no
+floating-point or non-finite values. The query only reads: it never creates,
+updates, deletes, repairs, or normalizes status, history, or any other
+record, and another machine's records never enter the result.
+
+## Machine status-history integrity chain
+
+Each machine's status-history records form a per-machine, tamper-evident
+hash chain. Every record returned by the status-history list endpoint
+carries, after its five transition fields:
+
+- `previous_status_event_id` — `null` for the machine's first record,
+  otherwise the id of the preceding record in `(created_at, id)` order (the
+  actual UTC instant, then id);
+- `content_hash` — `SHA-256(UTF-8(compact key-sorted JSON of {id,
+  machine_id, from_status, to_status, created_at}))`, covering the record
+  identifier, machine ownership, the status edge, and the creation moment;
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first
+  record and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))`
+  thereafter.
+
+All hashes are 64-character lowercase hexadecimal strings. The existing
+status fields, record id, from/to statuses, and creation moment are kept
+exactly as stored and are never rewritten for a chain check. Each machine is
+an independent chain: a record never points across machines or skips a link,
+the first record is rooted at the empty prefix, and later records must link
+to their immediate predecessor in the actual-UTC-instant/`id` order. A
+successful status change updates the machine, appends the history record,
+and links it to this machine's chain tail inside the existing single locked
+write transaction, so concurrent same-target changes still have at most one
+success and cannot lose records, fork the chain, or break a link. On
+startup the service adds the new columns to pre-existing databases and
+backfills missing chain data in `(created_at, id)` order; the recomputation
+is deterministic, so restarting with an already complete database performs
+no writes, and an empty database is directly usable.
+
+`GET /machines/{machine_id}/status-history/integrity` is the read-only
+independent verification `integrity` sub-entry under the machine status
+history path and returns the three integrity conclusions
+`{valid, checked_count, broken_status_event_id}`: an empty or fully sound
+chain reports `true`, the total count, and `null`; otherwise it reports
+`false`, the total count, and the first record whose creation moment,
+identifier, machine attribution, status edge, predecessor link, content
+hash, or chain hash does not verify. The status edge must keep the existing
+active/suspended semantics: both ends inside `active`/`suspended`, no self
+loop, and each edge's `from_status` must continue the state the earlier
+transitions establish (a machine is created `active`, and accepted changes
+alternate). A record with a corrupted `created_at` still enters the total
+and is itself reported as broken; a damaged record is never crashed on,
+repaired, rewritten, or recomputed, and another machine's damaged records
+never affect this machine's conclusion.
+
+The endpoint accepts no query parameters and no request body — either is a
+`422 {"error":{"code":"invalid_query"}}` validated before the machine is
+looked up and before any history is read (the same malformed request
+against a non-existent machine is still `422`). After validation a missing
+machine returns `404 {"error":{"code":"not_found"}}` with no partial
+conclusion; a real failure while reading the history returns
+`500 {"error":{"code":"internal_error"}}`, likewise with no partial
+conclusion. Only `GET` is routed; `HEAD` and every other method return
+`405` without reading history, computing a chain conclusion, or writing
+anything. The query is strictly read-only and machine-isolated, repeated
+queries of unchanged data are byte-identical compact UTF-8 JSON terminated
+by a single newline with no floating-point or non-finite value, and the
+conclusion persists across restarts.
 
 ## Read-only machine status-history compliance export
 
@@ -419,15 +483,16 @@ bound text are echoed verbatim, and `status_history` is an empty array
 (never omitted) for an empty window, a machine with no history, or an empty
 database. The array contains only the path machine's existing transition
 records whose own `created_at` falls inside the closed interval, each with
-exactly `{id, machine_id, from_status, to_status, created_at}` as the list
-endpoint returns it, ordered by the actual UTC instant of `created_at` and
-then by record id — an exact-second record sorts before any
-fractional-second record of the same second. A stored `created_at` that no
-longer parses sorts after every parseable instant and therefore never
-enters a finite window; damaged field values inside in-window records are
-kept exactly as stored, never filtered, repaired, or normalized. The query
-adds no persistence surface, repeats byte-identically, reads across
-restarts, and never returns another machine's records.
+the five transition fields `{id, machine_id, from_status, to_status,
+created_at}` exactly as stored — the export keeps this five-field shape and
+does not add the list endpoint's chain fields — ordered by the actual UTC
+instant of `created_at` and then by record id — an exact-second record sorts
+before any fractional-second record of the same second. A stored
+`created_at` that no longer parses sorts after every parseable instant and
+therefore never enters a finite window; damaged field values inside
+in-window records are kept exactly as stored, never filtered, repaired, or
+normalized. The query adds no persistence surface, repeats byte-identically,
+reads across restarts, and never returns another machine's records.
 
 ## Read-only joint-write transaction diagnostics
 

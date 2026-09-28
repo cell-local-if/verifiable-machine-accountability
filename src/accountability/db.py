@@ -25,7 +25,10 @@ class MachineStatusEvent(Base):
     Rows are append-only: each accepted status change inserts exactly one row
     in the same locked write transaction that updates the machine, and rows
     are never updated or deleted afterwards, so the table is a complete
-    per-machine history of every committed status change.
+    per-machine history of every committed status change. Each row also
+    carries a per-machine tamper-evident hash chain
+    (``previous_status_event_id``/``content_hash``/``chain_hash``) computed
+    from the record identifier, ownership, status edge, and creation moment.
     """
 
     __tablename__ = "machine_status_events"
@@ -37,6 +40,11 @@ class MachineStatusEvent(Base):
     from_status: Mapped[str] = mapped_column(String, nullable=False)
     to_status: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
+    # Per-machine hash chain. Nullable so databases created before the chain
+    # feature keep working; the startup migration backfills any missing values.
+    previous_status_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class KeyRotationEvent(Base):

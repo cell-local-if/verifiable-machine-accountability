@@ -10,6 +10,7 @@ from accountability.app import app
 RFC3339_Z_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$"
 )
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 MISSING_MACHINE = "00000000-0000-0000-0000-000000000000"
 
@@ -73,11 +74,17 @@ def test_suspend_appends_one_history_record(client):
         "from_status",
         "to_status",
         "created_at",
+        "previous_status_event_id",
+        "content_hash",
+        "chain_hash",
     ]
     assert record["machine_id"] == machine["id"]
     assert record["from_status"] == "active"
     assert record["to_status"] == "suspended"
     assert RFC3339_Z_RE.match(record["created_at"])
+    assert record["previous_status_event_id"] is None
+    assert HEX64_RE.match(record["content_hash"])
+    assert HEX64_RE.match(record["chain_hash"])
 
 
 def test_history_created_at_matches_commit_moment(client):
@@ -101,6 +108,9 @@ def test_suspend_reactivate_records_both_transitions_in_order(client):
         ("suspended", "active"),
     ]
     assert records[0]["created_at"] <= records[1]["created_at"]
+    # The second record links to the first in chain order.
+    assert records[0]["previous_status_event_id"] is None
+    assert records[1]["previous_status_event_id"] == records[0]["id"]
 
 
 def test_response_is_compact_utf8_json_ending_in_newline(client):

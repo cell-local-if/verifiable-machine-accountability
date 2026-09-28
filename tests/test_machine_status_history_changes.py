@@ -45,8 +45,20 @@ T4 = "2026-03-01T00:00:04Z"
 T5 = "2026-03-01T00:00:05Z"
 T0_FRAC = "2026-03-01T00:00:00.500000Z"
 
-RECORD_KEYS = ["id", "machine_id", "from_status", "to_status", "created_at"]
+RECORD_KEYS = [
+    "id",
+    "machine_id",
+    "from_status",
+    "to_status",
+    "created_at",
+    "previous_status_event_id",
+    "content_hash",
+    "chain_hash",
+]
 ENVELOPE_KEYS = ["machine_id", "limit", "records", "next_cursor", "has_more"]
+
+HASH_A = "a" * 64
+HASH_B = "b" * 64
 
 MISSING_MACHINE = "00000000-0000-0000-0000-000000000000"
 
@@ -96,22 +108,35 @@ def insert_status_event(
     *,
     from_status="active",
     to_status="suspended",
+    previous_status_event_id=None,
+    content_hash=HASH_A,
+    chain_hash=HASH_B,
 ):
-    """Insert a machine status-history row directly with a fixed id/stamp."""
+    """Insert a machine status-history row directly with a fixed id/stamp.
+
+    The chain columns are supplied explicitly and non-null so the startup
+    backfill (which only rewrites when a chain hash is missing) leaves the
+    row exactly as given; the changes query never recomputes them.
+    """
     values = {
         "id": rid(n),
         "machine_id": machine_id,
         "from_status": from_status,
         "to_status": to_status,
         "created_at": created_at,
+        "previous_status_event_id": previous_status_event_id,
+        "content_hash": content_hash,
+        "chain_hash": chain_hash,
     }
     with client.app.state.engine.begin() as conn:
         conn.execute(
             text(
                 "INSERT INTO machine_status_events "
-                "(id, machine_id, from_status, to_status, created_at) "
+                "(id, machine_id, from_status, to_status, created_at, "
+                "previous_status_event_id, content_hash, chain_hash) "
                 "VALUES "
-                "(:id, :machine_id, :from_status, :to_status, :created_at)"
+                "(:id, :machine_id, :from_status, :to_status, :created_at, "
+                ":previous_status_event_id, :content_hash, :chain_hash)"
             ),
             values,
         )
@@ -400,6 +425,9 @@ def test_records_carry_exactly_the_list_fields(client, machine_id):
         "from_status": "suspended",
         "to_status": "active",
         "created_at": "2026-03-01T00:00:00.250Z",
+        "previous_status_event_id": None,
+        "content_hash": HASH_A,
+        "chain_hash": HASH_B,
     }
 
 
@@ -709,6 +737,9 @@ def test_body_is_compact_newline_terminated_json_with_fixed_order(
                 "from_status": "active",
                 "to_status": "suspended",
                 "created_at": T1,
+                "previous_status_event_id": None,
+                "content_hash": HASH_A,
+                "chain_hash": HASH_B,
             }
         ],
         "next_cursor": None,
