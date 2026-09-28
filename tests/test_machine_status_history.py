@@ -73,11 +73,17 @@ def test_suspend_appends_one_history_record(client):
         "from_status",
         "to_status",
         "created_at",
+        "previous_status_event_id",
+        "content_hash",
+        "chain_hash",
     ]
     assert record["machine_id"] == machine["id"]
     assert record["from_status"] == "active"
     assert record["to_status"] == "suspended"
     assert RFC3339_Z_RE.match(record["created_at"])
+    assert record["previous_status_event_id"] is None
+    assert re.match(r"^[0-9a-f]{64}$", record["content_hash"])
+    assert re.match(r"^[0-9a-f]{64}$", record["chain_hash"])
 
 
 def test_history_created_at_matches_commit_moment(client):

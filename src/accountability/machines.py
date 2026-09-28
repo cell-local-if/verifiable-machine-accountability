@@ -11,12 +11,12 @@ and writes nothing. The state lives in the ``machines`` table and the history
 in ``machine_status_events``, so both survive restarts.
 """
 
-import uuid
 from typing import Any
 
 from sqlalchemy import Connection, Engine, func, select
 from sqlalchemy.orm import Session
 
+from . import machine_status_chain
 from .chain import (
     JointWriteOutcome,
     _utc_now_iso,
@@ -26,7 +26,6 @@ from .chain import (
 from .db import AuthorizationDecisionEvent, Machine, MachineStatusEvent
 
 _MACHINE_TABLE = Machine.__table__
-_HISTORY_TABLE = MachineStatusEvent.__table__
 
 _MACHINE_FIELDS = (
     "id",
@@ -79,6 +78,11 @@ def change_machine_status(
             )
 
         now = _utc_now_iso()
+        # The status change and the history record share one commit-moment
+        # stamp; derive it before the update so a clock regression against
+        # the chain tail is absorbed identically by ``updated_at`` and the
+        # history record's ``created_at``.
+        now = machine_status_chain.commit_timestamp(conn, machine_id, now)
         # The status predicate is an optimistic guard in addition to the write
         # lock: the row only changes while it still holds the status we read.
         result = conn.execute(
@@ -104,15 +108,15 @@ def change_machine_status(
         # The history record joins the same transaction, so the status update
         # and its history append commit together or not at all; its timestamp
         # is the transaction's commit-moment clock read, shared with the
-        # machine's updated_at.
-        conn.execute(
-            _HISTORY_TABLE.insert().values(
-                id=str(uuid.uuid4()),
-                machine_id=machine_id,
-                from_status=current_status,
-                to_status=to_status,
-                created_at=now,
-            )
+        # machine's updated_at. The record is linked to this machine's status
+        # chain tail in the same transaction, so the machine, the history
+        # record, and its chain link commit together or leave no trace.
+        machine_status_chain.mint_tail_link(
+            conn,
+            machine_id=machine_id,
+            from_status=current_status,
+            to_status=to_status,
+            created_at=now,
         )
 
         updated_row = conn.execute(

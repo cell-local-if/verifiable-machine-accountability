@@ -382,14 +382,92 @@ transition records as a JSON array — empty when the machine has never changed
 status. The query accepts no parameters: any query parameter is a
 `422 {"error":{"code":"invalid_query"}}` raised before the machine is looked
 up, a missing machine is `404 {"error":{"code":"not_found"}}`, and only `GET`
-is routed (other methods return `405`). Each item carries exactly
-`{id, machine_id, from_status, to_status, created_at}` in this fixed field
-order, with `created_at` the UTC commit-moment stamp ending in `Z`. Records
-are ordered by the actual UTC instant of `created_at`, then by `id`. The
-response body is compact UTF-8 JSON terminated by a single newline and
-contains no floating-point or non-finite values. The query only reads: it
+is routed (other methods return `405`). Each item carries the five stored
+transition fields `{id, machine_id, from_status, to_status, created_at}` in
+this fixed field order, followed by the per-machine tamper-evident chain
+fields `previous_status_event_id`, `content_hash`, and `chain_hash`
+(described below), with `created_at` the UTC commit-moment stamp ending in
+`Z`. Records are ordered by the actual UTC instant of `created_at`, then by
+`id`. The response body is compact UTF-8 JSON terminated by a single newline
+and contains no floating-point or non-finite values. The query only reads: it
 never creates, updates, deletes, repairs, or normalizes status, history, or
 any other record, and another machine's records never enter the result.
+
+## Machine status history tamper-evident chain
+
+Each machine's status transition records form their own per-machine,
+tamper-evident hash chain, independent of every other machine and of the
+machine's authorization event chain. A successful status change is still
+accepted solely through `POST /machines/{machine_id}/status`: inside the
+same locked write transaction the machine row is updated, exactly one
+history record is appended, and the new record is linked to **this
+machine's** chain tail, so the status, the record, and its chain link commit
+together or leave no trace, and concurrent changes cannot lose records,
+skip a link, point two records at the same predecessor, or fork the chain.
+The existing outcomes are unchanged: a body error is `422` (before any
+lookup), the machine's current status is `409
+invalid_status_transition` (concurrent requests for the same target have at
+most one success), and a missing machine is `404 not_found`.
+
+Every record the status-history list carries, in the positions after the
+existing fields:
+
+- `previous_status_event_id` — `null` for the machine's first record,
+  otherwise the id of the immediately preceding record in `(created_at, id)`
+  order (the actual UTC instant, then id); it never points across machines or
+  skips a record;
+- `content_hash` — `SHA-256(UTF-8(compact key-sorted JSON of {id,
+  machine_id, from_status, to_status, created_at}))`, covering the record
+  identifier, ownership, status edge, and creation moment; the existing
+  status fields, record id, before/after statuses, and creation moment keep
+  their stored values and are never rewritten for chain verification;
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first
+  record and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))`
+  thereafter.
+
+All hashes are 64-character lowercase hexadecimal strings. Records are
+ordered by the actual UTC instant of `created_at`, then by record id
+ascending, so an exact-second record precedes any fractional-second record
+of the same second. On startup the service adds the three columns to
+pre-existing databases and backfills missing chain data in that order; the
+recomputation is deterministic, so restarting with an already complete
+database performs no writes, and an empty database is directly usable.
+
+`GET /machines/{machine_id}/status-history/integrity` is the independent
+read-only verification sub-entry under the status-history path; it does not
+re-emit the history, it verifies it. It accepts only the path machine id:
+any query parameter (including a repeated one) or a carried request body is
+`422 {"error":{"code":"invalid_query"}}` validated before the machine is
+looked up and without reading history (the same malformed request against a
+non-existent machine is still `422`). After validation a missing machine is
+`404 {"error":{"code":"not_found"}}` with no conclusion; a real failure
+while reading the machine or history is
+`500 {"error":{"code":"internal_error"}}` with no partial conclusion. Only
+`GET` is routed; `HEAD` and every other method return `405` without reading
+history, computing a chain conclusion, or writing anything.
+
+A successful response carries the README's three integrity conclusions in
+this fixed field order, `{valid, checked_count, broken_status_event_id}`, as
+compact UTF-8 JSON terminated by a single newline with no floating-point or
+non-finite value. An empty machine or a complete chain reports `true`, the
+total record count (`0` when empty), and `null`; otherwise it reports
+`false`, the total count, and the first broken record in `(created_at, id)`
+order. Damage to the creation moment, record identifier, ownership, the
+status edge, the previous-record link, the content digest, or the chain
+digest all count as an anomaly and the first one is reported stably: a
+`created_at` that no longer parses still enters the total and is reported
+itself; the first record's predecessor must be empty and every later
+record's must be the immediately preceding record of the same machine. The
+status edges must also stay legal and continuous — a status outside
+`active`/`suspended`, a self loop, or a `from_status` that does not
+continue the state the earlier transitions establish (starting from the
+machine's creation default `active`) fails the record independently of the
+hashes, so the active/suspended semantics can never be broken by a
+hash-consistent forged edge. Only the path machine's records are examined,
+so another machine's damaged records never change the result. The audit is
+strictly read-only: a damaged record is neither repaired nor recomputed,
+repeated queries against unchanged data are byte-identical, and conclusions
+read records persisted across restarts.
 
 ## Read-only machine status-history compliance export
 

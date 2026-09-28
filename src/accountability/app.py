@@ -37,6 +37,7 @@ from . import (
     diagnostics,
     evidence_chain,
     incidents,
+    machine_status_chain,
     machines,
     policy_conflicts,
     policy_preview,
@@ -109,6 +110,8 @@ async def lifespan(app: FastAPI):
     policy_rule_chain.backfill_chains(engine)
     status_event_chain.migrate_schema(engine)
     status_event_chain.backfill_chains(engine)
+    machine_status_chain.migrate_schema(engine)
+    machine_status_chain.backfill_chains(engine)
     diagnostics.migrate_schema(engine)
     # Finalize joint-write markers left by a crashed previous process from
     # the committed evidence, before serving any request.
@@ -346,17 +349,20 @@ def list_machine_status_history(
     changed status — of the machine's own transition records, ordered by the
     actual UTC instant of ``created_at`` and then by id, so an exact-second
     record sorts before any fractional-second record of the same second. Each
-    item carries exactly ``{id, machine_id, from_status, to_status,
-    created_at}`` in this fixed field order, with ``created_at`` the UTC
-    commit-moment stamp ending in ``Z``. Records are returned exactly as
-    stored: they are never rewritten, recomputed, filtered out, or repaired,
-    and another machine's records can never enter the result. The query only
-    issues reads — it never creates, updates, deletes, repairs, or normalizes
-    status, history, or any other accountability record — and the body is
-    compact UTF-8 JSON terminated by a single newline, free of any
-    floating-point or non-finite value, byte-identical on repeat calls
-    against unchanged data, including data persisted across application
-    restarts.
+    item carries the five stored transition fields — ``{id, machine_id,
+    from_status, to_status, created_at}`` in this fixed field order, with
+    ``created_at`` the UTC commit-moment stamp ending in ``Z`` — followed by
+    the per-machine tamper-evident chain fields ``previous_status_event_id``
+    (``null`` on the machine's first record, otherwise the immediately
+    preceding record's id), ``content_hash``, and ``chain_hash``. Records are
+    returned exactly as stored: they are never rewritten, recomputed,
+    filtered out, or repaired, and another machine's records can never enter
+    the result. The query only issues reads — it never creates, updates,
+    deletes, repairs, or normalizes status, history, or any other
+    accountability record — and the body is compact UTF-8 JSON terminated by
+    a single newline, free of any floating-point or non-finite value,
+    byte-identical on repeat calls against unchanged data, including data
+    persisted across application restarts.
     """
     machine = session.get(Machine, machine_id)
     if machine is None:
@@ -375,6 +381,9 @@ def list_machine_status_history(
             "from_status": record.from_status,
             "to_status": record.to_status,
             "created_at": record.created_at,
+            "previous_status_event_id": record.previous_status_event_id,
+            "content_hash": record.content_hash,
+            "chain_hash": record.chain_hash,
         }
         for record in records
     ]
@@ -390,8 +399,100 @@ def list_machine_status_history(
     return Response(content=body, media_type="application/json")
 
 
-# --- read-only stable incremental machine status-history query --------------
+# --- read-only machine status-history tamper-evident chain verification -----
 
+
+def validate_machine_status_history_integrity_params(request: Request) -> None:
+    """Validate the machine status-history integrity query before any lookup.
+
+    The integrity sub-entry is keyed on the path machine alone; it accepts no
+    business filter parameters and no request body. Any parameter name
+    (including a repeated one) or a carried body is a 422 ``invalid_query``.
+    Every check runs before the machine is looked up and issues no database
+    access, so an extra parameter or a body against a non-existent machine
+    still reports 422 rather than 404 and no status history is read.
+    """
+    # A present non-zero Content-Length, or a chunked request without one,
+    # means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/status-history/integrity")
+def check_machine_status_history_integrity(
+    machine_id: str,
+    _: Annotated[
+        None, Depends(validate_machine_status_history_integrity_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only verification of one machine's status-history hash chain.
+
+    The caller submits only the path machine id — no query parameters and no
+    request body; either is a 422 ``invalid_query`` reported during
+    validation before the machine is looked up and before any status history
+    is read (the same malformed request against a non-existent machine is
+    still 422). A missing machine is a 404 ``not_found`` carrying no
+    conclusion. Only ``GET`` is routed; ``HEAD`` and every other method
+    return 405 without reading history, computing a chain conclusion, or
+    writing anything. A real failure while reading the machine or the
+    history returns 500 ``internal_error`` with no conclusion and no partial
+    result.
+
+    On success the response carries exactly ``{valid, checked_count,
+    broken_status_event_id}`` in this fixed field order. An empty machine or
+    a complete chain reports ``true``, the machine's total history count
+    (``0`` when empty), and ``null``; otherwise ``false``, the total count,
+    and the first record — in (created-at instant, id) order, an
+    exact-second record before any fractional-second record of the same
+    second — whose creation moment, identifier, ownership, status edge
+    (an edge outside ``active``/``suspended``, a self loop, or one that does
+    not continue the carried state), previous-record link, content hash, or
+    chain hash does not verify. The first record's predecessor must be
+    empty; every later record's must be the immediately preceding record of
+    the same machine, never a cross-machine or skipped link. Only the path
+    machine's records are examined, so another machine's damaged records
+    never change this conclusion, and the query is strictly read-only: a
+    damaged record is neither repaired nor recomputed, repeated calls
+    against unchanged data return byte-identical compact UTF-8 JSON
+    terminated by a single newline with no floating-point or non-finite
+    value, and conclusions read records persisted across application
+    restarts.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        valid, checked_count, broken_status_event_id = (
+            machine_status_chain.verify_machine_chain(session, machine_id)
+        )
+    except SQLAlchemyError:
+        # Never emit a partial conclusion when the records cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "valid": valid,
+        "checked_count": checked_count,
+        "broken_status_event_id": broken_status_event_id,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
+# --- read-only stable incremental machine status-history query --------------
 
 class MachineStatusHistoryChangesParams(BaseModel):
     limit: int
@@ -514,11 +615,14 @@ def _machine_status_history_id_key(value: object) -> tuple[int, str]:
 def machine_status_history_change_to_dict(
     record: MachineStatusEvent,
 ) -> dict[str, object]:
-    """One stored machine status-history record, exactly as the list view.
+    """One stored machine status-history record for the audit queries.
 
-    Carries exactly ``{id, machine_id, from_status, to_status,
-    created_at}`` in this fixed field order, with no normalization or
-    repair of the stored values.
+    Carries exactly the five transition fields ``{id, machine_id,
+    from_status, to_status, created_at}`` in this fixed field order, with
+    no normalization or repair of the stored values. The incremental query
+    and the compliance window export keep this shape; the per-machine chain
+    fields are carried only by the status-history list and verified by its
+    integrity sub-entry.
     """
     return {
         "id": record.id,
@@ -563,14 +667,16 @@ def get_machine_status_history_changes(
     next_cursor, has_more}`` in this fixed key order; the path machine id and
     the page size are echoed back. ``records`` contains only status-history
     records owned by the path machine, and each item carries exactly the
-    complete fields of the status-history list view — ``{id, machine_id,
-    from_status, to_status, created_at}`` exactly as stored — with no
-    normalization or repair. Items are ordered by the actual UTC instant of
-    ``created_at`` and then by record id ascending, so an exact-second
-    record sorts before any fractional-second record of the same second; a
-    stored ``created_at`` that no longer parses is kept verbatim and
-    deterministically sorts after every parseable instant instead of
-    crashing, being deleted, or being rewritten.
+    five stored transition fields ``{id, machine_id, from_status,
+    to_status, created_at}`` exactly as stored (the tamper-evident chain
+    fields are carried by the status-history list and its integrity
+    sub-entry, not this audit query) with no normalization or repair.
+    Items are ordered by the actual UTC instant of ``created_at`` and then
+    by record id ascending, so an exact-second record sorts before any
+    fractional-second record of the same second; a stored ``created_at``
+    that no longer parses is kept verbatim and deterministically sorts
+    after every parseable instant instead of crashing, being deleted, or
+    being rewritten.
 
     The cursor is the exclusive position ``<created_at original
     text>|<status event id>`` pointing just after a page's last record, so a
@@ -770,9 +876,11 @@ def export_machine_status_history_compliance(
     window, a machine with no history, or an empty database). The array
     holds only the path machine's existing status-transition records whose
     own ``created_at`` falls in the closed UTC interval, each carrying
-    exactly the complete fields of the status-history list view — ``{id,
-    machine_id, from_status, to_status, created_at}`` exactly as stored —
-    with no filtering, repair, or normalization of damaged field values.
+    exactly the five stored transition fields ``{id, machine_id,
+    from_status, to_status, created_at}`` exactly as stored (the
+    tamper-evident chain fields are carried by the status-history list and
+    its integrity sub-entry, not this export), with no filtering, repair,
+    or normalization of damaged field values.
     Items are ordered by the actual UTC instant of ``created_at`` and then
     by record id ascending, so an exact-second record sorts before any
     fractional-second record of the same second; a stored ``created_at``

@@ -535,7 +535,11 @@ def test_changes_records_match_the_status_history_list(client, machine_id):
     listed = client.get(f"/machines/{machine_id}/status-history").json()
 
     records, _ = fetch_all_pages(client, machine_id, limit=1)
-    assert records == listed
+    # The changes query keeps the five stored transition fields; the list
+    # additionally carries the per-machine tamper-evident chain fields.
+    assert [
+        {key: record[key] for key in RECORD_KEYS} for record in records
+    ] == [{key: record[key] for key in RECORD_KEYS} for record in listed]
 
 
 # --------------------------------------------------------------------------- #
@@ -751,8 +755,15 @@ def test_changes_persist_across_restart(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# The existing status-history list and status-change semantics are untouched
+# The existing status-change and status-history semantics are preserved
 # --------------------------------------------------------------------------- #
+
+
+LIST_KEYS = RECORD_KEYS + [
+    "previous_status_event_id",
+    "content_hash",
+    "chain_hash",
+]
 
 
 def test_status_history_list_is_unchanged(client, machine_id):
@@ -762,7 +773,13 @@ def test_status_history_list_is_unchanged(client, machine_id):
     listed = client.get(f"/machines/{machine_id}/status-history")
     assert listed.status_code == 200
     records = listed.json()
-    assert [list(record.keys()) for record in records] == [RECORD_KEYS, RECORD_KEYS]
+    # The list keeps the five stored transition fields first, then the
+    # tamper-evident chain fields.
+    assert [list(record.keys()) for record in records] == [LIST_KEYS, LIST_KEYS]
+    assert [record["previous_status_event_id"] for record in records] == [
+        None,
+        records[0]["id"],
+    ]
     # The list still rejects every query parameter.
     assert (
         client.get(f"/machines/{machine_id}/status-history?limit=1").status_code

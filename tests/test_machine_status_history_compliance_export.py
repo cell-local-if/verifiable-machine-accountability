@@ -504,7 +504,11 @@ def test_export_items_have_exactly_the_list_endpoint_fields(client):
 
     assert response.status_code == 200
     exported = response.json()["status_history"]
-    assert exported == listed
+    # The window export keeps the five stored transition fields exactly as
+    # the list stores them; the chain fields are carried by the list itself.
+    assert exported == [
+        {key: record[key] for key in RECORD_KEYS} for record in listed
+    ]
     assert list(exported[0].keys()) == RECORD_KEYS
 
 
