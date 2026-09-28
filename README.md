@@ -391,6 +391,75 @@ contains no floating-point or non-finite values. The query only reads: it
 never creates, updates, deletes, repairs, or normalizes status, history, or
 any other record, and another machine's records never enter the result.
 
+### Read-only stable machine status-history incremental query
+
+`GET /machines/{machine_id}/status-history/changes` is the stable,
+keyset-paginated incremental view over one machine's status transition
+history — the `changes` sub-entry under the machine status history path.
+It is a separate, strictly read-only audit entry point: it changes neither
+the status-history list, status changes, any other machine interface,
+diagnostics, nor the health check, and it adds no on-disk format (cursors
+are stateless), so old and empty databases work unchanged. The caller
+submits only the path machine id, a page size, and an optional cursor — no
+business filter parameters and no request body. Validation completes
+before the machine or any status-history record is read:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, fractional (e.g. `1.0`), boolean (`true`/`false`), non-decimal,
+  or out-of-range value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque string shaped
+  `<created_at original text>|<record id>` and returned by a previous page.
+  An empty, non-string, or shape-mismatching value returns
+  `422 {"error":{"code":"invalid_cursor"}}`; the timestamp segment is
+  original stored text rather than re-parsed (the split is on the last
+  separator), because a record whose stored `created_at` no longer parses
+  stays pageable. A well-shaped cursor whose `(created_at, id)` position
+  cannot be located among the path machine's stored records (including a
+  position naming another machine's record) is rejected as
+  `422 {"error":{"code":"invalid_cursor"}}` after the records are read,
+  with no partial page, so a parameter error always takes priority over
+  the machine lookup.
+- Any other query parameter, a repeated `limit`/`cursor`, or a request
+  carrying a body returns `422 {"error":{"code":"invalid_query"}}` in the
+  validation phase; every validation error is answered without reading any
+  machine or status-history record.
+- The path accepts `GET` only; `HEAD` and every other method return `405`
+  without reading history, computing a page, or writing anything.
+- A valid query against a machine that does not exist returns
+  `404 {"error":{"code":"not_found"}}` carrying no records.
+- A failure that prevents reading the records or the machine returns
+  `500 {"error":{"code":"internal_error"}}` with no partial page.
+
+The success object carries exactly `{machine_id, limit, records,
+next_cursor, has_more}` in this fixed field order; the path machine id and
+page size are echoed verbatim, and an empty database or a machine with no
+history returns the complete empty page. `records` contains only
+status-history records owned by the path machine, each carrying exactly
+the complete fields of the status-history list view — `{id, machine_id,
+from_status, to_status, created_at}` emitted exactly as stored — with no
+filtering, repair, or normalization. Records are ordered by the actual
+UTC instant of `created_at` and then by record id ascending, so an
+exact-second record sorts before any fractional-second record of the same
+second. A stored `created_at` that no longer parses never crashes the
+query: the record is kept with its stored value and deterministically
+sorts after every parseable instant rather than being deleted.
+
+The cursor is an exclusive position over `(created_at, record id)`: it
+points just after a page's last record, so the page returns only records
+strictly after it. Repeating the same cursor against unchanged data
+returns the byte-identical next page, and a newly inserted record whose
+sort position is earlier never makes an already-returned record resurface
+while the current page still follows the stable order. `next_cursor` is
+the position after the page's last record when at least one record
+follows and `null` otherwise; `has_more` is `true` exactly then and
+`false` on both an empty and a last page. The query is strictly
+read-only and machine-isolated — another machine's records never enter
+the result — cursors are stateless, damaged records are kept exactly as
+stored, and the body is compact UTF-8 JSON terminated by a single
+newline, free of floating-point, `-0.0`, or non-finite values,
+byte-identical on repeat calls against unchanged data, and readable for
+records persisted across application restarts.
+
 ## Read-only joint-write transaction diagnostics
 
 `GET /machines/{machine_id}/diag` exposes read-only observability over the
