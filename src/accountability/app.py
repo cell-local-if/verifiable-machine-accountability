@@ -46,6 +46,7 @@ from . import (
     status_event_chain,
 )
 from .db import (
+    AuthorizationDecisionBasis,
     AuthorizationDecisionCausalLink,
     AuthorizationDecisionEvent,
     AuthorizationDecisionEvidence,
@@ -7745,6 +7746,285 @@ def get_authorization_decision_event_decision_basis_integrity(
     body = (
         json.dumps(
             conclusion, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
+# --- read-only stable incremental query over one machine's basis snapshots ---
+
+
+class DecisionBasisChangesParams(BaseModel):
+    limit: int
+    cursor: str | None = None
+
+
+def validate_decision_basis_changes_params(
+    request: Request,
+) -> DecisionBasisChangesParams:
+    """Validate the decision-basis ``changes`` query string before any read.
+
+    Exactly two parameters are accepted: the required ``limit`` and the
+    optional ``cursor``; no business filter parameters and no request body.
+    ``limit`` must be a non-boolean integer in 1..100; a missing, blank,
+    fractional, boolean, non-decimal, or out-of-range value is a 422
+    ``bad_limit``. ``cursor``, when present, must be a non-empty string
+    shaped ``<created_at original text>|<event id>``; an empty, non-string,
+    or shape-mismatching value is a 422 ``invalid_cursor``. The timestamp
+    segment is accepted verbatim as stored text rather than parsed here:
+    snapshots whose stored ``created_at`` no longer parses sort last and
+    remain pageable, so a cursor legitimately built from such a snapshot
+    must pass shape validation; locating the named snapshot happens in the
+    handler while the path machine's snapshots are read, and a position
+    that names no stored snapshot of the path machine is a 422
+    ``invalid_cursor`` there. Any other parameter name, a repeated
+    ``limit`` or ``cursor``, or a request that carries a body is a 422
+    ``invalid_query`` — a repeated name is an unknown-shape query rather
+    than a bad single value, so it is reported as ``invalid_query`` even
+    when the repeated parameter is ``limit``/``cursor``. Every check in
+    this dependency runs before the machine or any snapshot is read.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or snapshot is read. A present non-zero Content-Length, or a
+    # chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``limit=1&limit=2`` (and a repeated ``cursor``) as ``invalid_query``
+    # rather than silently taking one occurrence, regardless of which name
+    # was repeated.
+    if len(request.query_params.getlist("limit")) > 1:
+        raise QueryError("invalid_query")
+    if len(request.query_params.getlist("cursor")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_limit = request.query_params.get("limit")
+    if raw_limit is None or not _INTEGER_QUERY_RE.fullmatch(raw_limit):
+        raise QueryError("bad_limit")
+    limit = int(raw_limit)
+    if not 1 <= limit <= 100:
+        raise QueryError("bad_limit")
+
+    cursor = request.query_params.get("cursor")
+    if cursor is not None:
+        # Query parameters arrive as strings; an empty value carries no
+        # separator and fails the shape check. Split on the LAST separator
+        # because the position is ``<created_at original text>|<event id>``
+        # and the timestamp segment is original stored text that may itself
+        # contain ``|`` (a snapshot with an unparseable created_at stays
+        # pageable), while the event-id segment never does. Both segments
+        # only have to be non-empty here; the pair is resolved against the
+        # path machine's stored snapshot rows in the handler, so a position
+        # naming no snapshot is rejected there as a non-locatable cursor.
+        parts = cursor.rsplit("|", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise QueryError("invalid_cursor")
+
+    return DecisionBasisChangesParams(limit=limit, cursor=cursor)
+
+
+def _encode_decision_basis_cursor(created_at: str, event_id: str) -> str:
+    return f"{created_at}|{event_id}"
+
+
+# A stored snapshot ``created_at`` that no longer parses is ordered after
+# every parseable record (the same tolerant convention the other changes
+# queries use), so a damaged stamp sorts deterministically last instead of
+# crashing this read-only query; ties break by event id.
+_DECISION_BASIS_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _decision_basis_created_instant(value: object) -> datetime:
+    """Parse a stored basis snapshot ``created_at`` to its UTC instant.
+
+    Legitimately captured values always satisfy the RFC 3339 ``Z`` contract;
+    a damaged value sorts after every parseable record instead of raising,
+    so the read-only query neither crashes nor repairs the stored text.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _DECISION_BASIS_FAR_FUTURE
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/decision-basis/changes"
+)
+def get_authorization_decision_basis_changes(
+    machine_id: str,
+    params: Annotated[
+        DecisionBasisChangesParams,
+        Depends(validate_decision_basis_changes_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only stable incremental, keyset-paginated query of one machine's
+    immutable authorization decision-basis snapshots.
+
+    The real entry point is the ``changes`` sub-entry under the machine
+    authorization decision basis path; only ``GET`` is routed, so non-GET
+    methods (including ``HEAD``) return ``405`` without reading a snapshot,
+    computing a page, or writing anything. The caller submits only the path
+    machine id, a required ``limit`` (a non-boolean integer from 1 to 100),
+    and an optional opaque ``cursor`` returned by a previous page — no
+    business filter parameters and no request body. Query validation
+    (``invalid_query`` for unknown parameters, repeated names, or a carried
+    body; ``bad_limit`` for a missing, blank, fractional, boolean, or
+    out-of-range ``limit``; ``invalid_cursor`` for an empty, non-string, or
+    shape-mismatching ``cursor``) completes before the machine or any
+    snapshot is read; a well-shaped cursor that names no stored
+    ``(created_at, event_id)`` snapshot position of the path machine is an
+    ``invalid_cursor`` reported while the snapshots are read, so a parameter
+    error always takes priority over the machine lookup. A valid query
+    against a missing machine is a 404 ``not_found`` carrying no records.
+
+    On success the response carries exactly ``{machine_id, limit, records,
+    next_cursor, has_more}`` in this fixed key order; the path machine id
+    and the page size are echoed verbatim. ``records`` contains exactly one
+    item per stored snapshot owned by the path machine; an event committed
+    before the basis feature that has no snapshot row is not fabricated,
+    not skipped into the cursor, and never appears. Each item is exactly
+    ``{group, record}`` with the fixed tag ``"decision_basis"`` and the
+    five groups the single-snapshot query exposes — ``event_summary``,
+    ``status_basis``, ``declaration_basis``, ``policy_candidates``, and
+    ``decision`` — emitted exactly as captured, with no recomputation or
+    repair. Items are ordered by the snapshot creation event's actual UTC
+    instant of ``created_at`` and then by event id ascending, so an
+    exact-second record sorts before any fractional-second record of the
+    same second; a stored ``created_at`` that no longer parses is kept
+    verbatim and deterministically sorts after every parseable instant
+    instead of crashing or being rewritten.
+
+    The cursor is the exclusive position ``<created_at original
+    text>|<event id>`` pointing just after a page's last snapshot, so a
+    page returns only snapshots strictly after it: repeating the same
+    cursor against unchanged data returns the byte-identical next page,
+    and a newly captured snapshot whose sort position is earlier never
+    makes an already-returned record resurface while the current page
+    still follows the stable order. ``next_cursor`` carries the position
+    after the page's last snapshot only when one follows (``null`` on an
+    empty or last page), and ``has_more`` is true exactly in that case —
+    false on an empty or last page, including an empty database. The
+    endpoint adds no schema (cursors are stateless) and is strictly
+    read-only and machine isolated: it never creates, updates, deletes,
+    repairs, recomputes, or normalizes an event or snapshot, leaves event
+    creation, the single-snapshot query, the hash chain, privacy exports,
+    diagnostics, and health checks unchanged, and never returns another
+    machine's snapshots. The body is compact UTF-8 JSON terminated by a
+    single newline, free of floating-point, ``-0.0``, or non-finite
+    values, byte-identical on repeat calls against unchanged data, and
+    readable across application restarts. A failure while reading the
+    snapshots or the machine returns 500 ``internal_error`` with no
+    partial page.
+    """
+    # Any failure while *reading* — the snapshot rows, the ordering over
+    # them, decoding the captured document, the cursor position, or the
+    # machine lookup — is an internal read-layer fault: answer 500
+    # internal_error with no partial page. Damaged stored stamp text is not
+    # a read failure — rows read successfully are ordered and emitted with
+    # the stamp verbatim, an unparseable one sorting last — so the tolerant
+    # key function and cursor matching stay inside the guard but only a
+    # true read/decode/order fault reaches the except branch.
+    try:
+        rows = session.scalars(
+            select(AuthorizationDecisionBasis).where(
+                AuthorizationDecisionBasis.machine_id == machine_id
+            )
+        ).all()
+        ordered = sorted(
+            rows,
+            key=lambda row: (
+                _decision_basis_created_instant(row.created_at),
+                row.event_id,
+            ),
+        )
+
+        start = 0
+        if params.cursor is not None:
+            cursor_created_at, cursor_id = params.cursor.rsplit("|", 1)
+            # Exclusive keyset position. A cursor this endpoint issued always
+            # names a stored snapshot, so locate it by its exact stored
+            # ``(created_at text, event id)`` pair; a well-shaped cursor that
+            # no snapshot row of the path machine matches (an event without a
+            # snapshot, a deleted snapshot, a foreign position, drifted text)
+            # cannot be positioned and is rejected as a non-locatable cursor
+            # — a parameter error, reported before the machine lookup below.
+            # Matching on stored text keeps the unparseable-stamp tail
+            # pageable too.
+            positions = [
+                index
+                for index, row in enumerate(ordered)
+                if row.created_at == cursor_created_at and row.event_id == cursor_id
+            ]
+            if not positions:
+                return error_response(422, "invalid_cursor")
+            start = positions[0] + 1
+
+        machine = session.get(Machine, machine_id)
+    except Exception:
+        return error_response(500, "internal_error")
+
+    if machine is None:
+        return error_response(404, "not_found")
+
+    remaining = ordered[start:]
+    page = remaining[: params.limit]
+
+    # Each record carries the five groups the single-snapshot query exposes.
+    # The captured document is decoded once here from its stored compact JSON
+    # (the same strict parse the consistency audit uses, rejecting non-finite
+    # constants) and the parsed value is re-emitted exactly as captured, in
+    # its captured key order, with no recomputation, repair, or shape
+    # normalization — so a JSON-valid but tampered document is still emitted
+    # verbatim and never skipped or fabricated. Page membership, ordering, and
+    # the cursor are decided from the rows above, not from document content.
+    # Stored text that is not JSON at all cannot be rendered as the captured
+    # object without fabricating or altering it: that is a read-layer fault
+    # answered 500 with no partial page, never a repaired record.
+    try:
+        records = [
+            {
+                "group": "decision_basis",
+                "record": decision_basis_integrity.json_loads(row.document),
+            }
+            for row in page
+        ]
+    except (ValueError, TypeError):
+        return error_response(500, "internal_error")
+
+    has_more = len(remaining) > len(page)
+    next_cursor = (
+        _encode_decision_basis_cursor(page[-1].created_at, page[-1].event_id)
+        if page and has_more
+        else None
+    )
+
+    payload = {
+        "machine_id": machine_id,
+        "limit": params.limit,
+        "records": records,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
         )
         + "\n"
     )

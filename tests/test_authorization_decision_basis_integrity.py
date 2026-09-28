@@ -503,7 +503,7 @@ def _assert_broken(response, event_id, reason):
         "123",
     ],
 )
-def test_unparseable_or_non_object_document_is_corrupt(client, raw):
+def test_unparseable_or_non_object_document_is_malformed_document(client, raw):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -511,10 +511,11 @@ def test_unparseable_or_non_object_document_is_corrupt(client, raw):
 
     tamper_snapshot(client, event["id"], None, raw=raw)
     _assert_broken(audit(client, machine_id, event["id"]), event["id"],
-                   "corrupt_document")
+                   "malformed_document",
+    )
 
 
-def test_missing_top_level_group_is_malformed_structure(client):
+def test_missing_top_level_group_is_malformed_document(client):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -526,11 +527,11 @@ def test_missing_top_level_group_is_malformed_structure(client):
     tamper_snapshot(client, event["id"], mutate)
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "malformed_structure",
+        "malformed_document",
     )
 
 
-def test_extra_or_reordered_top_level_group_is_malformed_structure(client):
+def test_extra_or_reordered_top_level_group_is_malformed_document(client):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -542,7 +543,7 @@ def test_extra_or_reordered_top_level_group_is_malformed_structure(client):
     tamper_snapshot(client, event["id"], add_extra)
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "malformed_structure",
+        "malformed_document",
     )
 
     second = record_event(client, machine_id).json()
@@ -562,7 +563,7 @@ def test_extra_or_reordered_top_level_group_is_malformed_structure(client):
     )
     _assert_broken(
         audit(client, machine_id, second["id"]), second["id"],
-        "malformed_structure",
+        "malformed_document",
     )
 
 
@@ -572,7 +573,7 @@ def _reorder(doc, keys):
     doc.update(reordered)
 
 
-def test_wrong_summary_field_type_is_malformed_event_summary(client):
+def test_wrong_summary_field_type_is_malformed_document(client):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -585,11 +586,11 @@ def test_wrong_summary_field_type_is_malformed_event_summary(client):
     )
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "malformed_event_summary",
+        "malformed_document",
     )
 
 
-def test_wrong_status_field_type_is_malformed_status_basis(client):
+def test_wrong_status_field_type_is_malformed_document(client):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -602,11 +603,11 @@ def test_wrong_status_field_type_is_malformed_status_basis(client):
     )
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "malformed_status_basis",
+        "malformed_document",
     )
 
 
-def test_wrong_declaration_shape_is_malformed_declaration_basis(client):
+def test_wrong_declaration_shape_is_malformed_document(client):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -619,7 +620,7 @@ def test_wrong_declaration_shape_is_malformed_declaration_basis(client):
     )
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "malformed_declaration_basis",
+        "malformed_document",
     )
 
     # A second, intact snapshot for the wrong member type.
@@ -631,11 +632,11 @@ def test_wrong_declaration_shape_is_malformed_declaration_basis(client):
     )
     _assert_broken(
         audit(client, machine_id, second["id"]), second["id"],
-        "malformed_declaration_basis",
+        "malformed_document",
     )
 
 
-def test_wrong_candidate_shape_is_malformed_policy_candidates(client):
+def test_wrong_candidate_shape_is_malformed_document(client):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -652,11 +653,11 @@ def test_wrong_candidate_shape_is_malformed_policy_candidates(client):
     )
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "malformed_policy_candidates",
+        "malformed_document",
     )
 
 
-def test_wrong_decision_shape_is_malformed_decision(client):
+def test_wrong_decision_shape_is_malformed_document(client):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -667,7 +668,7 @@ def test_wrong_decision_shape_is_malformed_decision(client):
     )
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "malformed_decision",
+        "malformed_document",
     )
 
 
@@ -849,7 +850,7 @@ def test_wrong_match_flag_is_declaration_match_mismatch(client):
     )
 
 
-def test_anomalous_declaration_order_is_declaration_order(client):
+def test_anomalous_declaration_order_is_malformed_document(client):
     machine_id = create_machine(client)
     declare(client, machine_id, resource_pattern="res/a*")
     declare(client, machine_id, resource_pattern="res/b*")
@@ -866,7 +867,7 @@ def test_anomalous_declaration_order_is_declaration_order(client):
     tamper_snapshot(client, event["id"], mutate)
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "declaration_order",
+        "malformed_document",
     )
 
 
@@ -909,7 +910,7 @@ def test_other_action_candidate_is_policy_candidate_mismatch(client):
     )
 
 
-def test_anomalous_candidate_order_is_candidate_order(client):
+def test_anomalous_candidate_order_is_malformed_document(client):
     machine_id = create_machine(client)
     declare(client, machine_id, resource_pattern="res/*")
     create_rule(client, resource_pattern="res/*", effect="allow", priority=0)
@@ -922,7 +923,7 @@ def test_anomalous_candidate_order_is_candidate_order(client):
     tamper_snapshot(client, event["id"], mutate)
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "candidate_order",
+        "malformed_document",
     )
 
 
@@ -960,7 +961,7 @@ def test_wrong_conflict_group_is_policy_conflict_mismatch(client):
     )
 
 
-def test_decision_that_disagrees_with_event_is_decision_mismatch(client):
+def test_decision_that_disagrees_with_event_is_malformed_decision(client):
     machine_id = create_machine(client)
     declare(client, machine_id)
     create_rule(client)
@@ -973,7 +974,7 @@ def test_decision_that_disagrees_with_event_is_decision_mismatch(client):
     tamper_snapshot(client, event["id"], mutate)
     _assert_broken(
         audit(client, machine_id, event["id"]), event["id"],
-        "decision_mismatch",
+        "malformed_decision",
     )
 
 

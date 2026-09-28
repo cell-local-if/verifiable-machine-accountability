@@ -211,15 +211,113 @@ event committed, so later declarations or rules never retroactively break a
 faithful historical snapshot; the audit never recomputes or repairs a record
 and never fabricates a missing basis. An event without a snapshot row
 answers `valid false`, `checked_count 0`, `broken_basis_id` equal to the
-event id, and `reason "snapshot_not_found"`. A damaged, anomalously ordered,
-or self-contradictory snapshot answers `valid false`, `checked_count 1`, the
-event id, and the stable first-anomaly category. The conclusion is compact
+event id, and `reason "snapshot_not_found"`. A damaged or contradictory
+snapshot answers `valid false`, `checked_count 1`, the event id, and the
+stable first-anomaly category, using exactly these buckets for damaged
+content:
+
+- `malformed_document` — the document does not parse (invalid JSON or a
+  non-finite constant), does not parse to an object, or has a document-level
+  shape anomaly: a missing, extra, or reordered top-level group, a wrong
+  field type on any group (the event summary, status basis, declaration
+  basis, policy candidates, or decision), an anomalous collection shape, or
+  an anomalous set/record ordering. Every such structural or ordering
+  anomaly collapses to this one stable category instead of naming the group;
+- `malformed_decision` — the structure is complete but the final decision
+  field is illegal or contradicts the event's committed result (including a
+  decision the rebuilt basis cannot support).
+
+Content-level correspondence checks that are neither structural nor the
+final decision keep their own mismatch category in examination order:
+`event_summary_mismatch`, the status triplet (`status_history_invalid`,
+`status_state_mismatch`, `read_flags_mismatch`, checked history then state
+then read flags), `status_basis_mismatch`,
+`declaration_basis_mismatch`/`declaration_match_mismatch`, and
+`policy_candidate_mismatch`/`policy_winner_mismatch`/
+`policy_conflict_mismatch`. The conclusion is compact
 UTF-8 JSON in fixed field order terminated by one newline, with no
 floating-point or non-finite value, so identical stored data audits
 byte-for-byte identically, the result persists across restarts, and machine
 isolation is enforced. Event creation, the event list, the hash chain,
 evidence chain, incident responsibility, privacy exports, diagnostics, and
 health-check semantics are unchanged.
+
+### Incremental decision-basis snapshot changes query
+
+`GET /machines/{machine_id}/authorization-decision-events/decision-basis/changes`
+is the stable, keyset-paginated incremental view over one machine's
+immutable decision-basis snapshots — the `changes` sub-entry under the
+decision-basis path (a sibling of the single-snapshot query and its
+integrity audit). It is a separate, strictly read-only audit entry point:
+it changes neither event creation, the single-snapshot query, the
+consistency audit, the hash chain, the privacy exports, the compliance
+exports, diagnostics, the authorization evaluation, nor the health check,
+and it adds no on-disk format (cursors are stateless), so old and empty
+databases work unchanged. The caller submits only the path machine id, a
+page size, and an optional cursor — no business filter parameters and no
+request body. Validation completes before the machine or any snapshot is
+read:
+
+- `limit` — required, a non-boolean integer from `1` to `100`. A missing,
+  blank, fractional (e.g. `1.0`), boolean (`true`/`false`), non-decimal, or
+  out-of-range value returns `422 {"error":{"code":"bad_limit"}}`.
+- `cursor` — optional, an opaque string shaped
+  `<created_at original text>|<event id>` and returned by a previous page.
+  An empty value, a missing separator, or an empty segment returns
+  `422 {"error":{"code":"invalid_cursor"}}`; the timestamp segment is
+  original stored text rather than re-parsed (the split is on the last
+  separator), because a snapshot whose stored `created_at` no longer parses
+  stays pageable. A well-shaped cursor whose `(created_at, event id)`
+  position cannot be located among the path machine's stored snapshots —
+  naming another machine's snapshot, a deleted snapshot, or an event that
+  has no snapshot — is rejected as `422 {"error":{"code":"invalid_cursor"}}`
+  after the snapshots are read, with no partial page, so a parameter error
+  always takes priority over the machine lookup.
+- Any other query parameter, a repeated `limit`/`cursor`, or a request
+  carrying a body returns `422 {"error":{"code":"invalid_query"}}` in the
+  validation phase; every validation error is answered without reading any
+  machine or snapshot.
+- The path accepts `GET` only; `HEAD` and every other method return `405`
+  without reading a snapshot, computing a page, or writing anything.
+- A valid query against a machine that does not exist returns
+  `404 {"error":{"code":"not_found"}}` carrying no records.
+- A failure that prevents reading the snapshots or the machine, or a stored
+  snapshot document that is no longer decodable JSON, returns
+  `500 {"error":{"code":"internal_error"}}` with no partial page — the row
+  is neither repaired nor skipped.
+
+The success object carries exactly `{machine_id, limit, records,
+next_cursor, has_more}` in this fixed field order; the path machine id and
+page size are echoed verbatim, and an empty database or a machine with no
+snapshots returns the complete empty page. Only events that already have a
+snapshot enter the page: an event committed before the basis feature (or
+whose snapshot row is absent) is not fabricated, is not returned, and never
+enters a cursor. Each record is exactly `{group, record}`: the fixed tag
+`"decision_basis"` and the same five groups the single-snapshot query
+exposes — `event_summary`, `status_basis`, `declaration_basis`,
+`policy_candidates`, and `decision` — emitted exactly as captured, with no
+recomputation, audit, repair, or shape normalization, so a JSON-valid but
+tampered document is still re-emitted verbatim. Records are ordered by the
+snapshot creation event's actual UTC instant of `created_at` and then by
+event id ascending, so an exact-second record sorts before any
+fractional-second record of the same second; a stored `created_at` that no
+longer parses never crashes the query — its original text is kept and it
+deterministically sorts after every parseable instant.
+
+The cursor is an exclusive position over `(created_at, event id)`: it
+points just after a page's last snapshot, so the page returns only
+snapshots strictly after it. Repeating the same cursor against unchanged
+data returns the byte-identical next page, and a newly captured snapshot
+whose sort position is earlier never makes an already-returned record
+resurface while the current page still follows the stable order.
+`next_cursor` is the position after the page's last snapshot when at least
+one follows and `null` otherwise; `has_more` is `true` exactly then and
+`false` on both an empty and a last page. The query is strictly read-only
+and machine-isolated — another machine's snapshots never enter the result
+— and the body is compact UTF-8 JSON terminated by a single newline, free
+of floating-point, `-0.0`, or non-finite values, byte-identical on repeat
+calls against unchanged data, and readable for snapshots persisted across
+application restarts.
 
 
 ## Machine suspension and reactivation
