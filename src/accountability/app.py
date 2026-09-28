@@ -666,6 +666,193 @@ def get_machine_status_history_changes(
     return Response(content=body, media_type="application/json")
 
 
+# --- read-only machine status-history compliance window export --------------
+
+
+class MachineStatusHistoryExportParams(BaseModel):
+    from_created_at: str
+    to_created_at: str
+
+
+def validate_machine_status_history_export_params(
+    request: Request,
+) -> MachineStatusHistoryExportParams:
+    """Validate the status-history compliance-export query before any lookup.
+
+    Exactly two parameters are accepted: the required ``from_created_at`` and
+    ``to_created_at``, both UTC RFC 3339 date-times ending in ``Z`` (fractional
+    seconds optional; offset forms, surrounding whitespace, and non-``Z``
+    suffixes are rejected), with the lower bound not later than the upper
+    bound (equal bounds allowed). Any other parameter name, a repeated
+    ``from_created_at``/``to_created_at``, or a request that carries a body
+    is a 422 ``invalid_query`` and takes priority; a missing, blank,
+    malformed, out-of-range, or inverted bound is a 422 ``bad_time``. Every
+    check here runs before the machine or any status event is read and issues
+    no database access, so a parameter error against a non-existent machine
+    still reports 422 rather than 404.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or status event is read. A present non-zero Content-Length, or
+    # a chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"from_created_at", "to_created_at"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``from_created_at=a&from_created_at=b`` rather than silently taking one
+    # occurrence, regardless of which bound was repeated.
+    if len(request.query_params.getlist("from_created_at")) > 1:
+        raise QueryError("invalid_query")
+    if len(request.query_params.getlist("to_created_at")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_from = request.query_params.get("from_created_at")
+    raw_to = request.query_params.get("to_created_at")
+
+    def _valid(value: str | None) -> bool:
+        if not value or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+            return False
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            return False
+        return True
+
+    if not _valid(raw_from) or not _valid(raw_to):
+        raise QueryError("bad_time")
+
+    if parse_utc_z_datetime(raw_from) > parse_utc_z_datetime(raw_to):
+        raise QueryError("bad_time")
+
+    return MachineStatusHistoryExportParams(
+        from_created_at=raw_from,  # type: ignore[arg-type]
+        to_created_at=raw_to,  # type: ignore[arg-type]
+    )
+
+
+@app.get("/machines/{machine_id}/status-history/compliance-export")
+def export_machine_status_history_compliance(
+    machine_id: str,
+    params: Annotated[
+        MachineStatusHistoryExportParams,
+        Depends(validate_machine_status_history_export_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only compliance export of one machine's status-history window.
+
+    The real entry point is the ``compliance-export`` sub-entry under the
+    machine status-history path; only ``GET`` is routed, so ``HEAD`` and
+    every other method return ``405`` without reading records, filtering,
+    computing a result, or writing anything. The caller submits only the
+    path machine id and the two required bounds
+    ``from_created_at``/``to_created_at`` — UTC RFC 3339 date-times ending in
+    ``Z`` (fractional seconds optional, equal bounds allowed). Query
+    validation (``invalid_query`` for an unknown parameter, a repeated bound,
+    or a carried request body; ``bad_time`` for a missing, blank, offset,
+    whitespace-padded, malformed, out-of-range, or inverted bound) completes
+    before the machine or any status event is read, so a parameter error
+    takes priority even against a missing machine; a valid query against a
+    missing machine is a 404 ``not_found`` carrying no records.
+
+    On success the response carries exactly ``{machine_id, from_created_at,
+    to_created_at, status_history}`` in this fixed key order; the path
+    machine id and the original bound text are echoed back, and
+    ``status_history`` is always present (an empty array for an empty
+    window, a machine with no history, or an empty database). The array
+    holds only the path machine's existing status-transition records whose
+    own ``created_at`` falls in the closed UTC interval, each carrying
+    exactly the complete fields of the status-history list view — ``{id,
+    machine_id, from_status, to_status, created_at}`` exactly as stored —
+    with no filtering, repair, or normalization of damaged field values.
+    Items are ordered by the actual UTC instant of ``created_at`` and then
+    by record id ascending, so an exact-second record sorts before any
+    fractional-second record of the same second; a stored ``created_at``
+    that no longer parses sorts deterministically after every parseable
+    instant and therefore never falls inside a finite window, while its
+    stored text is left untouched. Another machine's records never enter
+    the result. A real failure while reading the machine or the records
+    returns 500 ``internal_error`` with no partial records. The query is
+    strictly read-only and adds no persistence surface: repeated calls
+    against unchanged data are byte-identical, results survive restarts,
+    and old and empty databases serve directly. The body is compact UTF-8
+    JSON terminated by a single newline and contains no floating-point,
+    ``-0.0``, or non-finite value.
+    """
+    # Any failure while *reading* — the machine lookup, the status-event
+    # rows, or the ordering over them — is an internal read-layer fault:
+    # answer 500 internal_error with no partial records. Damaged stored
+    # values are not a read failure — rows read successfully are filtered
+    # and ordered with the tolerant instant key (an unparseable stamp sorts
+    # last and so stays outside every finite window) and emitted verbatim.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+
+        window_start = parse_utc_z_datetime(params.from_created_at)
+        window_end = parse_utc_z_datetime(params.to_created_at)
+
+        rows = machines.list_status_history(session, machine_id)
+
+        def _instant(record: MachineStatusEvent) -> datetime | None:
+            # Window membership is decided on parsed instants. A stored stamp
+            # that no longer parses has no instant, so it can never fall
+            # inside a finite window (it also sorts last); the record's
+            # stored text is still emitted by the unbounded surfaces
+            # untouched.
+            value = record.created_at
+            if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+                try:
+                    return parse_utc_z_datetime(value)
+                except ValueError:
+                    pass
+            return None
+
+        in_window = [
+            record
+            for record in rows
+            if (instant := _instant(record)) is not None
+            and window_start <= instant <= window_end
+        ]
+        ordered = sorted(
+            in_window,
+            key=lambda record: (
+                _machine_status_history_created_instant(record.created_at),
+                _machine_status_history_id_key(record.id),
+            ),
+        )
+    except Exception:
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": machine_id,
+        "from_created_at": params.from_created_at,
+        "to_created_at": params.to_created_at,
+        "status_history": [
+            machine_status_history_change_to_dict(record) for record in ordered
+        ],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 class KeyRotationEventOut(BaseModel):
     id: str
     machine_id: str

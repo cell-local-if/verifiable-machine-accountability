@@ -391,6 +391,44 @@ contains no floating-point or non-finite values. The query only reads: it
 never creates, updates, deletes, repairs, or normalizes status, history, or
 any other record, and another machine's records never enter the result.
 
+## Read-only machine status-history compliance export
+
+`GET /machines/{machine_id}/status-history/compliance-export` returns a
+deterministic, read-only slice of one machine's status transition history
+over a closed UTC time window. Only `GET` is routed (other methods,
+including `HEAD`, return `405` without reading records). Both query
+parameters are required and every check runs before the machine is looked
+up, so a parameter error against a non-existent machine is still `422`:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; offset forms such as `+00:00`, surrounding
+  whitespace, and out-of-range calendar/time values are rejected);
+  `from_created_at` must not be later than `to_created_at` (equal bounds are
+  allowed). A missing, blank, malformed, or inverted bound returns
+  `422 {"error":{"code":"bad_time"}}`.
+- An unknown parameter, a repeated `from_created_at`/`to_created_at`, or a
+  request body returns `422 {"error":{"code":"invalid_query"}}`.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}`; a real read failure returns
+`500 {"error":{"code":"internal_error"}}` with no partial records.
+
+The response is `{machine_id, from_created_at, to_created_at,
+status_history}` in this fixed key order; the machine id and the original
+bound text are echoed verbatim, and `status_history` is an empty array
+(never omitted) for an empty window, a machine with no history, or an empty
+database. The array contains only the path machine's existing transition
+records whose own `created_at` falls inside the closed interval, each with
+exactly `{id, machine_id, from_status, to_status, created_at}` as the list
+endpoint returns it, ordered by the actual UTC instant of `created_at` and
+then by record id — an exact-second record sorts before any
+fractional-second record of the same second. A stored `created_at` that no
+longer parses sorts after every parseable instant and therefore never
+enters a finite window; damaged field values inside in-window records are
+kept exactly as stored, never filtered, repaired, or normalized. The query
+adds no persistence surface, repeats byte-identically, reads across
+restarts, and never returns another machine's records.
+
 ## Read-only joint-write transaction diagnostics
 
 `GET /machines/{machine_id}/diag` exposes read-only observability over the
