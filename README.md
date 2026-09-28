@@ -494,6 +494,53 @@ in-window records are kept exactly as stored, never filtered, repaired, or
 normalized. The query adds no persistence surface, repeats byte-identically,
 reads across restarts, and never returns another machine's records.
 
+## Read-only machine behavior-declaration compliance export
+
+`GET /machines/{machine_id}/behavior-declarations/compliance-export` returns a
+deterministic, read-only slice of one machine's behavior declarations over a
+closed UTC creation-time window. It is a separate audit entry point under the
+machine behavior-declaration path: declaration creation, the declaration list,
+the declaration integrity audit, authorization evaluation, the event chains,
+diagnostics, and the health check are unchanged, this endpoint never
+participates in an evaluation and adds no way to write a declaration other than
+the creation entry, and it adds no on-disk format, so old and empty databases
+work unchanged. Only `GET` is routed (other methods, including `HEAD`, return
+`405` without reading or filtering declarations or writing anything). Both
+query parameters are required and every check runs before the machine is looked
+up, so a parameter error against a non-existent machine is still `422`:
+
+- `from_created_at`, `to_created_at` — UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; offset forms such as `+00:00`, surrounding
+  whitespace, and out-of-range calendar/time values are rejected);
+  `from_created_at` must not be later than `to_created_at` (equal bounds are
+  allowed). A missing, blank, malformed, or inverted bound returns
+  `422 {"error":{"code":"bad_time"}}`.
+- An unknown parameter, a repeated `from_created_at`/`to_created_at`, or a
+  request body returns `422 {"error":{"code":"invalid_query"}}`.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}`; a real read failure returns
+`500 {"error":{"code":"internal_error"}}` with no partial records.
+
+The response is `{machine_id, from_created_at, to_created_at,
+behavior_declarations}` in this fixed key order; the machine id and the
+original bound text are echoed verbatim, and `behavior_declarations` is an
+empty array (never omitted) for an empty window, a machine with no
+declarations, or an empty database. The array contains only the path machine's
+existing declarations whose own `created_at` falls inside the closed interval,
+each with the complete list-view visible fields `{id, machine_id, action_type,
+resource_pattern, enabled, created_at, updated_at}` exactly as stored — the
+export adds no chain field — ordered by the actual UTC instant of `created_at`
+and then by record id, so an exact-second record sorts before any
+fractional-second record of the same second. A stored `created_at` that no
+longer parses keeps its original text, deterministically sorts after every
+parseable instant, and therefore never enters a finite window; illegal,
+duplicated, missing, or otherwise damaged field values inside in-window records
+are kept exactly as stored, never filtered, repaired, or normalized, and a
+damaged association never drops the record. The query adds no persistence
+surface, repeats byte-identically against unchanged data, reads across
+restarts, and never returns another machine's declarations.
+
 ## Read-only joint-write transaction diagnostics
 
 `GET /machines/{machine_id}/diag` exposes read-only observability over the

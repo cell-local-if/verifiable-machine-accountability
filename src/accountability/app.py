@@ -1181,6 +1181,256 @@ def check_behavior_declaration_integrity(
     return Response(content=body, media_type="application/json")
 
 
+# --- read-only machine behavior-declaration compliance window export --------
+
+
+class BehaviorDeclarationComplianceExportParams(BaseModel):
+    from_created_at: str
+    to_created_at: str
+
+
+def validate_behavior_declaration_export_params(
+    request: Request,
+) -> BehaviorDeclarationComplianceExportParams:
+    """Validate the behavior-declaration compliance-export query pre-lookup.
+
+    Exactly two parameters are accepted: the required ``from_created_at`` and
+    ``to_created_at``, both UTC RFC 3339 date-times ending in ``Z`` (fractional
+    seconds optional; offset forms, surrounding whitespace, and non-``Z``
+    suffixes are rejected), with the lower bound not later than the upper
+    bound (equal bounds allowed). Any other parameter name, a repeated
+    ``from_created_at``/``to_created_at``, or a request that carries a body
+    is a 422 ``invalid_query`` and takes priority; a missing, blank,
+    malformed, out-of-range, or inverted bound is a 422 ``bad_time``. Every
+    check here runs before the machine or any behavior declaration is read
+    and issues no database access, so a parameter error against a
+    non-existent machine still reports 422 rather than 404.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or declaration is read. A present non-zero Content-Length, or
+    # a chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"from_created_at", "to_created_at"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``from_created_at=a&from_created_at=b`` rather than silently taking one
+    # occurrence, regardless of which bound was repeated.
+    if len(request.query_params.getlist("from_created_at")) > 1:
+        raise QueryError("invalid_query")
+    if len(request.query_params.getlist("to_created_at")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_from = request.query_params.get("from_created_at")
+    raw_to = request.query_params.get("to_created_at")
+
+    def _valid(value: str | None) -> bool:
+        if not value or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+            return False
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            return False
+        return True
+
+    if not _valid(raw_from) or not _valid(raw_to):
+        raise QueryError("bad_time")
+
+    if parse_utc_z_datetime(raw_from) > parse_utc_z_datetime(raw_to):
+        raise QueryError("bad_time")
+
+    return BehaviorDeclarationComplianceExportParams(
+        from_created_at=raw_from,  # type: ignore[arg-type]
+        to_created_at=raw_to,  # type: ignore[arg-type]
+    )
+
+
+# A stored ``created_at`` that no longer parses is ordered after every
+# parseable record (the same tolerant convention the other read-only window
+# exports use), so a damaged stamp sorts deterministically last instead of
+# crashing this read-only query; such a degenerate instant can never fall
+# inside a finite window.
+_BEHAVIOR_DECLARATION_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _behavior_declaration_created_instant(value: object) -> datetime:
+    """Parse a stored declaration ``created_at`` to its UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract;
+    a damaged value sorts after every parseable record instead of raising, so
+    the read-only window export neither crashes nor repairs the stored text.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _BEHAVIOR_DECLARATION_FAR_FUTURE
+
+
+def _behavior_declaration_id_key(value: object) -> tuple[int, str]:
+    """Tie-break key for a stored declaration identifier.
+
+    Legitimately written ids are strings; a damaged non-string id never
+    crashes the ordering — it sorts after string ids within one instant, and
+    the stored value is still emitted verbatim.
+    """
+    if isinstance(value, str):
+        return (0, value)
+    return (1, str(value))
+
+
+def behavior_declaration_record_to_dict(
+    record: BehaviorDeclaration,
+) -> dict[str, object]:
+    """One stored behavior declaration, exactly the list-view visible fields.
+
+    Carries the seven visible fields ``{id, machine_id, action_type,
+    resource_pattern, enabled, created_at, updated_at}`` in this fixed field
+    order — the same complete field set the behavior-declaration list
+    endpoint exposes, with no added chain field. Damaged stored values are
+    emitted verbatim, never filtered, repaired, or normalized.
+    """
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "action_type": record.action_type,
+        "resource_pattern": record.resource_pattern,
+        "enabled": record.enabled,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    }
+
+
+@app.get("/machines/{machine_id}/behavior-declarations/compliance-export")
+def export_behavior_declarations_compliance(
+    machine_id: str,
+    params: Annotated[
+        BehaviorDeclarationComplianceExportParams,
+        Depends(validate_behavior_declaration_export_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only compliance export of one machine's declarations in a window.
+
+    The real entry point is the ``compliance-export`` sub-entry under the
+    machine behavior-declaration path; only ``GET`` is routed, so ``HEAD``
+    and every other method return ``405`` without reading declarations,
+    filtering records, computing a result, or writing anything. The caller
+    submits only the path machine id and the two required bounds
+    ``from_created_at``/``to_created_at`` — UTC RFC 3339 date-times ending in
+    ``Z`` (fractional seconds optional, equal bounds allowed). Query
+    validation (``invalid_query`` for an unknown parameter, a repeated bound,
+    or a carried request body; ``bad_time`` for a missing, blank, offset,
+    whitespace-padded, malformed, out-of-range, or inverted bound) completes
+    before the machine or any declaration is read, so a parameter error
+    takes priority even against a missing machine; a valid query against a
+    missing machine is a 404 ``not_found`` carrying no declarations.
+
+    On success the response carries exactly ``{machine_id, from_created_at,
+    to_created_at, behavior_declarations}`` in this fixed key order; the path
+    machine id and the original bound text are echoed back, and
+    ``behavior_declarations`` is always present (an empty array for an empty
+    window, a machine with no declarations, or an empty database). The array
+    holds only the path machine's existing declarations whose own
+    ``created_at`` falls in the closed UTC interval, each carrying the seven
+    list-view fields ``{id, machine_id, action_type, resource_pattern,
+    enabled, created_at, updated_at}`` exactly as stored — the export adds no
+    chain field — with no filtering, repair, or normalization of illegal,
+    duplicated, missing, or otherwise damaged field values.
+    Items are ordered by the actual UTC instant of ``created_at`` and then by
+    record id ascending, so an exact-second record sorts before any
+    fractional-second record of the same second; a stored ``created_at``
+    that no longer parses keeps its original text and deterministically
+    sorts after every parseable instant, and therefore never falls inside a
+    finite window while its stored text is left untouched. Another
+    machine's declarations never enter the result. A real failure while
+    reading the machine or the declarations returns 500
+    ``internal_error`` with no partial records. The query is strictly
+    read-only and adds no persistence surface: repeated calls against
+    unchanged data are byte-identical, results survive restarts, and old and
+    empty databases serve directly. The body is compact UTF-8 JSON
+    terminated by a single newline and contains no floating-point,
+    ``-0.0``, or non-finite value.
+    """
+    # Any failure while *reading* — the machine lookup, the declaration
+    # rows, or the ordering over them — is an internal read-layer fault:
+    # answer 500 internal_error with no partial records. Damaged stored
+    # values are not a read failure — rows read successfully are filtered
+    # and ordered with the tolerant instant key (an unparseable stamp sorts
+    # last and so stays outside every finite window) and emitted verbatim.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+
+        window_start = parse_utc_z_datetime(params.from_created_at)
+        window_end = parse_utc_z_datetime(params.to_created_at)
+
+        rows = session.scalars(
+            select(BehaviorDeclaration).where(
+                BehaviorDeclaration.machine_id == machine_id
+            )
+        ).all()
+
+        def _instant(record: BehaviorDeclaration) -> datetime | None:
+            # Window membership is decided on parsed instants. A stored stamp
+            # that no longer parses has no instant, so it can never fall
+            # inside a finite window (it also sorts last); the record's
+            # stored text is still emitted by the unbounded surfaces
+            # untouched.
+            value = record.created_at
+            if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+                try:
+                    return parse_utc_z_datetime(value)
+                except ValueError:
+                    pass
+            return None
+
+        in_window = [
+            record
+            for record in rows
+            if (instant := _instant(record)) is not None
+            and window_start <= instant <= window_end
+        ]
+        ordered = sorted(
+            in_window,
+            key=lambda record: (
+                _behavior_declaration_created_instant(record.created_at),
+                _behavior_declaration_id_key(record.id),
+            ),
+        )
+    except Exception:
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": machine_id,
+        "from_created_at": params.from_created_at,
+        "to_created_at": params.to_created_at,
+        "behavior_declarations": [
+            behavior_declaration_record_to_dict(record) for record in ordered
+        ],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 class PolicyRuleCreate(BaseModel):
     action_type: NonEmptyStr
     resource_pattern: NonEmptyStr
