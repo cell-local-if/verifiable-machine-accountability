@@ -390,6 +390,70 @@ class PrivacyAccess(Base):
     chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class AuthorizationGrant(Base):
+    """One one-time, short-lived authorization credential for one event.
+
+    A grant is minted only for an existing decision event of the path machine
+    that committed ``allowed = true`` with ``reason = "allowed_by_policy"`` and
+    whose immutable decision-basis snapshot passes the read-only consistency
+    audit. Rows are never updated after issue except the one atomic transition
+    performed by the consume operation, and ``event_id`` is unique: at most one
+    grant can ever be signed per event, enforced by the database itself so a
+    concurrent burst of issue requests has exactly one winner. The table is
+    created automatically at startup on databases that predate the feature.
+    """
+
+    __tablename__ = "authorization_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        unique=True,
+    )
+    issued_at: Mapped[str] = mapped_column(String, nullable=False)
+    expires_at: Mapped[str] = mapped_column(String, nullable=False)
+    # ``active`` after issue, then ``consumed`` exactly once. Grants are never
+    # revoked, renewed, or transferred; expiry is a derived state checked
+    # against ``expires_at`` and needs no column update.
+    status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    consumed_at: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class AuthorizationGrantUse(Base):
+    """The single consumption record of one authorization grant.
+
+    Written in the same locked transaction that flips the grant to
+    ``consumed``: the grant state change and the use record commit together or
+    leave no trace, so exactly one use row can ever exist per grant (enforced
+    by the unique ``grant_id``), even under concurrent consumption.
+    """
+
+    __tablename__ = "authorization_grant_uses"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    grant_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_grants.id"),
+        nullable=False,
+        unique=True,
+    )
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        index=True,
+    )
+    consumed_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class WriteTransactionDiagnostic(Base):
     """One read-only diagnostic record per joint-write transaction attempt.
 

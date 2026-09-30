@@ -2583,3 +2583,83 @@ unchanged data, and reads data persisted across application restarts. It adds
 no schema. `GET /health`, machine start/stop, authorization evaluation, the
 event chain, incident handling, and the existing compliance exports are
 unchanged.
+
+## One-time, short-lived authorization grants
+
+`POST /machines/{machine_id}/authorization-grants` turns one already-committed,
+audit-passing *allow* decision event into a short-lived credential that can be
+consumed exactly once. The request carries no query string and a JSON object
+body with exactly two fields:
+
+- `event_id` — a non-empty string naming an authorization decision event of the
+  path machine; a missing, non-string, or blank-after-trim value is
+  `422 {"error":{"code":"invalid_grant_request"}}`;
+- `ttl_seconds` — a non-boolean integer from `1` to `300`. A missing, boolean
+  (`true`/`false`), fractional (e.g. `1.0`), non-integer, or out-of-range value
+  is `422 {"error":{"code":"invalid_grant_request"}}`, as is a body that is
+  missing, not a JSON object, lacks or adds a top-level field, or does not
+  parse.
+
+Validation runs before any machine, event, or basis is read; any query
+parameter or repeated parameter is
+`422 {"error":{"code":"invalid_query"}}` and takes priority even over a
+non-existent machine, and every body error is likewise answered without
+reading a record. After validation, a missing machine, a missing event, or an
+event owned by another machine is `404 {"error":{"code":"not_found"}}`. The
+event itself must have committed `allowed = true` with
+`reason = "allowed_by_policy"`; any other committed result
+(`machine_suspended`, `no_enabled_declaration`, `no_matching_policy`,
+`denied_by_policy`) is `409 {"error":{"code":"event_not_allowed"}}`. An event
+with no historical decision-basis snapshot (one committed before the basis
+feature) is `409 {"error":{"code":"decision_basis_unavailable"}}` — a basis is
+never reconstructed from current data — and an event whose stored snapshot
+fails the read-only `decision-basis/integrity` consistency audit is
+`409 {"error":{"code":"decision_basis_invalid"}}`. The eligibility reads, the
+audit, and the grant insert run in one locked write transaction; every event
+can be signed at most once, so a concurrent issue burst has exactly one `201`
+success and every other request
+`409 {"error":{"code":"grant_already_exists"}}`, with a database-level unique
+constraint on `event_id` as the final backstop. A rejected issue writes
+nothing.
+
+The success body is exactly
+`{id, machine_id, event_id, issued_at, expires_at, status}` in this fixed
+order: a fresh UUID `id`, the path machine and chosen event echoed verbatim,
+`issued_at` the UTC issue moment ending in `Z`, `expires_at` the issue moment
+plus exactly `ttl_seconds`, and `status` always `"active"`. Issuing a grant
+never modifies the event, its basis, any hash chain, evidence, incidents, or
+any other accountability record.
+
+`POST /machines/{machine_id}/authorization-grants/{grant_id}/consume`
+atomically consumes one grant. It accepts only an empty query string and an
+empty request body: any query parameter, repeated parameter, or carried body
+(including an empty JSON object) is
+`422 {"error":{"code":"invalid_query"}}`, validated before the machine or
+grant is read, so the same malformed request against a non-existent machine is
+still 422. After validation a missing machine, a missing grant, or a grant
+owned by another machine is `404 {"error":{"code":"not_found"}}`. Consuming an
+already-consumed grant answers `409 {"error":{"code":"grant_consumed"}}`; a
+grant whose current UTC instant is at or past its `expires_at` answers
+`409 {"error":{"code":"grant_expired"}}` (expiry is derived from the immutable
+stamp; an expired grant is never updated), and neither rejection writes
+anything. On success the grant flips to `consumed` and one use record is
+inserted — carrying its own fresh UUID and the UTC consumption moment — inside
+the same locked write transaction, so a concurrent consumption burst has
+exactly one `200` success returning
+`{grant_id, use_id, consumed_at}` in this fixed order; the state change and
+the use record commit together or leave no trace, and a database-level unique
+constraint on the use record's `grant_id` makes a second consumption
+impossible.
+
+Grants and use records live in their own tables, persist across application
+restarts, and are strictly isolated by machine (another machine can never
+consume a grant it does not own, and such an attempt leaves the grant
+consumable by its real owner). Grants cannot be revoked, renewed, or
+transferred; there is no update, delete, or list entry, and a failure leaves
+neither a half-consumed grant nor a use record. On startup the two tables are
+created safely on databases that predate the feature (`Base.metadata.create_all`),
+an empty database can issue and consume grants directly, and re-issuing,
+consuming, and reading events and their bases through the existing query
+entries observes the same stable results; the decision chain, decision bases,
+audits, diagnostics, compliance and privacy exports, and health-check
+semantics are unchanged.
