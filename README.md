@@ -2583,3 +2583,50 @@ unchanged data, and reads data persisted across application restarts. It adds
 no schema. `GET /health`, machine start/stop, authorization evaluation, the
 event chain, incident handling, and the existing compliance exports are
 unchanged.
+
+### One-time authorization grants
+
+`POST /machines/{machine_id}/authorization-grants` converts one audited
+allowed decision event into a short-lived credential that can be consumed at
+most once. The body is a JSON object with exactly two fields: `event_id` (a
+non-empty string naming an event of the path machine) and `ttl_seconds` (a
+non-boolean integer from `1` to `300`). Any query parameter returns
+`422 {"error":{"code":"invalid_query"}}` before the body is parsed; a missing,
+non-object, field-missing/extra, wrongly typed, boolean, fractional, or
+out-of-range body returns `422 {"error":{"code":"invalid_grant_request"}}`
+before any database read. A missing machine, a missing event, or an event
+owned by another machine is `404 {"error":{"code":"not_found"}}`. The event
+must be stored with `allowed=true` and `reason="allowed_by_policy"`
+(`409 {"error":{"code":"event_not_allowed"}}`), must have its immutable
+decision-basis snapshot (`409 {"error":{"code":"decision_basis_unavailable"}}`),
+and that snapshot must pass the same read-only integrity audit as the
+`decision-basis/integrity` entry
+(`409 {"error":{"code":"decision_basis_invalid"}}`). Each event can be signed
+at most once: the database-level unique `event_id` grant plus the locked write
+transaction make concurrent issuance succeed exactly once, with every losing
+request returning `409 {"error":{"code":"grant_already_exists"}}` and writing
+nothing.
+
+Success returns `201` with
+`{id, machine_id, event_id, issued_at, expires_at, status}`; the grant is born
+`status="active"` and `expires_at` is the UTC `Z` instant `issued_at` plus
+`ttl_seconds`.
+
+`POST /machines/{machine_id}/authorization-grants/{grant_id}/consume`
+atomically consumes one active, unexpired grant. It accepts only the path
+machine id and path grant id — an empty query string and no request body; any
+query parameter or carried body returns
+`422 {"error":{"code":"invalid_query"}}` before the machine or grant is read.
+A missing machine, a missing grant, or a grant owned by another machine is
+`404 {"error":{"code":"not_found"}}`. An already consumed grant returns
+`409 {"error":{"code":"grant_consumed"}}`; an active grant at or past
+`expires_at` returns `409 {"error":{"code":"grant_expired"}}` (consumed takes
+precedence); neither failure writes anything. On success the
+`active -> consumed` flip and the single use record commit in one locked write
+transaction, so concurrent consumption succeeds exactly once, with `200`
+`{grant_id, use_id, consumed_at}`. Grants and uses persist across restarts; a
+grant cannot be revoked, renewed, or transferred, and a failed consumption
+leaves neither the status flip nor a use record. The feature adds two new
+tables and never alters machines, events, decision bases, chains, audits, or
+accountability exports; old and empty databases create the new tables at
+startup and all existing behavior is unchanged.

@@ -36,6 +36,7 @@ from . import (
     declaration_integrity,
     diagnostics,
     evidence_chain,
+    grants,
     incidents,
     machine_status_chain,
     machines,
@@ -8581,6 +8582,148 @@ def get_authorization_decision_event_decision_basis_integrity(
         + "\n"
     )
     return Response(content=body, media_type="application/json")
+
+
+# --- one-time, short-lived authorization grants ------------------------------
+
+
+@app.post("/machines/{machine_id}/authorization-grants", status_code=201)
+async def create_authorization_grant(machine_id: str, request: Request):
+    """Mint the one short-lived, single-consumption grant for one event.
+
+    The body is a JSON object carrying exactly two fields: ``event_id``, a
+    non-empty string naming a decision event of the path machine, and
+    ``ttl_seconds``, a non-boolean integer from 1 through 300. Validation
+    runs entirely before any database read:
+
+    - any query parameter is ``422 invalid_query`` first of all, before the
+      body is even parsed;
+    - a missing or non-JSON-object body, a missing or extra field, a
+      non-string or empty ``event_id``, or a ``ttl_seconds`` that is not an
+      integer (booleans and floats rejected) or falls outside 1..300 is
+      ``422 invalid_grant_request``.
+
+    A missing machine, a missing event, or an event owned by another machine
+    is ``404 not_found``. The event must be stored as
+    ``allowed = true`` / ``reason = "allowed_by_policy"`` (otherwise
+    ``409 event_not_allowed``), must carry its immutable decision-basis
+    snapshot (otherwise ``409 decision_basis_unavailable``), and that
+    snapshot must pass the same read-only integrity audit the
+    ``decision-basis/integrity`` entry performs (otherwise
+    ``409 decision_basis_invalid``). Each event can be signed at most once:
+    the unique per-event grant plus the locked write transaction make
+    concurrent issuance succeed exactly once, and every losing request
+    answers ``409 grant_already_exists`` with nothing written.
+
+    Success is ``201`` with
+    ``{id, machine_id, event_id, issued_at, expires_at, status}``; the grant
+    is born ``active`` and ``expires_at`` is the UTC ``Z`` instant
+    ``issued_at`` plus ``ttl_seconds``. No existing machine, event, basis,
+    chain, audit, or accountability row is ever modified.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_grant_request")
+    if not isinstance(payload, dict) or set(payload) != {"event_id", "ttl_seconds"}:
+        return error_response(422, "invalid_grant_request")
+    event_id_raw = payload["event_id"]
+    ttl_raw = payload["ttl_seconds"]
+    # Booleans are not integers (``True``/``False`` must be rejected like any
+    # non-integer), and floats such as ``60.0`` do not satisfy the integer
+    # contract either.
+    if isinstance(event_id_raw, bool) or not isinstance(event_id_raw, str):
+        return error_response(422, "invalid_grant_request")
+    event_id = event_id_raw.strip()
+    if not event_id:
+        return error_response(422, "invalid_grant_request")
+    if isinstance(ttl_raw, bool) or not isinstance(ttl_raw, int):
+        return error_response(422, "invalid_grant_request")
+    if not 1 <= ttl_raw <= 300:
+        return error_response(422, "invalid_grant_request")
+
+    result = grants.issue_grant(
+        request.app.state.engine,
+        machine_id=machine_id,
+        event_id=event_id,
+        ttl_seconds=ttl_raw,
+    )
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "event_not_allowed":
+        return error_response(409, "event_not_allowed")
+    if status == "decision_basis_unavailable":
+        return error_response(409, "decision_basis_unavailable")
+    if status == "decision_basis_invalid":
+        return error_response(409, "decision_basis_invalid")
+    if status == "grant_already_exists":
+        return error_response(409, "grant_already_exists")
+
+    grant = result["grant"]
+    return JSONResponse(
+        status_code=201,
+        content={
+            "id": grant["id"],
+            "machine_id": grant["machine_id"],
+            "event_id": grant["event_id"],
+            "issued_at": grant["issued_at"],
+            "expires_at": grant["expires_at"],
+            "status": grant["status"],
+        },
+    )
+
+
+@app.post("/machines/{machine_id}/authorization-grants/{grant_id}/consume")
+async def consume_authorization_grant(
+    machine_id: str, grant_id: str, request: Request
+):
+    """Atomically consume one active, unexpired grant exactly once.
+
+    The entry accepts only the path machine id and path grant id: no query
+    parameters and no request body; any query string or carried body is
+    ``422 invalid_query`` before the machine or grant is read. A missing
+    machine, a missing grant, or a grant owned by another machine is
+    ``404 not_found``. An already consumed grant answers
+    ``409 grant_consumed``; an active grant whose UTC instant has reached
+    ``expires_at`` answers ``409 grant_expired`` (consumed takes precedence).
+    Both failures write nothing.
+
+    On success the ``active -> consumed`` flip and the grant's single use
+    record commit in one locked write transaction, so concurrent consumption
+    succeeds exactly once and a failure leaves neither the flip nor a use
+    row. The ``200`` body is ``{grant_id, use_id, consumed_at}`` with the
+    UTC ``Z`` consumption moment. Grants cannot be revoked, renewed, or
+    transferred; the result and all use records persist across restarts.
+    """
+    if request.query_params:
+        return error_response(422, "invalid_query")
+    # A present non-zero Content-Length, or a chunked request without one,
+    # means a body is being carried; the entry permits no body at all.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        return error_response(422, "invalid_query")
+
+    result = grants.consume_grant(
+        request.app.state.engine,
+        machine_id=machine_id,
+        grant_id=grant_id,
+    )
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "grant_consumed":
+        return error_response(409, "grant_consumed")
+    if status == "grant_expired":
+        return error_response(409, "grant_expired")
+
+    return JSONResponse(status_code=200, content=result["use"])
 
 
 # --- read-only stable incremental query over one machine's basis snapshots ---
