@@ -2696,3 +2696,73 @@ and consume grants directly, and re-issuing, consuming, revoking, and reading
 events and their bases through the existing query entries observes the same
 stable results; the decision chain, decision bases, audits, diagnostics,
 compliance and privacy exports, and health-check semantics are unchanged.
+
+## Grant lifecycle audit chain
+
+Every successful grant action additionally appends one immutable audit event
+to that machine's *grant lifecycle* chain, in the same locked transaction as
+the action itself: issuing appends `issued`, the single consumption appends
+`consumed`, and the one emergency revocation appends `revoked`. A failed,
+duplicate, expired, or concurrency-losing action writes no event, so a grant
+has exactly one terminal lifecycle event — the single consume or the single
+revocation — matching its persisted terminal status. Each event carries nine
+fields: `id` (a fresh UUID), `machine_id`, `grant_id`,
+`authorization_event_id` (the signed decision event), `type`
+(`issued`/`consumed`/`revoked`), `occurred_at` (the successful response's own
+moment — `issued_at`, `consumed_at`, or `revoked_at` — reused verbatim), and
+the per-machine chain fields `previous_event_id` (`null` for the machine's
+first event), `content_hash`, and `chain_hash`. The hash algorithm is the
+same one the other chains use: `content_hash` is SHA-256 of the compact
+key-sorted JSON of the six content fields
+`{id, machine_id, grant_id, authorization_event_id, type, occurred_at}`, and
+`chain_hash` is SHA-256 of `<previous chain_hash>:<content_hash>` starting
+from the empty string. Events are isolated per machine and linked in
+`(occurred_at, id)` order. The action and its event commit together or leave
+no trace.
+
+`GET /machines/{machine_id}/authorization-grant-lifecycle-events/integrity`
+verifies the machine's chain. It accepts only an empty query string and an
+empty request body; any query parameter or carried body is
+`422 {"error":{"code":"invalid_query"}}` before the machine is looked up. A
+missing machine is `404 {"error":{"code":"not_found"}}`; only `GET` is routed
+and other methods (including `HEAD`) answer `405`; a read failure is
+`500 {"error":{"code":"internal_error"}}` with no partial conclusion. The
+success body is exactly `{valid, checked_count, broken_event_id}` in this
+fixed order: a complete or empty chain reports `true`, the total count (`0`
+when empty), and `null`; a damaged chain reports `false`, the total count,
+and the id of the first event — in `(occurred_at, id)` order — whose content
+fields, predecessor link, content hash, or chain hash do not recompute. The
+check is strictly read-only and never repairs, recomputes, or deletes.
+
+`GET /machines/{machine_id}/authorization-grant-lifecycle-events/changes` is
+the read-only stable incremental (keyset-paginated) read. It accepts exactly
+a required `limit` and an optional `cursor`, and no request body. `limit`
+must be a non-boolean integer from `1` to `100`; a missing, blank,
+fractional, boolean, non-decimal, or out-of-range value is
+`422 {"error":{"code":"bad_limit"}}`. `cursor` is an opaque
+`<occurred_at original text>|<event id>` position returned by a previous
+page; an empty or shape-mismatching value is
+`422 {"error":{"code":"invalid_cursor"}}`, as is a well-shaped cursor that
+names no stored position of the path machine (including a cursor built for
+another machine). Any other parameter name, a repeated `limit`/`cursor`, or
+a carried body is `422 {"error":{"code":"invalid_query"}}`. Parameter errors
+take priority over the machine lookup; a valid query for a missing machine
+is `404 {"error":{"code":"not_found"}}`; non-GET methods answer `405`; a read
+failure answers `500 {"error":{"code":"internal_error"}}`. The success body
+is exactly `{machine_id, limit, records, next_cursor, has_more}` in this
+fixed order. `records` are the path machine's nine-field lifecycle events in
+actual-UTC-instant then id ascending order (an exact-second instant precedes
+a fractional one; a stored stamp that no longer parses is emitted verbatim
+and sorts deterministically last), the cursor is exclusive so an event is
+never returned twice and repeating a cursor against unchanged data returns
+the byte-identical next page, `next_cursor` is set only when a record
+follows (otherwise `null`), and `has_more` matches. The query exposes only
+the nine audit fields — never public keys, policy text, decision bases, or
+privacy fields — issues no writes, and works across application restarts.
+
+On startup the lifecycle-events table is created current-schema on databases
+that predate the feature (`Base.metadata.create_all`), and chain columns are
+added to a table that somehow predates them; existing grant rows and any
+other data are left exactly as they are, and no historical lifecycle events
+are synthesized for old grants (the chain simply starts empty).
+

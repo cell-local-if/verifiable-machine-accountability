@@ -36,6 +36,7 @@ from . import (
     declaration_integrity,
     diagnostics,
     evidence_chain,
+    grant_lifecycle_chain,
     grants,
     incidents,
     machine_status_chain,
@@ -53,6 +54,7 @@ from .db import (
     AuthorizationDecisionEvent,
     AuthorizationDecisionEvidence,
     AuthorizationDecisionIncident,
+    AuthorizationGrantLifecycleEvent,
     Base,
     BehaviorDeclaration,
     IncidentResponsibilityAssignment,
@@ -115,6 +117,10 @@ async def lifespan(app: FastAPI):
     machine_status_chain.backfill_chains(engine)
     diagnostics.migrate_schema(engine)
     grants.migrate_schema(engine)
+    # The lifecycle-events table is created current-schema by create_all;
+    # migrate_schema only adds chain columns to a table that predates them.
+    # Old rows are never rewritten (a fresh table starts with an empty chain).
+    grant_lifecycle_chain.migrate_schema(engine)
     # Finalize joint-write markers left by a crashed previous process from
     # the committed evidence, before serving any request.
     diagnostics.recover_pending(engine)
@@ -9835,3 +9841,309 @@ async def revoke_authorization_grant(
     if status == "grant_expired":
         return error_response(409, "grant_expired")
     return AuthorizationGrantRevocationOut(**result["revocation"])
+
+
+# --- grant lifecycle audit chain: integrity and incremental reads ------------
+
+
+_LIFECYCLE_BASE_PATH = (
+    "/machines/{machine_id}/authorization-grant-lifecycle-events"
+)
+
+
+def validate_grant_lifecycle_integrity_params(request: Request) -> None:
+    """Validate the lifecycle-chain integrity query before any lookup.
+
+    The integrity check is keyed on the path machine alone and accepts no
+    query parameters and no request body; any parameter name or a carried
+    body is a 422 ``invalid_query``. The check runs before the machine is
+    looked up and issues no database access, so an extra parameter or a body
+    against a non-existent machine still reports 422 rather than 404.
+    """
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get(f"{_LIFECYCLE_BASE_PATH}/integrity")
+def check_grant_lifecycle_integrity(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_grant_lifecycle_integrity_params)],
+    session: SessionDep,
+):
+    """Read-only verification of one machine's grant lifecycle hash chain.
+
+    The caller submits only the path machine id — no query parameters and no
+    request body; any query parameter or carried body is a 422
+    ``invalid_query`` raised during validation before the machine is looked
+    up and before any lifecycle event is read. A missing machine is a 404
+    ``not_found`` carrying no integrity conclusion. Only ``GET`` is routed;
+    every other method (including ``HEAD``) returns 405 without reading
+    events, computing a conclusion, or writing anything. A failure while
+    reading the events is a 500 ``internal_error`` with no partial
+    conclusion.
+
+    On success the response carries exactly ``{valid, checked_count,
+    broken_event_id}`` in this fixed field order. An empty or fully sound
+    chain reports ``true``, the machine's total lifecycle event count (``0``
+    when empty), and ``null``; otherwise ``false``, the total count, and the
+    first event — in (occurred-at instant, id) order — whose content fields,
+    predecessor link, content hash, or chain hash does not verify. Only the
+    path machine's events are examined, and the query never writes, repairs,
+    recomputes, or deletes, so repeated calls and restarts return stable
+    results. It never exposes public keys, policy text, decision bases, or
+    privacy fields: the nine lifecycle fields are the only data read. The
+    body is compact UTF-8 JSON terminated by a single newline.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        valid, checked_count, broken_event_id = (
+            grant_lifecycle_chain.verify_chain(session, machine_id)
+        )
+    except SQLAlchemyError:
+        # Never emit a partial conclusion when the events cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "valid": valid,
+        "checked_count": checked_count,
+        "broken_event_id": broken_event_id,
+    }
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
+class GrantLifecycleChangesParams(BaseModel):
+    limit: int
+    cursor: str | None = None
+
+
+def validate_grant_lifecycle_changes_params(
+    request: Request,
+) -> GrantLifecycleChangesParams:
+    """Validate the lifecycle ``changes`` query string before any lookup.
+
+    Exactly two parameters are accepted: the required ``limit`` and the
+    optional ``cursor``; no other parameters and no request body. ``limit``
+    must be a non-boolean integer in 1..100; a missing, blank, fractional,
+    boolean, non-decimal, or out-of-range value is a 422 ``bad_limit``.
+    ``cursor``, when present, must be a non-empty string shaped
+    ``<occurred_at original text>|<event id>``; an empty or shape-mismatching
+    value is a 422 ``invalid_cursor``. The timestamp segment is accepted
+    verbatim as stored text; locating the named event happens in the handler
+    while the path machine's events are read, and a position that names no
+    stored lifecycle event of the path machine (including a cursor for
+    another machine) is a 422 ``invalid_cursor`` there. Any other parameter
+    name, a repeated ``limit`` or ``cursor``, or a request that carries a
+    body is a 422 ``invalid_query``. Every check here runs before the machine
+    or any lifecycle event is read.
+    """
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is an unknown-shape query: reject
+    # ``limit=1&limit=2`` (and a repeated ``cursor``) as ``invalid_query``
+    # rather than silently taking one occurrence.
+    if len(request.query_params.getlist("limit")) > 1:
+        raise QueryError("invalid_query")
+    if len(request.query_params.getlist("cursor")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_limit = request.query_params.get("limit")
+    if raw_limit is None or not _INTEGER_QUERY_RE.fullmatch(raw_limit):
+        raise QueryError("bad_limit")
+    limit = int(raw_limit)
+    if not 1 <= limit <= 100:
+        raise QueryError("bad_limit")
+
+    cursor = request.query_params.get("cursor")
+    if cursor is not None:
+        # Split on the LAST separator because the position is
+        # ``<occurred_at original text>|<event id>`` and the timestamp
+        # segment is stored text that may itself contain ``|``, while the
+        # event-id segment never does.
+        parts = cursor.rsplit("|", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise QueryError("invalid_cursor")
+
+    return GrantLifecycleChangesParams(limit=limit, cursor=cursor)
+
+
+def _encode_grant_lifecycle_cursor(occurred_at: str, event_id: str) -> str:
+    return f"{occurred_at}|{event_id}"
+
+
+# A stored ``occurred_at`` that no longer parses is ordered after every
+# parseable event (the same tolerant convention the other changes queries
+# use), so a damaged stamp sorts deterministically last instead of crashing
+# this read-only query; ties among damaged stamps break by event id.
+_GRANT_LIFECYCLE_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _grant_lifecycle_occurred_instant(value: object) -> datetime:
+    """Parse a stored lifecycle ``occurred_at`` to its UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract;
+    a damaged value sorts after every parseable event instead of raising, so
+    the read-only query neither crashes nor repairs the stored text.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _GRANT_LIFECYCLE_FAR_FUTURE
+
+
+def grant_lifecycle_event_to_dict(
+    record: AuthorizationGrantLifecycleEvent,
+) -> dict[str, object]:
+    """One stored lifecycle event with exactly its nine audit fields."""
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "grant_id": record.grant_id,
+        "authorization_event_id": record.authorization_event_id,
+        "type": record.type,
+        "occurred_at": record.occurred_at,
+        "previous_event_id": record.previous_event_id,
+        "content_hash": record.content_hash,
+        "chain_hash": record.chain_hash,
+    }
+
+
+@app.get(f"{_LIFECYCLE_BASE_PATH}/changes")
+def get_grant_lifecycle_changes(
+    machine_id: str,
+    params: Annotated[
+        GrantLifecycleChangesParams,
+        Depends(validate_grant_lifecycle_changes_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only stable incremental, keyset-paginated query of one machine's
+    grant lifecycle audit events.
+
+    Only ``GET`` is routed, so other methods (including ``HEAD``) return
+    ``405`` without reading events, computing a page, or writing anything.
+    The caller submits only the path machine id, a required ``limit`` (a
+    non-boolean integer from 1 to 100), and an optional opaque ``cursor``
+    returned by a previous page — no other parameters and no request body.
+    Query validation (``invalid_query`` for unknown parameters, repeated
+    names, or a carried body; ``bad_limit`` for a missing, blank, fractional,
+    boolean, or out-of-range ``limit``; ``invalid_cursor`` for an empty or
+    shape-mismatching ``cursor``) completes before the machine or any event
+    is read; a well-shaped cursor that names no stored
+    ``(occurred_at, id)`` position of the path machine — a drifted position
+    or one owned by another machine — is an ``invalid_cursor`` reported
+    while the events are read, so a parameter error always takes priority
+    over the machine lookup. A valid query against a missing machine is a
+    404 ``not_found`` carrying no records and no status.
+
+    On success the response carries exactly ``{machine_id, limit, records,
+    next_cursor, has_more}`` in this fixed key order. ``records`` contains
+    only lifecycle events owned by the path machine, each carrying exactly
+    the nine stored fields ``{id, machine_id, grant_id,
+    authorization_event_id, type, occurred_at, previous_event_id,
+    content_hash, chain_hash}`` with no normalization or repair. Items are
+    ordered by the actual UTC instant of ``occurred_at`` and then by event id
+    ascending (an exact-second instant precedes a fractional one); a stored
+    stamp that no longer parses is kept verbatim and deterministically sorts
+    after every parseable instant.
+
+    The cursor is the exclusive position ``<occurred_at original
+    text>|<event id>`` just after a page's last record, so a page returns
+    only events strictly after it and an event already returned never
+    resurfaces; repeating the same cursor against unchanged data returns the
+    byte-identical next page. ``next_cursor`` is set only when a record
+    follows (``null`` on the last or an empty page) and ``has_more`` is true
+    exactly then. The query is strictly read-only and machine isolated,
+    exposes no public keys, policy text, decision bases, or privacy fields,
+    and the body is compact UTF-8 JSON terminated by a single newline. A
+    failure while reading returns 500 ``internal_error`` with no partial
+    page.
+    """
+    try:
+        rows = session.scalars(
+            select(AuthorizationGrantLifecycleEvent).where(
+                AuthorizationGrantLifecycleEvent.machine_id == machine_id
+            )
+        ).all()
+        ordered = sorted(
+            rows,
+            key=lambda record: (
+                _grant_lifecycle_occurred_instant(record.occurred_at),
+                record.id,
+            ),
+        )
+
+        start = 0
+        if params.cursor is not None:
+            cursor_occurred_at, cursor_id = params.cursor.rsplit("|", 1)
+            # Exclusive keyset position. A cursor this endpoint issued always
+            # names a stored row of this machine, so locate it by the exact
+            # stored ``(occurred_at text, id)`` pair; a well-shaped cursor no
+            # row of the path machine matches (a foreign machine's position,
+            # a deleted event, drifted text) cannot be positioned and is
+            # rejected as a non-locatable cursor before the machine lookup.
+            positions = [
+                index
+                for index, record in enumerate(ordered)
+                if record.occurred_at == cursor_occurred_at
+                and record.id == cursor_id
+            ]
+            if not positions:
+                return error_response(422, "invalid_cursor")
+            start = positions[0] + 1
+
+        machine = session.get(Machine, machine_id)
+    except Exception:
+        return error_response(500, "internal_error")
+
+    if machine is None:
+        return error_response(404, "not_found")
+
+    remaining = ordered[start:]
+    page = remaining[: params.limit]
+    has_more = len(remaining) > len(page)
+    next_cursor = (
+        _encode_grant_lifecycle_cursor(page[-1].occurred_at, page[-1].id)
+        if page and has_more
+        else None
+    )
+
+    payload = {
+        "machine_id": machine_id,
+        "limit": params.limit,
+        "records": [
+            grant_lifecycle_event_to_dict(record) for record in page
+        ],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")

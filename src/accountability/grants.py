@@ -25,9 +25,17 @@ a short-lived credential that can be consumed exactly once:
 
 Grants and use records live in their own tables and are never renewed,
 transferred, or deleted. Revocation never touches the decision event, its
-immutable basis, any hash chain, evidence, incident, diagnostic, or export. A
-failed attempt writes neither the grant state change nor a use record: the
-whole operation either commits together or leaves no trace.
+immutable basis, the decision-event hash chain, evidence, incident,
+diagnostic, or export. A failed attempt writes neither the grant state change
+nor a use record: the whole operation either commits together or leaves no
+trace.
+
+Every successful action also appends one per-machine grant lifecycle audit
+event (``issued``/``consumed``/``revoked``) inside that same locked
+transaction, timestamped with the success response's own moment and linked
+into its own tamper-evident hash chain. A rejected, duplicate, or
+concurrency-losing action writes no lifecycle event, so the one terminal
+winner is the only action that leaves an audit record.
 """
 
 import uuid
@@ -37,7 +45,7 @@ from typing import Any
 from sqlalchemy import Engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
-from . import decision_basis, decision_basis_integrity
+from . import decision_basis, decision_basis_integrity, grant_lifecycle_chain
 from .chain import _run_with_lock_retry
 from .db import (
     AuthorizationDecisionEvent,
@@ -163,6 +171,17 @@ def issue_grant(
                 consumed_at=None,
             )
         )
+        # The lifecycle audit event commits in this same transaction, reusing
+        # the grant's issued moment, so a failed or losing transaction leaves
+        # neither a grant nor an ``issued`` event behind.
+        lifecycle_event = grant_lifecycle_chain.append_lifecycle_event(
+            conn,
+            machine_id=machine_id,
+            grant_id=grant_id,
+            authorization_event_id=event_id,
+            type="issued",
+            occurred_at=issued_at,
+        )
         return {
             "status": "ok",
             "grant": {
@@ -173,6 +192,7 @@ def issue_grant(
                 "expires_at": expires_at,
                 "status": "active",
             },
+            "lifecycle_event": lifecycle_event,
         }
 
     try:
@@ -254,6 +274,17 @@ def consume_grant(
                 consumed_at=consumed_at,
             )
         )
+        # The consumed lifecycle event shares the use's moment and the same
+        # locked transaction, so the flip, use record, and audit event either
+        # all commit together or leave no trace.
+        lifecycle_event = grant_lifecycle_chain.append_lifecycle_event(
+            conn,
+            machine_id=machine_id,
+            grant_id=grant_id,
+            authorization_event_id=grant["event_id"],
+            type="consumed",
+            occurred_at=consumed_at,
+        )
         return {
             "status": "ok",
             "use": {
@@ -261,6 +292,7 @@ def consume_grant(
                 "use_id": use_id,
                 "consumed_at": consumed_at,
             },
+            "lifecycle_event": lifecycle_event,
         }
 
     try:
@@ -332,6 +364,17 @@ def revoke_grant(
             .where(_GRANT_TABLE.c.id == grant_id)
             .values(status="revoked", revoked_at=revoked_at)
         )
+        # The revoked lifecycle event shares the revocation moment and the
+        # same locked transaction as the state flip; a losing revocation
+        # writes neither the flip nor an audit event.
+        lifecycle_event = grant_lifecycle_chain.append_lifecycle_event(
+            conn,
+            machine_id=machine_id,
+            grant_id=grant_id,
+            authorization_event_id=grant["event_id"],
+            type="revoked",
+            occurred_at=revoked_at,
+        )
         return {
             "status": "ok",
             "revocation": {
@@ -339,6 +382,7 @@ def revoke_grant(
                 "revoked_at": revoked_at,
                 "status": "revoked",
             },
+            "lifecycle_event": lifecycle_event,
         }
 
     return _run_with_lock_retry(engine, _work)
