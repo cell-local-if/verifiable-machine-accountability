@@ -1,19 +1,23 @@
 """Tests for one-time, short-lived authorization grants.
 
-Two new write entries sit under the machine path:
+Three write entries sit under the machine path:
 
     POST /machines/{machine_id}/authorization-grants
     POST /machines/{machine_id}/authorization-grants/{grant_id}/consume
+    POST /machines/{machine_id}/authorization-grants/{grant_id}/revoke
 
 A grant turns one committed ``allowed_by_policy`` decision event whose
 immutable decision-basis snapshot passes the consistency audit into an
 ``active``, short-lived credential; it can be consumed exactly once, after
 which it is ``consumed``, and a grant past ``expires_at`` answers
-``grant_expired``. These tests cover the success shapes, every validation and
-lookup outcome, the unavailable/invalid-basis cases, exactly-once issue and
-consume under concurrency, expiry, atomicity (no half records), restart
-persistence, old-database table creation, and non-interference with the
-existing event and basis views.
+``grant_expired``. The revoke entry adds an emergency terminal transition to
+``revoked`` with a persisted ``revoked_at``; revocation and consumption race
+to one definite terminal winner. These tests cover the success shapes, every
+validation and lookup outcome, the unavailable/invalid-basis cases,
+exactly-once issue, consume, and revoke under concurrency (including revoke
+versus consume), expiry, atomicity (no half records), restart persistence,
+old-database table creation and column migration, and non-interference with
+the existing event and basis views.
 """
 import json
 import sqlite3
@@ -100,6 +104,12 @@ def issue(client, machine_id, event_id, ttl_seconds=60):
 def consume_url(machine_id, grant_id):
     return (
         f"/machines/{machine_id}/authorization-grants/{grant_id}/consume"
+    )
+
+
+def revoke_url(machine_id, grant_id):
+    return (
+        f"/machines/{machine_id}/authorization-grants/{grant_id}/revoke"
     )
 
 
@@ -806,3 +816,549 @@ def test_non_post_methods_are_not_routed(allowed_event, client):
         assert response.status_code == 405
         response = getattr(client, method)(consume_url(machine_id, grant["id"]))
         assert response.status_code == 405
+        response = getattr(client, method)(revoke_url(machine_id, grant["id"]))
+        assert response.status_code == 405
+    # The 405s neither read nor wrote the grant: it is still active and its
+    # single consumption still succeeds.
+    assert client.post(consume_url(machine_id, grant["id"])).status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Emergency revocation: success shape and persistence
+# --------------------------------------------------------------------------- #
+
+
+def test_revoke_success_shape(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+
+    before = datetime.now(timezone.utc)
+    response = client.post(revoke_url(machine_id, grant["id"]))
+    after = datetime.now(timezone.utc)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert list(body.keys()) == ["grant_id", "revoked_at", "status"]
+    assert body["grant_id"] == grant["id"]
+    assert body["status"] == "revoked"
+    revoked_at = _parse_z(body["revoked_at"])
+    assert body["revoked_at"].endswith("Z")
+    assert revoked_at.tzinfo == timezone.utc
+    assert before <= revoked_at <= after
+
+
+def test_revoke_persists_revoked_status_and_stamp(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    revocation = client.post(
+        revoke_url(machine_id, grant["id"])
+    ).json()
+
+    with client.app.state.engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT status, consumed_at, revoked_at, issued_at, "
+                "expires_at FROM authorization_grants WHERE id = :id"
+            ).bindparams(id=grant["id"])
+        ).one()
+        use_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM authorization_grant_uses "
+                "WHERE grant_id = :id"
+            ).bindparams(id=grant["id"])
+        ).scalar_one()
+    assert row.status == "revoked"
+    assert row.revoked_at == revocation["revoked_at"]
+    assert row.consumed_at is None
+    assert use_count == 0
+    # The immutable issue-time fields are exactly the issued values.
+    assert row.issued_at == grant["issued_at"]
+    assert row.expires_at == grant["expires_at"]
+
+
+def test_revoked_grant_survives_restart(tmp_path, monkeypatch):
+    db_url = f"sqlite:///{tmp_path / 'revoked.db'}"
+    monkeypatch.setenv("ACCOUNTABILITY_DATABASE_URL", db_url)
+
+    with TestClient(app) as first:
+        machine_id = create_machine(first)
+        declare(first, machine_id)
+        create_rule(first)
+        event = record_event(first, machine_id).json()
+        grant = issue(first, machine_id, event["id"], ttl_seconds=300).json()
+        revocation = first.post(
+            revoke_url(machine_id, grant["id"])
+        ).json()
+
+    with TestClient(app) as second:
+        repeat = second.post(revoke_url(machine_id, grant["id"]))
+        assert repeat.status_code == 409
+        assert repeat.json() == {"error": {"code": "grant_revoked"}}
+        consume = second.post(consume_url(machine_id, grant["id"]))
+        assert consume.status_code == 409
+        assert consume.json() == {"error": {"code": "grant_revoked"}}
+        with second.app.state.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT status, revoked_at FROM authorization_grants "
+                    "WHERE id = :id"
+                ).bindparams(id=grant["id"])
+            ).one()
+        assert row.status == "revoked"
+        assert row.revoked_at == revocation["revoked_at"]
+
+
+# --------------------------------------------------------------------------- #
+# Revoke query and body validation
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("send", [b"{}", b'{"x":1}', b"null", b"[]", b"text"])
+def test_revoke_with_body_is_invalid_query(allowed_event, client, send):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+
+    response = client.post(
+        revoke_url(machine_id, grant["id"]),
+        content=send,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
+@pytest.mark.parametrize("query", ["?x=1", "?=", "?foo"])
+def test_revoke_with_query_is_invalid_query_before_lookup(
+    allowed_event, client, query
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    missing_machine = "00000000-0000-0000-0000-000000000000"
+
+    response = client.post(revoke_url(machine_id, grant["id"]) + query)
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+    # Validation precedes the machine/grant lookup.
+    response = client.post(revoke_url(missing_machine, grant["id"]) + query)
+    assert response.status_code == 422
+
+
+def test_revoke_rejects_repeated_query_parameter(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    response = client.post(
+        revoke_url(machine_id, grant["id"]) + "?x=1&x=2"
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
+def test_revoke_empty_body_with_zero_length_is_accepted(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    response = client.request(
+        "POST", revoke_url(machine_id, grant["id"]), content=b""
+    )
+    assert response.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Revoke lookup outcomes
+# --------------------------------------------------------------------------- #
+
+
+def test_revoke_missing_machine_is_not_found(client, allowed_event):
+    _, event = allowed_event
+    missing_machine = "00000000-0000-0000-0000-000000000000"
+    response = client.post(revoke_url(missing_machine, "anything"))
+    assert response.status_code == 404
+    assert response.json() == {"error": {"code": "not_found"}}
+
+
+def test_revoke_missing_grant_is_not_found(allowed_event, client):
+    machine_id, _ = allowed_event
+    response = client.post(revoke_url(machine_id, "no-such-grant"))
+    assert response.status_code == 404
+    assert response.json() == {"error": {"code": "not_found"}}
+
+
+def test_revoke_grant_owned_by_another_machine_is_not_found(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    other = create_machine(client, external_id="machine-2")
+    grant = issue(client, machine_id, event["id"]).json()
+
+    response = client.post(revoke_url(other, grant["id"]))
+    assert response.status_code == 404
+    assert response.json() == {"error": {"code": "not_found"}}
+    # The grant is untouched and still revocable by its real owner.
+    assert client.post(revoke_url(machine_id, grant["id"])).status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Revoke conflict outcomes
+# --------------------------------------------------------------------------- #
+
+
+def test_consume_then_revoke_is_grant_consumed(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+
+    assert client.post(consume_url(machine_id, grant["id"])).status_code == 200
+    response = client.post(revoke_url(machine_id, grant["id"]))
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": "grant_consumed"}}
+
+    with client.app.state.engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT status, revoked_at FROM authorization_grants "
+                "WHERE id = :id"
+            ).bindparams(id=grant["id"])
+        ).one()
+    assert row.status == "consumed"
+    assert row.revoked_at is None
+
+
+def test_revoke_then_consume_is_grant_revoked(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+
+    assert client.post(revoke_url(machine_id, grant["id"])).status_code == 200
+    response = client.post(consume_url(machine_id, grant["id"]))
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": "grant_revoked"}}
+
+    with client.app.state.engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT status, consumed_at FROM authorization_grants "
+                "WHERE id = :id"
+            ).bindparams(id=grant["id"])
+        ).one()
+        use_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM authorization_grant_uses "
+                "WHERE grant_id = :id"
+            ).bindparams(id=grant["id"])
+        ).scalar_one()
+    assert row.status == "revoked"
+    assert row.consumed_at is None
+    assert use_count == 0
+
+
+def test_revoking_twice_returns_grant_revoked_once(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+
+    first = client.post(revoke_url(machine_id, grant["id"]))
+    second = client.post(revoke_url(machine_id, grant["id"]))
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json() == {"error": {"code": "grant_revoked"}}
+    # The first stamp is stable: the rejected revocation rewrote nothing.
+    with client.app.state.engine.connect() as conn:
+        stamp = conn.execute(
+            text("SELECT revoked_at FROM authorization_grants WHERE id = :id")
+            .bindparams(id=grant["id"])
+        ).scalar_one()
+    assert stamp == first.json()["revoked_at"]
+
+
+def test_expired_grant_revoke_is_grant_expired(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = _backdated_grant(client, machine_id, event["id"])
+
+    response = client.post(revoke_url(machine_id, grant["id"]))
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": "grant_expired"}}
+
+    # Nothing was written: the grant stays active (expiry is derived), with
+    # no revocation stamp and no use record.
+    with client.app.state.engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT status, revoked_at FROM authorization_grants "
+                "WHERE id = :id"
+            ).bindparams(id=grant["id"])
+        ).one()
+        use_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM authorization_grant_uses "
+                "WHERE grant_id = :id"
+            ).bindparams(id=grant["id"])
+        ).scalar_one()
+    assert row.status == "active"
+    assert row.revoked_at is None
+    assert use_count == 0
+
+
+def test_revoked_grant_keeps_answering_revoked_after_it_expires(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    revocation = client.post(revoke_url(machine_id, grant["id"])).json()
+
+    # Move expires_at into the past after the revocation.
+    past = (
+        datetime.now(timezone.utc) - timedelta(seconds=10)
+    ).isoformat().replace("+00:00", "Z")
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE authorization_grants SET expires_at = :at "
+                "WHERE id = :id"
+            ).bindparams(at=past, id=grant["id"])
+        )
+
+    repeat = client.post(revoke_url(machine_id, grant["id"]))
+    assert repeat.status_code == 409
+    assert repeat.json() == {"error": {"code": "grant_revoked"}}
+    consume = client.post(consume_url(machine_id, grant["id"]))
+    assert consume.status_code == 409
+    assert consume.json() == {"error": {"code": "grant_revoked"}}
+    with client.app.state.engine.connect() as conn:
+        stamp = conn.execute(
+            text("SELECT revoked_at FROM authorization_grants WHERE id = :id")
+            .bindparams(id=grant["id"])
+        ).scalar_one()
+    assert stamp == revocation["revoked_at"]
+
+
+# --------------------------------------------------------------------------- #
+# Revocation concurrency
+# --------------------------------------------------------------------------- #
+
+
+def test_concurrent_revokes_have_exactly_one_success(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    count = 20
+    gate = threading.Event()
+
+    def hit():
+        gate.wait()
+        return client.post(revoke_url(machine_id, grant["id"]))
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [pool.submit(hit) for _ in range(count)]
+        gate.set()
+        responses = [f.result() for f in futures]
+
+    statuses = sorted(r.status_code for r in responses)
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == count - 1
+    for response in responses:
+        if response.status_code == 409:
+            assert response.json() == {"error": {"code": "grant_revoked"}}
+    stamps = {
+        r.json()["revoked_at"] for r in responses if r.status_code == 200
+    }
+    assert len(stamps) == 1
+
+    with client.app.state.engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT status, revoked_at FROM authorization_grants "
+                "WHERE id = :id"
+            ).bindparams(id=grant["id"])
+        ).one()
+        use_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM authorization_grant_uses "
+                "WHERE grant_id = :id"
+            ).bindparams(id=grant["id"])
+        ).scalar_one()
+    assert row.status == "revoked"
+    assert row.revoked_at == stamps.pop()
+    assert use_count == 0
+
+
+def test_concurrent_revoke_and_consume_have_one_terminal_winner(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    gate = threading.Event()
+
+    def revoke_hit():
+        gate.wait()
+        return client.post(revoke_url(machine_id, grant["id"]))
+
+    def consume_hit():
+        gate.wait()
+        return client.post(consume_url(machine_id, grant["id"]))
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = (
+            [pool.submit(revoke_hit) for _ in range(10)]
+            + [pool.submit(consume_hit) for _ in range(10)]
+        )
+        gate.set()
+        responses = [f.result() for f in futures]
+
+    successes = [r for r in responses if r.status_code == 200]
+    assert len(successes) == 1
+    winner = successes[0]
+    conflict_codes = {
+        r.json()["error"]["code"]
+        for r in responses
+        if r.status_code == 409
+    }
+    assert len(conflict_codes) == 1
+
+    with client.app.state.engine.connect() as conn:
+        final_status = conn.execute(
+            text("SELECT status FROM authorization_grants WHERE id = :id")
+            .bindparams(id=grant["id"])
+        ).scalar_one()
+        use_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM authorization_grant_uses "
+                "WHERE grant_id = :id"
+            ).bindparams(id=grant["id"])
+        ).scalar_one()
+
+    if winner.json().get("status") == "revoked":
+        # Revocation committed first: every loser reports grant_revoked.
+        assert set(winner.json()) == {"grant_id", "revoked_at", "status"}
+        assert conflict_codes == {"grant_revoked"}
+        assert final_status == "revoked"
+        assert use_count == 0
+    else:
+        # Consumption committed first: every loser reports grant_consumed.
+        assert set(winner.json()) == {"grant_id", "use_id", "consumed_at"}
+        assert conflict_codes == {"grant_consumed"}
+        assert final_status == "consumed"
+        assert use_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Old-database column migration and non-interference
+# --------------------------------------------------------------------------- #
+
+
+def test_revoked_at_column_is_added_to_old_database(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy-column.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("ACCOUNTABILITY_DATABASE_URL", db_url)
+
+    with TestClient(app) as first:
+        machine_id = create_machine(first)
+        declare(first, machine_id)
+        create_rule(first)
+        consumed_event = record_event(first, machine_id, resource="res/c").json()
+        active_event = record_event(first, machine_id, resource="res/a").json()
+        consumed_grant = issue(
+            first, machine_id, consumed_event["id"]
+        ).json()
+        active_grant = issue(first, machine_id, active_event["id"]).json()
+        consumed_use = first.post(
+            consume_url(machine_id, consumed_grant["id"])
+        ).json()
+
+    # Reproduce a database created before the revocation feature: drop the
+    # column (SQLite >= 3.35 supports ALTER TABLE ... DROP COLUMN).
+    conn = sqlite3.connect(db_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(authorization_grants)")
+    }
+    assert "revoked_at" in columns
+    conn.execute(
+        "ALTER TABLE authorization_grants DROP COLUMN revoked_at"
+    )
+    conn.commit()
+    conn.close()
+
+    with TestClient(app) as second:
+        # Old values are preserved byte-for-byte and the use record survives.
+        with second.app.state.engine.connect() as db_conn:
+            old_consumed = db_conn.execute(
+                text(
+                    "SELECT issued_at, expires_at, status, consumed_at, "
+                    "revoked_at FROM authorization_grants WHERE id = :id"
+                ).bindparams(id=consumed_grant["id"])
+            ).one()
+            old_active = db_conn.execute(
+                text(
+                    "SELECT issued_at, expires_at, status, consumed_at, "
+                    "revoked_at FROM authorization_grants WHERE id = :id"
+                ).bindparams(id=active_grant["id"])
+            ).one()
+            use_row = db_conn.execute(
+                text(
+                    "SELECT id, consumed_at FROM authorization_grant_uses "
+                    "WHERE grant_id = :id"
+                ).bindparams(id=consumed_grant["id"])
+            ).one()
+        assert old_consumed.issued_at == consumed_grant["issued_at"]
+        assert old_consumed.expires_at == consumed_grant["expires_at"]
+        assert old_consumed.status == "consumed"
+        assert old_consumed.consumed_at == consumed_use["consumed_at"]
+        assert old_consumed.revoked_at is None
+        assert old_active.issued_at == active_grant["issued_at"]
+        assert old_active.expires_at == active_grant["expires_at"]
+        assert old_active.status == "active"
+        assert old_active.consumed_at is None
+        assert old_active.revoked_at is None
+        assert use_row.id == consumed_use["use_id"]
+        assert use_row.consumed_at == consumed_use["consumed_at"]
+
+        # The old consumed grant cannot be revoked; the old active one can.
+        blocked = second.post(
+            revoke_url(machine_id, consumed_grant["id"])
+        )
+        assert blocked.status_code == 409
+        assert blocked.json() == {"error": {"code": "grant_consumed"}}
+        revoked = second.post(revoke_url(machine_id, active_grant["id"]))
+        assert revoked.status_code == 200
+        assert revoked.json()["status"] == "revoked"
+
+
+def test_revoke_never_rewrites_event_basis_or_chains(allowed_event, client):
+    machine_id, event = allowed_event
+    basis_url = (
+        f"/machines/{machine_id}/authorization-decision-events/"
+        f"{event['id']}/decision-basis"
+    )
+    events_url = f"/machines/{machine_id}/authorization-decision-events"
+    basis_before = client.get(basis_url).content
+    events_before = client.get(events_url).content
+
+    grant = issue(client, machine_id, event["id"]).json()
+    assert client.post(revoke_url(machine_id, grant["id"])).status_code == 200
+
+    assert client.get(basis_url).content == basis_before
+    assert client.get(events_url).content == events_before
+    integrity = client.get(
+        f"/machines/{machine_id}/authorization-decision-events/integrity"
+    ).json()
+    assert integrity["valid"] is True
+
+
+def test_revocation_is_isolated_between_independent_grants(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client, resource_pattern="res/*", effect="allow", priority=0)
+    first_event = record_event(client, machine_id, resource="res/1").json()
+    second_event = record_event(client, machine_id, resource="res/2").json()
+    first_grant = issue(client, machine_id, first_event["id"]).json()
+    second_grant = issue(client, machine_id, second_event["id"]).json()
+
+    # Revoking one never revokes or consumes the other.
+    assert client.post(
+        revoke_url(machine_id, first_grant["id"])
+    ).status_code == 200
+    assert client.post(
+        consume_url(machine_id, second_grant["id"])
+    ).status_code == 200
+    assert client.post(
+        revoke_url(machine_id, second_grant["id"])
+    ).status_code == 409
+    assert client.post(
+        consume_url(machine_id, first_grant["id"])
+    ).status_code == 409

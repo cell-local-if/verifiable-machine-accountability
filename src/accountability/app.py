@@ -114,6 +114,7 @@ async def lifespan(app: FastAPI):
     machine_status_chain.migrate_schema(engine)
     machine_status_chain.backfill_chains(engine)
     diagnostics.migrate_schema(engine)
+    grants.migrate_schema(engine)
     # Finalize joint-write markers left by a crashed previous process from
     # the committed evidence, before serving any request.
     diagnostics.recover_pending(engine)
@@ -9631,6 +9632,12 @@ class AuthorizationGrantUseOut(BaseModel):
     consumed_at: str
 
 
+class AuthorizationGrantRevocationOut(BaseModel):
+    grant_id: str
+    revoked_at: str
+    status: str
+
+
 @app.post(
     "/machines/{machine_id}/authorization-grants",
     status_code=201,
@@ -9741,13 +9748,14 @@ async def consume_authorization_grant(
     machine is still 422. After validation a missing machine, a missing grant,
     or a grant owned by another machine is
     ``404 {"error":{"code":"not_found"}}``. Consuming an already-consumed
-    grant answers ``409 grant_consumed`` and a grant past its ``expires_at``
-    answers ``409 grant_expired``; neither writes anything. On success the
-    grant flips to ``consumed`` and its single use record is inserted in one
-    locked write transaction, so a concurrent consumption burst has exactly
-    one ``200`` success carrying ``{grant_id, use_id, consumed_at}``; the
-    state change and the use record commit together or leave no trace.
-    Grants are never revoked, renewed, or transferred.
+    grant answers ``409 grant_consumed``, consuming an emergency-revoked
+    grant answers ``409 grant_revoked``, and a grant past its ``expires_at``
+    answers ``409 grant_expired``; none of these writes anything. On success
+    the grant flips to ``consumed`` and its single use record is inserted in
+    one locked write transaction, so a concurrent consumption burst has
+    exactly one ``200`` success carrying ``{grant_id, use_id, consumed_at}``;
+    the state change and the use record commit together or leave no trace.
+    A revocation racing this consumption has one definite terminal winner.
     """
     if request.query_params:
         return error_response(422, "invalid_query")
@@ -9766,6 +9774,64 @@ async def consume_authorization_grant(
         return error_response(404, "not_found")
     if status == "grant_consumed":
         return error_response(409, "grant_consumed")
+    if status == "grant_revoked":
+        return error_response(409, "grant_revoked")
     if status == "grant_expired":
         return error_response(409, "grant_expired")
     return AuthorizationGrantUseOut(**result["use"])
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-grants/{grant_id}/revoke",
+    response_model=AuthorizationGrantRevocationOut,
+)
+async def revoke_authorization_grant(
+    machine_id: str, grant_id: str, request: Request
+):
+    """Emergency-revoke one unconsumed, unrevoked, unexpired grant.
+
+    The request accepts only an empty query string and an empty request body:
+    any query parameter, a repeated parameter, or any carried body (including
+    an empty JSON object) is
+    ``422 {"error":{"code":"invalid_query"}}`` validated before the machine or
+    grant is read, so the same malformed request against a non-existent
+    machine is still 422. After validation a missing machine, a missing grant,
+    or a grant owned by another machine is
+    ``404 {"error":{"code":"not_found"}}``. Revoking an already-consumed grant
+    answers ``409 grant_consumed``, revoking an already-revoked grant answers
+    ``409 grant_revoked``, and revoking a grant past its ``expires_at``
+    answers ``409 grant_expired``; none of these writes anything. On success
+    the grant flips to ``revoked`` and ``revoked_at`` is stamped in one locked
+    write transaction — the same lock the consume operation takes — so a
+    concurrent revocation burst has exactly one ``200`` success and a
+    revocation racing a consumption has one definite terminal winner: consume
+    first makes this call answer ``grant_consumed``; revoke first makes the
+    consumption answer ``grant_revoked``. The success body is
+    ``{grant_id, revoked_at, status}`` with ``status "revoked"`` and
+    ``revoked_at`` a UTC ``Z`` RFC 3339 instant. Revocation changes only the
+    grant's own status and stamp: it never modifies the decision event, the
+    immutable decision basis, any hash chain, evidence, incident, diagnostic,
+    or export, and adds no renewal, transfer, or deletion entry.
+    """
+    if request.query_params:
+        return error_response(422, "invalid_query")
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        return error_response(422, "invalid_query")
+
+    engine = request.app.state.engine
+    result = grants.revoke_grant(
+        engine, machine_id=machine_id, grant_id=grant_id
+    )
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "grant_consumed":
+        return error_response(409, "grant_consumed")
+    if status == "grant_revoked":
+        return error_response(409, "grant_revoked")
+    if status == "grant_expired":
+        return error_response(409, "grant_expired")
+    return AuthorizationGrantRevocationOut(**result["revocation"])

@@ -10,22 +10,31 @@ a short-lived credential that can be consumed exactly once:
   also inserts the grant, so a concurrent burst signing for the same event has
   exactly one winner — a database-level unique constraint on ``event_id`` is
   the final backstop. Grants never modify the event, the basis, or any chain.
-* :func:`consume_grant` atomically flips one unused, unexpired grant to
-  ``consumed`` and inserts its single use record in the same locked
+* :func:`consume_grant` atomically flips one unused, unexpired, unrevoked
+  grant to ``consumed`` and inserts its single use record in the same locked
   transaction, so a concurrent burst of consumptions has exactly one success;
-  already-consumed and expired grants are rejected and nothing is written.
+  already-consumed, revoked, and expired grants are rejected and nothing is
+  written.
+* :func:`revoke_grant` performs the emergency revocation: it atomically flips
+  one unused, unexpired, unrevoked grant to ``revoked`` and stamps
+  ``revoked_at`` in the same kind of locked transaction, so a concurrent burst
+  of revocations has exactly one winner and a revocation racing a consumption
+  has one definite terminal winner — consume first makes the revocation answer
+  ``grant_consumed``; revoke first makes the consumption answer
+  ``grant_revoked``.
 
-Grants and use records live in their own tables and are never revoked,
-renewed, or transferred. A failed attempt writes neither the grant state
-change nor a use record: the whole operation either commits together or
-leaves no trace.
+Grants and use records live in their own tables and are never renewed,
+transferred, or deleted. Revocation never touches the decision event, its
+immutable basis, any hash chain, evidence, incident, diagnostic, or export. A
+failed attempt writes neither the grant state change nor a use record: the
+whole operation either commits together or leaves no trace.
 """
 
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from . import decision_basis, decision_basis_integrity
@@ -40,6 +49,27 @@ from .db import (
 _EVENT_TABLE = AuthorizationDecisionEvent.__table__
 _GRANT_TABLE = AuthorizationGrant.__table__
 _USE_TABLE = AuthorizationGrantUse.__table__
+
+
+def migrate_schema(engine: Engine) -> None:
+    """Add the revocation column to databases created before the feature."""
+    inspector = inspect(engine)
+    if _GRANT_TABLE.name not in inspector.get_table_names():
+        # ``create_all`` builds a current-schema table; there is nothing to
+        # bring forward.
+        return
+    existing = {
+        column["name"]
+        for column in inspector.get_columns(_GRANT_TABLE.name)
+    }
+    if "revoked_at" not in existing:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"ALTER TABLE {_GRANT_TABLE.name} "
+                    "ADD COLUMN revoked_at VARCHAR"
+                )
+            )
 
 
 def _utc_iso(instant: datetime) -> str:
@@ -168,6 +198,7 @@ def consume_grant(
       under it (a grant owned by another machine is indistinguishable from a
       missing one);
     * ``grant_consumed`` — the grant was already consumed;
+    * ``grant_revoked`` — the grant was emergency-revoked;
     * ``grant_expired`` — the grant is past its ``expires_at``;
     * ``ok`` — with ``{grant_id, use_id, consumed_at}``.
 
@@ -191,8 +222,13 @@ def consume_grant(
             return {"status": "not_found"}
 
         grant = grant_row._mapping
+        # The two terminal states are checked before the derived expiry: a
+        # consumed or revoked grant keeps answering its own outcome even once
+        # its TTL has elapsed.
         if grant["status"] == "consumed":
             return {"status": "grant_consumed"}
+        if grant["status"] == "revoked":
+            return {"status": "grant_revoked"}
 
         now = datetime.now(timezone.utc)
         if now >= _parse_utc(grant["expires_at"]):
@@ -231,3 +267,78 @@ def consume_grant(
         return _run_with_lock_retry(engine, _work)
     except IntegrityError:
         return {"status": "grant_consumed"}
+
+
+def revoke_grant(
+    engine: Engine,
+    *,
+    machine_id: str,
+    grant_id: str,
+) -> dict[str, Any]:
+    """Emergency-revoke one unconsumed, unrevoked, unexpired grant.
+
+    The grant lookup, state checks, and the state flip with ``revoked_at``
+    run in one locked write transaction, the same lock
+    :func:`consume_grant` takes, so revocation and consumption have one
+    definite serial order. Returns a status dict:
+
+    * ``not_found`` — the path machine is missing or the grant does not exist
+      under it (a grant owned by another machine is indistinguishable from a
+      missing one);
+    * ``grant_consumed`` — the grant was already consumed;
+    * ``grant_revoked`` — the grant was already revoked;
+    * ``grant_expired`` — the grant is past its ``expires_at``;
+    * ``ok`` — with ``{grant_id, revoked_at, status: "revoked"}``.
+
+    A rejection writes nothing. Revocation never touches the use table, the
+    decision event, the basis, or any chain: only the grant's own
+    ``status`` / ``revoked_at`` change, and an old grant's ``issued_at``,
+    ``expires_at``, ``consumed_at`` are never rewritten.
+    """
+
+    def _work(conn) -> dict[str, Any]:
+        machine = conn.execute(
+            Machine.__table__.select().where(Machine.__table__.c.id == machine_id)
+        ).first()
+        if machine is None:
+            return {"status": "not_found"}
+        grant_row = conn.execute(
+            _GRANT_TABLE.select().where(
+                _GRANT_TABLE.c.id == grant_id,
+                _GRANT_TABLE.c.machine_id == machine_id,
+            )
+        ).first()
+        if grant_row is None:
+            return {"status": "not_found"}
+
+        grant = grant_row._mapping
+        if grant["status"] == "consumed":
+            return {"status": "grant_consumed"}
+        if grant["status"] == "revoked":
+            return {"status": "grant_revoked"}
+
+        now = datetime.now(timezone.utc)
+        if now >= _parse_utc(grant["expires_at"]):
+            # Expiry is derived from the immutable expires_at; an expired
+            # grant is never updated, renewed, or rewritten.
+            return {"status": "grant_expired"}
+
+        revoked_at = _utc_iso(now)
+        # The lock is the same one consume takes: a concurrent consumption or
+        # revocation that committed first is already visible in the status
+        # check above and cannot interleave with this flip.
+        conn.execute(
+            _GRANT_TABLE.update()
+            .where(_GRANT_TABLE.c.id == grant_id)
+            .values(status="revoked", revoked_at=revoked_at)
+        )
+        return {
+            "status": "ok",
+            "revocation": {
+                "grant_id": grant_id,
+                "revoked_at": revoked_at,
+                "status": "revoked",
+            },
+        }
+
+    return _run_with_lock_retry(engine, _work)
