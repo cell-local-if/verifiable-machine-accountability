@@ -808,12 +808,21 @@ def test_grants_for_different_events_are_independent(client):
     ).status_code == 409
 
 
-def test_non_post_methods_are_not_routed(allowed_event, client):
+def test_non_post_methods_are_not_routed_for_writes(allowed_event, client):
     machine_id, event = allowed_event
     grant = issue(client, machine_id, event["id"]).json()
-    for method in ("get", "put", "patch", "delete"):
+    # The collection POST (issue) and the per-grant POST entries (consume,
+    # revoke) accept only POST; the read-only GET audit listing lives on the
+    # collection path separately.
+    for method in ("put", "patch", "delete"):
         response = getattr(client, method)(grant_url(machine_id))
         assert response.status_code == 405
+        response = getattr(client, method)(consume_url(machine_id, grant["id"]))
+        assert response.status_code == 405
+        response = getattr(client, method)(revoke_url(machine_id, grant["id"]))
+        assert response.status_code == 405
+    # The two per-grant write entries reject GET/HEAD as well.
+    for method in ("get", "head"):
         response = getattr(client, method)(consume_url(machine_id, grant["id"]))
         assert response.status_code == 405
         response = getattr(client, method)(revoke_url(machine_id, grant["id"]))

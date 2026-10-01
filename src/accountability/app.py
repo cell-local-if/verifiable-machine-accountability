@@ -54,7 +54,9 @@ from .db import (
     AuthorizationDecisionEvent,
     AuthorizationDecisionEvidence,
     AuthorizationDecisionIncident,
+    AuthorizationGrant,
     AuthorizationGrantLifecycleEvent,
+    AuthorizationGrantUse,
     Base,
     BehaviorDeclaration,
     IncidentResponsibilityAssignment,
@@ -9838,6 +9840,307 @@ async def revoke_authorization_grant(
     if status == "grant_expired":
         return error_response(409, "grant_expired")
     return AuthorizationGrantRevocationOut(**result["revocation"])
+
+
+# --- read-only authorization grant audit listing ------------------------------
+
+
+_GRANT_LIST_DEFAULT_LIMIT = 50
+_GRANT_LIST_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+class AuthorizationGrantListParams(BaseModel):
+    limit: int
+    cursor: str | None = None
+
+
+def validate_authorization_grant_list_params(
+    request: Request,
+) -> AuthorizationGrantListParams:
+    """Validate the grant audit-list query before any machine or grant read.
+
+    Exactly two parameters are accepted: the optional ``limit`` and the
+    optional opaque ``cursor``; no other parameter names and no request body.
+    Every malformed request — a carried body, an unknown parameter name, a
+    repeated ``limit`` or ``cursor``, a ``limit`` that is missing-shaped,
+    fractional, boolean, non-decimal, or outside 1..100, or a ``cursor`` that
+    is empty or does not have the issued-cursor shape — is the single 422
+    ``invalid_query`` outcome, raised here before the machine or any grant is
+    read. ``limit`` omitted defaults to 50; ``cursor`` omitted starts the
+    listing at the beginning.
+    """
+    # A body on a GET is an unknown-shape request, rejected in the validation
+    # phase before any machine or grant is read. A present non-zero
+    # Content-Length, or a chunked request without one, means a body is being
+    # carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``limit=1&limit=2`` (and a repeated ``cursor``) rather than silently
+    # taking one occurrence.
+    if len(request.query_params.getlist("limit")) > 1:
+        raise QueryError("invalid_query")
+    if len(request.query_params.getlist("cursor")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_limit = request.query_params.get("limit")
+    if raw_limit is None:
+        limit = _GRANT_LIST_DEFAULT_LIMIT
+    else:
+        # Query parameters arrive as strings, so every value is text here; a
+        # boolean (``true``), fractional (``1.0``), blank, or otherwise
+        # non-decimal value never matches the integer shape. ``-?\d+`` also
+        # rejects surrounding whitespace and signs other than ``-``.
+        if not _INTEGER_QUERY_RE.fullmatch(raw_limit):
+            raise QueryError("invalid_query")
+        limit = int(raw_limit)
+        if not 1 <= limit <= 100:
+            raise QueryError("invalid_query")
+
+    cursor = request.query_params.get("cursor")
+    if cursor is not None:
+        # Opaque issued cursor: ``<issued_at RFC 3339 Z text>|<grant id>``.
+        # Issued stamps never contain ``|``, so exactly one separator is
+        # required; the stamp segment must be shaped like a stored UTC Z
+        # instant and the id segment must be non-empty. Resolving the pair
+        # against the path machine's stored grants happens in the handler.
+        parts = cursor.split("|")
+        if (
+            len(parts) != 2
+            or not _RFC3339_Z_DATETIME_RE.fullmatch(parts[0])
+            or not parts[1]
+        ):
+            raise QueryError("invalid_query")
+
+    return AuthorizationGrantListParams(limit=limit, cursor=cursor)
+
+
+def _grant_issued_instant(value: object) -> datetime:
+    """Parse a stored grant ``issued_at`` to its actual UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract; a
+    damaged value sorts after every parseable record instead of crashing the
+    read-only audit listing, and its stored text is still emitted verbatim.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _GRANT_LIST_FAR_FUTURE
+
+
+def _grant_expires_instant(value: object) -> datetime:
+    """Parse a stored grant ``expires_at`` tolerantly for derived expiry.
+
+    A value that no longer parses cannot be shown as expired (the expiry
+    instant is unknowable from the stored text), so it sorts as a far-future
+    instant and the non-terminal grant presents ``active``; the read-only
+    listing never crashes, rewrites, or repairs the stored stamp.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _GRANT_LIST_FAR_FUTURE
+
+
+def _grant_id_key(value: object) -> tuple[int, str]:
+    """Tie-break key for a stored grant id, tolerant of a damaged value."""
+    if isinstance(value, str):
+        return (0, value)
+    return (1, "")
+
+
+def authorization_grant_to_dict(
+    record: AuthorizationGrant,
+    use_by_grant: dict[str, AuthorizationGrantUse],
+    *,
+    now: datetime,
+) -> dict[str, object]:
+    """One stored grant as the fixed ten-field audit-list view.
+
+    The four lifecycle stamps (``issued_at``, ``expires_at``,
+    ``consumed_at``, ``revoked_at``) and the identifiers are emitted exactly
+    as stored; nothing is normalized or rewritten. ``status`` is derived at
+    read time: the terminal states ``consumed`` and ``revoked`` are kept from
+    storage even after the TTL elapses, and a non-terminal grant presents
+    ``expired`` once the current UTC instant reaches ``expires_at`` and
+    ``active`` before it — the derived status is never persisted. ``use_id``
+    and ``use_at`` carry the grant's unique consumption record, and are
+    ``null`` together when the grant was never consumed.
+    """
+    if record.status == "consumed" or record.status == "revoked":
+        # Terminal states are permanent: expiry never downgrades or rewrites
+        # them, and the listing mirrors stored state without a write-back.
+        status = record.status
+    elif now >= _grant_expires_instant(record.expires_at):
+        status = "expired"
+    else:
+        status = "active"
+
+    use = use_by_grant.get(record.id)
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "event_id": record.event_id,
+        "issued_at": record.issued_at,
+        "expires_at": record.expires_at,
+        "status": status,
+        "consumed_at": record.consumed_at,
+        "revoked_at": record.revoked_at,
+        "use_id": use.id if use is not None else None,
+        "use_at": use.consumed_at if use is not None else None,
+    }
+
+
+@app.get("/machines/{machine_id}/authorization-grants")
+def list_authorization_grants(
+    machine_id: str,
+    params: Annotated[
+        AuthorizationGrantListParams,
+        Depends(validate_authorization_grant_list_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only keyset-paginated audit listing of one machine's grants.
+
+    Only ``GET`` is routed, so non-GET methods (including ``HEAD``) return
+    ``405`` without reading grants, computing a page, or writing anything.
+    The caller submits only the path machine id, an optional ``limit`` (a
+    non-boolean integer from 1 to 100, defaulting to 50 when omitted), and an
+    optional opaque ``cursor`` returned by a previous page — no other
+    parameter names and no request body. A carried body, an unknown or
+    repeated parameter, a non-integer or out-of-range ``limit``, or a
+    malformed ``cursor`` is ``422 {"error":{"code":"invalid_query"}}`` raised
+    during validation before the machine or any grant is read; a well-shaped
+    cursor that names no stored ``(issued_at, id)`` position of the path
+    machine (including a position issued for another machine) is the same
+    ``invalid_query`` reported while the grants are read, so a parameter error
+    always takes priority over the machine lookup. A valid query against a
+    missing machine is ``404 {"error":{"code":"not_found"}}``.
+
+    On success the response carries exactly ``{items, next_cursor}`` in this
+    fixed key order. ``items`` contains only grants owned by the path machine,
+    and each item carries exactly the ten audit fields ``{id, machine_id,
+    event_id, issued_at, expires_at, status, consumed_at, revoked_at,
+    use_id, use_at}`` in this fixed order. The identifiers and the four
+    lifecycle stamps are emitted exactly as stored; no historical event is
+    fabricated and no stored value is normalized, repaired, or rewritten.
+    Items are ordered by the actual UTC instant of ``issued_at`` and then by
+    grant id ascending, so an exact-second stamp sorts before any
+    fractional-second stamp of the same second. ``status`` is derived without
+    a write-back: consumed and revoked grants keep their terminal status even
+    past their TTL, a non-terminal grant at or past ``expires_at`` presents
+    ``expired``, and one before it presents ``active``; the stored status of
+    an expired grant is never updated. ``use_id`` and ``use_at`` carry the
+    grant's unique consumption record (its UUID and consumption moment) and
+    are both ``null`` when it was never consumed.
+
+    The cursor is the exclusive position ``<issued_at original text>|<grant
+    id>`` pointing just after a page's last item, so a page returns only items
+    strictly after it and paging never repeats or omits an item; the position
+    resolves only inside the path machine's own grants and can never read
+    across machines. ``next_cursor`` is present only when another page follows
+    and is ``null`` on the last page and for an empty listing (including an
+    empty database or a machine with no grants). The endpoint is strictly
+    read-only: it never creates, repairs, updates, or deletes a grant, a use
+    record, a lifecycle event, or a chain hash, and issue, consume, revoke,
+    the lifecycle chain, authorization decisions, and every other view keep
+    their behavior. The body is compact UTF-8 JSON terminated by a single
+    newline, byte-identical on repeat calls against unchanged data, and
+    readable across application restarts. A failure while reading the grants,
+    the use records, or the machine returns 500 ``internal_error`` with no
+    partial page.
+    """
+    # Any failure while *reading* — the grant rows, the use rows, the ordering
+    # over them, the cursor position, or the machine lookup — is an internal
+    # read-layer fault: answer 500 internal_error with no partial page.
+    # Damaged stored values are not a read failure — rows read successfully
+    # are ordered and emitted verbatim, with an unparseable stamp sorting last
+    # — so the tolerant key functions and cursor matching stay inside the
+    # guard but only a true read/order fault reaches the except branch.
+    try:
+        rows = session.scalars(
+            select(AuthorizationGrant).where(
+                AuthorizationGrant.machine_id == machine_id
+            )
+        ).all()
+        ordered = sorted(
+            rows,
+            key=lambda record: (
+                _grant_issued_instant(record.issued_at),
+                _grant_id_key(record.id),
+            ),
+        )
+
+        start = 0
+        if params.cursor is not None:
+            cursor_issued_at, cursor_id = params.cursor.split("|")
+            # Exclusive keyset position, resolved strictly inside the path
+            # machine's own grants: a cursor this endpoint issued always names
+            # a stored row of that machine, so a pair no row matches (a
+            # foreign-machine cursor, drifted text, a fabricated value) cannot
+            # be positioned and is rejected as a malformed query before the
+            # machine lookup. Matching on stored text keeps the ordering
+            # byte-exact with the issued cursor.
+            positions = [
+                index
+                for index, record in enumerate(ordered)
+                if record.issued_at == cursor_issued_at and record.id == cursor_id
+            ]
+            if not positions:
+                return error_response(422, "invalid_query")
+            start = positions[0] + 1
+
+        use_rows = session.scalars(
+            select(AuthorizationGrantUse).where(
+                AuthorizationGrantUse.machine_id == machine_id
+            )
+        ).all()
+        use_by_grant = {use.grant_id: use for use in use_rows}
+
+        machine = session.get(Machine, machine_id)
+    except Exception:
+        return error_response(500, "internal_error")
+
+    if machine is None:
+        return error_response(404, "not_found")
+
+    remaining = ordered[start:]
+    page = remaining[: params.limit]
+    now = datetime.now(timezone.utc)
+    next_cursor = (
+        f"{page[-1].issued_at}|{page[-1].id}" if len(remaining) > len(page) else None
+    )
+
+    payload = {
+        "items": [
+            authorization_grant_to_dict(record, use_by_grant, now=now)
+            for record in page
+        ],
+        "next_cursor": next_cursor,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 # --- authorization grant lifecycle audit chain --------------------------------

@@ -2681,11 +2681,62 @@ renewal, transfer, or deletion entry. Revocation is reachable only via
 `POST`; other methods on the revoke path answer `405` without reading or
 writing the grant.
 
+### Read-only grant audit listing
+
+`GET /machines/{machine_id}/authorization-grants` returns the path machine's
+grants as a read-only audit listing, coexisting with the `POST` issue entry on
+the same path. It accepts only two query parameters:
+
+- `limit` — a non-boolean integer from `1` to `100`; omitted it defaults to
+  `50`. A fractional (e.g. `1.0`), boolean (`true`), non-decimal, blank, or
+  out-of-range value is `422 {"error":{"code":"invalid_query"}}`;
+- `cursor` — an opaque cursor returned as the previous page's `next_cursor`;
+  omitted the listing starts at the beginning. A value that is empty, has the
+  wrong shape, or is well-shaped but names no stored `(issued_at, id)`
+  position of the path machine (including a cursor issued for another
+  machine) is `422 {"error":{"code":"invalid_query"}}`.
+
+A carried request body, an unknown parameter, or a repeated `limit`/`cursor`
+is likewise `422 invalid_query`, and every query check completes before the
+machine or any grant is read — a malformed query against a non-existent
+machine is still `422` rather than `404`. After validation, a missing machine
+is `404 {"error":{"code":"not_found"}}`. Non-GET methods (including `HEAD`)
+answer `405` without reading grants.
+
+On success the body is exactly `{items, next_cursor}` in this fixed order.
+Each item carries exactly the ten fields
+`{id, machine_id, event_id, issued_at, expires_at, status, consumed_at,
+revoked_at, use_id, use_at}` in this fixed order: the identifiers and all
+four lifecycle stamps are emitted exactly as stored, with no normalization,
+repair, fabricated historical event, or write-back of any value. Items are
+ordered by the actual UTC instant of `issued_at` (an exact-second stamp sorts
+before any fractional-second stamp of the same second) and then by `id`
+ascending. `status` is derived at read time: a consumed or revoked grant
+keeps its terminal status even after its TTL elapses, a non-terminal grant at
+or past `expires_at` presents `expired`, and one before it presents `active`
+— the derived `expired` status is never persisted. `use_id` and `use_at`
+return the grant's unique consumption record (its UUID and consumption
+moment) and are both `null` when the grant was never consumed.
+
+The cursor is the exclusive `&lt;issued_at&gt;|&lt;grant id&gt;` position just
+after a page's last item, resolved strictly inside the path machine's own
+grants, so paging never repeats or omits an item and a cursor never reads
+across machines. `next_cursor` points to the start of the next page and is
+`null` on the last page and on an empty listing. The entry adds no schema, is
+byte-identical on repeat calls against unchanged data, and keeps its
+ordering, paging, and status results stable across application restarts. It
+is strictly read-only — it never creates, repairs, updates, or deletes a
+grant, a consumption record, a lifecycle event, or a chain hash — and issue,
+consume, revocation, the lifecycle chain and its `changes`/`integrity`
+queries, the authorization decisions and their bases, evidence, events,
+incidents, diagnostics, compliance and privacy exports, and health checks
+keep their original behavior.
+
 Grants and use records live in their own tables, persist across application
 restarts, and are strictly isolated by machine (another machine can never
 consume or revoke a grant it does not own, and such an attempt leaves the
 grant untouched for its real owner). There is no renewal, transfer, update,
-delete, or list entry, and a failure leaves neither a half-consumed /
+or delete entry, and a failure leaves neither a half-consumed /
 half-revoked grant nor a use record. On startup the two tables are created
 safely on databases that predate the grant feature
 (`Base.metadata.create_all`), and the grants table's `revoked_at` column is
