@@ -9840,6 +9840,182 @@ async def revoke_authorization_grant(
     return AuthorizationGrantRevocationOut(**result["revocation"])
 
 
+# --- read-only authorization grant audit listing ------------------------------
+
+
+class AuthorizationGrantListParams(BaseModel):
+    limit: int
+    cursor: str | None = None
+
+
+def validate_authorization_grant_list_params(
+    request: Request,
+) -> AuthorizationGrantListParams:
+    """Validate the read-only grant-list query before any lookup.
+
+    Exactly two parameters are accepted: the optional ``limit`` and the
+    optional ``cursor``; no business filter parameters and no request body.
+    ``limit`` must be a non-boolean integer in 1..100 and defaults to 50 when
+    omitted; a blank, fractional (``1.0``), boolean (``true``), non-decimal,
+    or out-of-range value is a 422 ``invalid_query``. ``cursor``, when
+    present, must be a non-empty opaque string shaped
+    ``<issued_at original text>|<grant id>`` as returned by a previous page;
+    an empty value, a missing separator, or an empty segment is a 422
+    ``invalid_query``. The timestamp segment is accepted verbatim as stored
+    text rather than parsed here: the split is on the LAST separator because
+    the segment is original stored text, while the id segment never contains
+    one; locating the named grant happens in the handler while the path
+    machine's grants are read, and a position that names no stored grant of
+    the path machine (including one built from another machine's grant) is a
+    422 ``invalid_query`` there. Any other parameter name, a repeated
+    ``limit`` or ``cursor``, or a request that carries a body is likewise a
+    422 ``invalid_query``. Every check in this dependency runs before the
+    machine or any grant is read.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or grant is read. A present non-zero Content-Length, or a
+    # chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``limit=1&limit=2`` (and a repeated ``cursor``) rather than silently
+    # taking one occurrence.
+    if len(request.query_params.getlist("limit")) > 1:
+        raise QueryError("invalid_query")
+    if len(request.query_params.getlist("cursor")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_limit = request.query_params.get("limit")
+    if raw_limit is None:
+        # Omitted limit defaults to 50; the parameter itself stays optional.
+        limit = 50
+    else:
+        # Query parameters arrive as strings, so a boolean can only appear
+        # as the text ``true``/``false``, which the decimal pattern rejects;
+        # fractional, signed-plus, blank, and non-decimal values fail too.
+        if not _INTEGER_QUERY_RE.fullmatch(raw_limit):
+            raise QueryError("invalid_query")
+        limit = int(raw_limit)
+        if not 1 <= limit <= 100:
+            raise QueryError("invalid_query")
+
+    cursor = request.query_params.get("cursor")
+    if cursor is not None:
+        # An empty value carries no separator and fails the shape check. The
+        # pair is resolved against the path machine's stored grants in the
+        # handler, so a position naming no stored grant is rejected there.
+        parts = cursor.rsplit("|", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise QueryError("invalid_query")
+
+    return AuthorizationGrantListParams(limit=limit, cursor=cursor)
+
+
+@app.get("/machines/{machine_id}/authorization-grants")
+def list_authorization_grants(
+    machine_id: str,
+    request: Request,
+    params: Annotated[
+        AuthorizationGrantListParams,
+        Depends(validate_authorization_grant_list_params),
+    ],
+):
+    """Read-only, keyset-paginated audit listing of one machine's grants.
+
+    Only ``GET`` is routed, so non-GET methods (including ``HEAD``) return
+    ``405`` without reading grants, computing a page, or writing anything.
+    The caller submits only the path machine id, an optional ``limit`` (a
+    non-boolean integer from 1 to 100, defaulting to 50 when omitted), and
+    an optional opaque ``cursor`` returned by a previous page — no business
+    filter parameters and no request body. A carried body, an unknown or
+    repeated parameter, a non-integer or out-of-range ``limit``, or a
+    malformed ``cursor`` is a 422 ``invalid_query`` rejected before the
+    machine or any grant is read; a well-shaped cursor that names no stored
+    ``(issued_at, id)`` position of the path machine — including a position
+    of another machine's grant — is a 422 ``invalid_query`` reported while
+    the grants are read, so a parameter error always takes priority over the
+    machine lookup. A valid query against a missing machine is a 404
+    ``not_found`` carrying no items.
+
+    On success the response carries exactly ``{items, next_cursor}`` in this
+    fixed key order. ``items`` contains only grants owned by the path
+    machine, ordered by the actual UTC instant of ``issued_at`` and then by
+    grant id ascending, and is an empty array when the machine has none.
+    Each item carries exactly the ten fields ``{id, machine_id, event_id,
+    issued_at, expires_at, status, consumed_at, revoked_at, use_id,
+    use_at}`` in this fixed order: the four stamps are emitted exactly as
+    stored and are never normalized or rewritten. ``status`` is one of
+    ``active``, ``consumed``, ``revoked``, or ``expired``: a consumed or
+    revoked grant keeps its terminal status even once its TTL has elapsed;
+    for any other grant the value is derived read-only from the immutable
+    ``expires_at`` against the current UTC instant — ``active`` before it
+    and ``expired`` once it is reached — and the stored status is never
+    updated. ``use_id``/``use_at`` name the grant's unique consumption
+    record (the record's UUID and consumption moment) and are both ``null``
+    when the grant was never consumed.
+
+    The cursor is the exclusive opaque position
+    ``<issued_at original text>|<grant id>`` pointing just after a page's
+    last grant, so a page returns only grants strictly after it: repeating
+    the same cursor against unchanged data returns the byte-identical next
+    page, and an already-returned grant never resurfaces. ``next_cursor``
+    points at the next page's first item when more grants follow and is
+    ``null`` on the last or an empty page; pagination never repeats or
+    misses a grant. The endpoint is strictly read-only and machine
+    isolated: it never creates, repairs, updates, or deletes a grant, a use
+    record, a lifecycle event, or a chain hash, it fabricates no historical
+    event for an old grant, and another machine's grants never enter the
+    page or a cursor. The body is compact UTF-8 JSON terminated by a single
+    newline, free of floating-point or non-finite values, byte-identical on
+    repeat calls against unchanged data, and readable across application
+    restarts. A failure while reading the grants returns 500
+    ``internal_error`` with no partial page.
+    """
+    try:
+        result = grants.list_grants(
+            request.app.state.engine,
+            machine_id=machine_id,
+            limit=params.limit,
+            cursor=params.cursor,
+        )
+    except SQLAlchemyError:
+        # Never emit a partial page when the grants cannot be read.
+        return error_response(500, "internal_error")
+
+    status = result["status"]
+    if status == "invalid_cursor":
+        # A well-shaped cursor that names no stored grant of the path
+        # machine is the same invalid-query outcome as a malformed cursor.
+        return error_response(422, "invalid_query")
+    if status == "not_found":
+        return error_response(404, "not_found")
+
+    payload = {
+        "items": result["items"],
+        "next_cursor": result["next_cursor"],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in the
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- authorization grant lifecycle audit chain --------------------------------
 
 

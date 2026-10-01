@@ -378,3 +378,193 @@ def revoke_grant(
         }
 
     return _run_with_lock_retry(engine, _work)
+
+
+# --------------------------------------------------------------------------- #
+# Read-only audit listing
+# --------------------------------------------------------------------------- #
+
+_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _issued_at_instant(value: object) -> datetime:
+    """Parse a stored ``issued_at`` to its actual UTC instant for ordering.
+
+    Legitimately written stamps always satisfy the RFC 3339 ``Z`` contract,
+    so parsing cannot fail for them; a damaged value that no longer parses
+    sorts after every parseable stamp (instead of crashing the read-only
+    audit), and locating the cursor on stored text keeps such a row pageable.
+    """
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            pass
+    return _FAR_FUTURE
+
+
+def _grant_id_key(value: object) -> tuple[int, str]:
+    """Tie-break key for a stored grant identifier.
+
+    Legitimately written ids are strings; a damaged non-string id never
+    crashes the ordering — it sorts after string ids within one instant, and
+    the stored value is still emitted verbatim.
+    """
+    if isinstance(value, str):
+        return (0, value)
+    return (1, "")
+
+
+def encode_grant_cursor(issued_at: str, grant_id: str) -> str:
+    """Encode the opaque keyset position ``<issued_at original text>|<id>``."""
+    return f"{issued_at}|{grant_id}"
+
+
+def _parse_utc_or_none(value: object) -> datetime | None:
+    """Parse a stored ``Z`` UTC stamp, or ``None`` when it no longer parses."""
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _grant_to_item(grant: Any, use: Any | None, now: datetime) -> dict[str, Any]:
+    """One stored grant as the fixed ten-field audit item.
+
+    The four stored stamps (``issued_at``, ``expires_at``, ``consumed_at``,
+    ``revoked_at``) are emitted exactly as stored. The two terminal states
+    are sticky: a consumed or revoked grant keeps that status even once its
+    TTL has elapsed. For any other grant the status is derived read-only from
+    the immutable ``expires_at`` — ``expired`` once the current UTC instant
+    reaches it, ``active`` before — and this derivation never rewrites the
+    stored status. A non-terminal grant whose ``expires_at`` no longer parses
+    cannot be shown to still be unexpired, so it answers ``expired``
+    fail-closed rather than crashing or fabricating an instant.
+    ``use_id``/``use_at`` name the grant's unique consumption record and are
+    both ``None`` when no such record exists.
+    """
+    stored_status = grant["status"]
+    if stored_status == "consumed":
+        status = "consumed"
+    elif stored_status == "revoked":
+        status = "revoked"
+    else:
+        expires_at = _parse_utc_or_none(grant["expires_at"])
+        # Expiry is derived from the immutable expires_at; an expired grant
+        # is never updated, renewed, or rewritten.
+        if expires_at is None or now >= expires_at:
+            status = "expired"
+        else:
+            status = "active"
+
+    use_id = use["id"] if use is not None else None
+    use_at = use["consumed_at"] if use is not None else None
+
+    return {
+        "id": grant["id"],
+        "machine_id": grant["machine_id"],
+        "event_id": grant["event_id"],
+        "issued_at": grant["issued_at"],
+        "expires_at": grant["expires_at"],
+        "status": status,
+        "consumed_at": grant["consumed_at"],
+        "revoked_at": grant["revoked_at"],
+        "use_id": use_id,
+        "use_at": use_at,
+    }
+
+
+def list_grants(
+    engine: Engine,
+    *,
+    machine_id: str,
+    limit: int,
+    cursor: str | None,
+) -> dict[str, Any]:
+    """Read one keyset page of one machine's grants without writing anything.
+
+    Issues only ``SELECT`` statements in a plain read transaction: it never
+    creates, repairs, updates, or deletes a grant, use record, lifecycle
+    event, or chain hash, and expiry is derived rather than persisted.
+    Returns a status dict:
+
+    * ``not_found`` — the path machine is missing;
+    * ``invalid_cursor`` — a well-shaped cursor whose ``(issued_at, id)``
+      position names no stored grant of the path machine (including a
+      position built from another machine's grant);
+    * ``ok`` — with ``items`` (the page, oldest ``issued_at`` first, id
+      ascending for a tie) and ``next_cursor`` (the opaque position pointing
+      at the next page's first item, or ``None`` on the last page).
+
+    The position is resolved while the path machine's grants are read,
+    before the machine existence check, so a parameter error always takes
+    priority over ``not_found``.
+    """
+    with engine.connect() as conn:
+        grant_rows = conn.execute(
+            _GRANT_TABLE.select().where(
+                _GRANT_TABLE.c.machine_id == machine_id
+            )
+        ).all()
+        use_rows = conn.execute(
+            _USE_TABLE.select().where(_USE_TABLE.c.machine_id == machine_id)
+        ).all()
+
+        ordered = sorted(
+            grant_rows,
+            key=lambda row: (
+                _issued_at_instant(row._mapping["issued_at"]),
+                _grant_id_key(row._mapping["id"]),
+            ),
+        )
+
+        start = 0
+        if cursor is not None:
+            cursor_issued_at, cursor_id = cursor.rsplit("|", 1)
+            # Exclusive keyset position. A cursor this endpoint issued always
+            # names a stored row, so locate it by its exact stored
+            # ``(issued_at text, id)`` pair; a well-shaped cursor that no row
+            # of the path machine matches (a deleted grant, another machine's
+            # position, drifted text) cannot be positioned and is rejected.
+            # The grant read is filtered by the path machine, so a cursor can
+            # never page into another machine's grants.
+            positions = [
+                index
+                for index, row in enumerate(ordered)
+                if row._mapping["issued_at"] == cursor_issued_at
+                and row._mapping["id"] == cursor_id
+            ]
+            if not positions:
+                return {"status": "invalid_cursor"}
+            start = positions[0] + 1
+
+        machine = conn.execute(
+            Machine.__table__.select().where(Machine.__table__.c.id == machine_id)
+        ).first()
+        if machine is None:
+            return {"status": "not_found"}
+
+        uses_by_grant = {
+            row._mapping["grant_id"]: row._mapping for row in use_rows
+        }
+
+        remaining = ordered[start:]
+        page = remaining[:limit]
+        now = datetime.now(timezone.utc)
+        items = [
+            _grant_to_item(
+                row._mapping, uses_by_grant.get(row._mapping["id"]), now
+            )
+            for row in page
+        ]
+        has_more = len(remaining) > len(page)
+        next_cursor = (
+            encode_grant_cursor(
+                page[-1]._mapping["issued_at"], page[-1]._mapping["id"]
+            )
+            if page and has_more
+            else None
+        )
+        return {"status": "ok", "items": items, "next_cursor": next_cursor}

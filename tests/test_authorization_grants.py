@@ -811,15 +811,19 @@ def test_grants_for_different_events_are_independent(client):
 def test_non_post_methods_are_not_routed(allowed_event, client):
     machine_id, event = allowed_event
     grant = issue(client, machine_id, event["id"]).json()
-    for method in ("get", "put", "patch", "delete"):
+    # The collection now also serves the read-only audit listing, so GET is a
+    # routed read rather than a 405; every other non-write method is still not
+    # routed on either the collection or the consume/revoke sub-paths.
+    assert client.get(grant_url(machine_id)).status_code == 200
+    for method in ("put", "patch", "delete"):
         response = getattr(client, method)(grant_url(machine_id))
         assert response.status_code == 405
         response = getattr(client, method)(consume_url(machine_id, grant["id"]))
         assert response.status_code == 405
         response = getattr(client, method)(revoke_url(machine_id, grant["id"]))
         assert response.status_code == 405
-    # The 405s neither read nor wrote the grant: it is still active and its
-    # single consumption still succeeds.
+    # The method probes neither read nor wrote the grant: it is still active
+    # and its single consumption still succeeds.
     assert client.post(consume_url(machine_id, grant["id"])).status_code == 200
 
 

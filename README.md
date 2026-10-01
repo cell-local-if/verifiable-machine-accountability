@@ -2685,9 +2685,10 @@ Grants and use records live in their own tables, persist across application
 restarts, and are strictly isolated by machine (another machine can never
 consume or revoke a grant it does not own, and such an attempt leaves the
 grant untouched for its real owner). There is no renewal, transfer, update,
-delete, or list entry, and a failure leaves neither a half-consumed /
-half-revoked grant nor a use record. On startup the two tables are created
-safely on databases that predate the grant feature
+or delete entry; the only collection entry beyond issue is the read-only
+audit listing described in the next section, and a failure leaves neither a
+half-consumed / half-revoked grant nor a use record. On startup the two
+tables are created safely on databases that predate the grant feature
 (`Base.metadata.create_all`), and the grants table's `revoked_at` column is
 added safely to a database created before the revocation feature while
 leaving every old grant's `issued_at`, `expires_at`, `status`, `consumed_at`,
@@ -2696,3 +2697,83 @@ and consume grants directly, and re-issuing, consuming, revoking, and reading
 events and their bases through the existing query entries observes the same
 stable results; the decision chain, decision bases, audits, diagnostics,
 compliance and privacy exports, and health-check semantics are unchanged.
+
+## Read-only authorization grant audit listing
+
+`GET /machines/{machine_id}/authorization-grants` is the read-only,
+keyset-paginated audit listing of one machine's grants — the read entry on
+the same collection as issue, sharing no code path with grant writes. It is
+strictly read-only: it never creates, repairs, updates, or deletes a grant,
+a consumption record, a lifecycle event, or a chain hash, it fabricates no
+historical lifecycle event for an old grant, and it changes no stored value,
+so grant issue, the consume/revoke uniqueness, the lifecycle chain, the
+lifecycle `changes` query, the authorization decision and its basis,
+evidence, incidents, diagnostics, compliance and privacy exports, and the
+health check keep their existing behavior. Only `GET` is routed on the
+collection for reads (`PUT`/`PATCH`/`DELETE` answer `405` without reading or
+writing anything).
+
+The caller submits only the path machine id and at most two query
+parameters — no business filter parameters and no request body — and every
+check completes before the machine or any grant is read:
+
+- `limit` — optional, a non-boolean integer from `1` to `100`, defaulting to
+  `50` when omitted. A blank, fractional (e.g. `1.0`), boolean
+  (`true`/`false`), non-decimal, or out-of-range value returns
+  `422 {"error":{"code":"invalid_query"}}`.
+- `cursor` — optional, an opaque string shaped
+  `<issued_at original text>|<grant id>` and returned by a previous page as
+  `next_cursor`; an empty value, a missing separator, or an empty segment is
+  `422 {"error":{"code":"invalid_query"}}`. The timestamp segment is original
+  stored text (the split is on the last separator), so a grant whose stored
+  `issued_at` no longer parses stays pageable. A well-shaped cursor whose
+  `(issued_at, grant id)` position names no stored grant of the path machine
+  — one built from another machine's grant, a deleted grant, or drifted text
+  — is rejected as `422 {"error":{"code":"invalid_query"}}` while the path
+  machine's grants are read, so a parameter error always takes priority over
+  the machine lookup; the read is filtered by the path machine, so a cursor
+  can never page across machines.
+- Any other query parameter, a repeated `limit` or `cursor`, or a request
+  carrying a body is likewise `422 {"error":{"code":"invalid_query"}}` in the
+  validation phase, answered without reading a machine or a grant (the same
+  malformed request against a non-existent machine is still 422).
+- A valid query against a machine that does not exist returns
+  `404 {"error":{"code":"not_found"}}` carrying no items.
+- A failure while reading the grants returns
+  `500 {"error":{"code":"internal_error"}}` with no partial page.
+
+The success body is exactly `{items, next_cursor}` in this fixed key order.
+`items` is an array (empty for a machine with no grants) containing only
+grants owned by the path machine, ordered by the actual UTC instant of
+`issued_at` and then by grant id ascending — so an exact-second grant sorts
+before any fractional-second grant of the same second; a stored `issued_at`
+that no longer parses keeps its text and deterministically sorts after every
+parseable instant. Each item carries exactly ten fields in this fixed order,
+with the four stamps emitted exactly as stored and never normalized:
+
+`{id, machine_id, event_id, issued_at, expires_at, status, consumed_at,
+revoked_at, use_id, use_at}`.
+
+`status` is one of `active`, `consumed`, `revoked`, or `expired`:
+
+- a grant whose stored state is `consumed` or `revoked` keeps that terminal
+  status even once its TTL has elapsed — expiry never overrides a terminal
+  state;
+- for any other grant the value is derived read-only from the immutable
+  `expires_at` against the current UTC instant: `active` while the instant
+  is earlier than `expires_at`, and `expired` once the instant reaches it.
+  Deriving `expired` never writes or rewrites the stored status.
+
+`use_id` and `use_at` name the grant's unique consumption record — the
+record's UUID and its consumption moment — and are both `null` when the
+grant was never consumed; `consumed_at` / `revoked_at` are the stored stamps
+(or `null`). The cursor is an exclusive position pointing just after a
+page's last grant, so a page returns only grants strictly after it and each
+page holds at most `limit` items. `next_cursor` carries the position of the
+next page's first item while grants follow and is `null` on the last or an
+empty page; repeating the same cursor against unchanged data returns the
+byte-identical next page, and walking the cursors returns every grant exactly
+once with no repeats and no omissions. The body is compact UTF-8 JSON
+terminated by a single newline, free of floating-point or non-finite values,
+byte-identical on repeat calls against unchanged data, and readable across
+application restarts.
