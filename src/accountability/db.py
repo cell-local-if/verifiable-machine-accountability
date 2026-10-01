@@ -459,6 +459,57 @@ class AuthorizationGrantUse(Base):
     consumed_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
+class AuthorizationGrantLifecycleEvent(Base):
+    """One immutable lifecycle audit event of one authorization grant.
+
+    Exactly one row is appended for every successful grant action — issue
+    (``issued``), the single consumption (``consumed``), or the one emergency
+    revocation (``revoked``) — inside the same locked write transaction that
+    performs the action, so the action and its audit event commit together or
+    leave no trace. A rejected attempt writes nothing, and a repeated
+    consumption or revocation has exactly one terminal winner, so at most one
+    terminal (``consumed``/``revoked``) event can ever exist per grant. Rows
+    are append-only: never updated, deleted, or recomputed afterwards.
+
+    ``occurred_at`` reuses the exact moment the successful response already
+    carries (``issued_at`` / ``consumed_at`` / ``revoked_at``); it is never
+    re-minted. Each row also carries a per-machine tamper-evident hash chain
+    (``previous_event_id``/``content_hash``/``chain_hash``) computed from the
+    six content columns, chained in (``occurred_at`` instant, ``id``) order
+    within one machine only. The table is created automatically at startup on
+    databases that predate the feature; historical grants are never rewritten
+    and no events are fabricated for them.
+    """
+
+    __tablename__ = "authorization_grant_lifecycle_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    grant_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_grants.id"),
+        nullable=False,
+        index=True,
+    )
+    authorization_event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        index=True,
+    )
+    # ``issued``, ``consumed``, or ``revoked``.
+    type: Mapped[str] = mapped_column(String, nullable=False)
+    occurred_at: Mapped[str] = mapped_column(String, nullable=False)
+    # Per-machine hash chain. Nullable so databases created before the chain
+    # columns keep working; the startup migration adds any missing columns
+    # and never rewrites existing rows.
+    previous_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
 class WriteTransactionDiagnostic(Base):
     """One read-only diagnostic record per joint-write transaction attempt.
 

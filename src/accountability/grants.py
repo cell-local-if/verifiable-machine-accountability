@@ -28,6 +28,12 @@ transferred, or deleted. Revocation never touches the decision event, its
 immutable basis, any hash chain, evidence, incident, diagnostic, or export. A
 failed attempt writes neither the grant state change nor a use record: the
 whole operation either commits together or leaves no trace.
+
+Every successful action also appends exactly one immutable lifecycle audit
+event (``issued`` / ``consumed`` / ``revoked``) to the machine's
+tamper-evident grant-lifecycle chain inside the same locked transaction
+(:mod:`.grant_lifecycle`), reusing the response's own moment as the event's
+``occurred_at``; a failed attempt appends no event.
 """
 
 import uuid
@@ -37,7 +43,7 @@ from typing import Any
 from sqlalchemy import Engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
-from . import decision_basis, decision_basis_integrity
+from . import decision_basis, decision_basis_integrity, grant_lifecycle
 from .chain import _run_with_lock_retry
 from .db import (
     AuthorizationDecisionEvent,
@@ -163,6 +169,16 @@ def issue_grant(
                 consumed_at=None,
             )
         )
+        # The audit event commits in the same locked transaction as the
+        # grant, reusing the response's issued_at as its occurred_at.
+        grant_lifecycle.append_event(
+            conn,
+            machine_id=machine_id,
+            grant_id=grant_id,
+            authorization_event_id=event_id,
+            type="issued",
+            occurred_at=issued_at,
+        )
         return {
             "status": "ok",
             "grant": {
@@ -254,6 +270,16 @@ def consume_grant(
                 consumed_at=consumed_at,
             )
         )
+        # The audit event commits in the same locked transaction as the state
+        # flip and the use record, reusing the response's consumed_at.
+        grant_lifecycle.append_event(
+            conn,
+            machine_id=machine_id,
+            grant_id=grant_id,
+            authorization_event_id=grant["event_id"],
+            type="consumed",
+            occurred_at=consumed_at,
+        )
         return {
             "status": "ok",
             "use": {
@@ -331,6 +357,16 @@ def revoke_grant(
             _GRANT_TABLE.update()
             .where(_GRANT_TABLE.c.id == grant_id)
             .values(status="revoked", revoked_at=revoked_at)
+        )
+        # The audit event commits in the same locked transaction as the state
+        # flip, reusing the response's revoked_at.
+        grant_lifecycle.append_event(
+            conn,
+            machine_id=machine_id,
+            grant_id=grant_id,
+            authorization_event_id=grant["event_id"],
+            type="revoked",
+            occurred_at=revoked_at,
         )
         return {
             "status": "ok",
