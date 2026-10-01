@@ -2747,3 +2747,77 @@ and consume grants directly, and re-issuing, consuming, revoking, and reading
 events and their bases through the existing query entries observes the same
 stable results; the decision chain, decision bases, audits, diagnostics,
 compliance and privacy exports, and health-check semantics are unchanged.
+
+### Read-only grant compliance export
+
+`GET /machines/{machine_id}/authorization-grants/compliance-export` returns
+the path machine's grants over an optional period as a read-only compliance
+slice, coexisting with the `POST` issue entry and the `GET` audit listing.
+Only `GET` is routed; every other method (including `HEAD`) answers `405`
+without reading grants, uses, lifecycle events, or chains. The query accepts
+only four parameters:
+
+- `start_at` / `end_at` — optional UTC RFC 3339 date-times ending in `Z`
+  (fractional seconds optional; offset forms, surrounding whitespace, and
+  non-`Z` suffixes are rejected). The period is the half-open UTC interval
+  `[start_at, end_at)`: a grant issued exactly at `start_at` is included and
+  one issued exactly at `end_at` is excluded. Each bound may be omitted
+  independently; omitting both covers every grant. A malformed, blank,
+  non-`Z`, or out-of-range value is
+  `422 {"error":{"code":"invalid_query"}}`, and when both bounds are present
+  `start_at` equal to or later than `end_at` is
+  `422 {"error":{"code":"invalid_range"}}`;
+- `limit` — a non-boolean integer from `1` to `100`; omitted it defaults to
+  `50`. A fractional (e.g. `1.0`), boolean (`true`), non-decimal, blank, or
+  out-of-range value is `422 invalid_query`;
+- `cursor` — an opaque cursor returned as a previous page's `next_cursor`;
+  omitted the export starts at the beginning of the period. An empty or
+  ill-shaped value, and a well-shaped value that names no stored
+  `(issued_at, id)` position of the path machine inside the requested
+  period (including a cursor issued for another machine or for a grant
+  outside the window), is `422 {"error":{"code":"invalid_cursor"}}`.
+
+A carried request body, an unknown parameter, or a repeated parameter is
+likewise `422 invalid_query`, and every query check completes before the
+machine or any grant, use, or lifecycle row is read — a malformed query
+against a non-existent machine is still `422` rather than `404`. After
+validation, a missing machine is `404 {"error":{"code":"not_found"}}`. A
+failure while reading or serializing answers
+`500 {"error":{"code":"internal_error"}}` with no partial result.
+
+On success the body is exactly
+`{machine_id, start_at, end_at, items, next_cursor, has_more}` in this fixed
+order, with the original bound text echoed back (`null` when a bound was
+omitted). `items` holds one entry per grant owned by the path machine whose
+actual `issued_at` UTC instant falls in the period, ordered by that instant
+(an exact-second stamp sorts before any fractional-second stamp of the same
+second) and then by grant `id` ascending. Each item carries the issue fields
+and stored stamps exactly as stored — `{id, machine_id, event_id,
+issued_at, expires_at, status, consumed_at, revoked_at}` — followed by four
+derived read-time state booleans, `active`, `expired`, `consumed`, and
+`revoked`: a stored `consumed`/`revoked` terminal state keeps its flag even
+after the TTL elapses, while a non-terminal grant presents `expired` at or
+past `expires_at` and `active` before it, with no write-back. `use` is the
+grant's unique consumption record (`{id, grant_id, machine_id, event_id,
+consumed_at}`) or `null`, and `lifecycle_events` lists the grant's
+issued / consumed / revoked lifecycle audit events in chain order, each
+carrying `{id, machine_id, grant_id, authorization_event_id, type,
+occurred_at, previous_event_id, content_hash, chain_hash}`.
+
+Damaged data is emitted exactly as stored and never repaired: an
+unparseable `issued_at` has no instant, never enters a bounded window, and
+sorts at the tail of an unbounded export; a missing associated use or
+lifecycle event is `null` or absent rather than fabricated; a contradictory
+stored status is surfaced, not corrected. The cursor is the exclusive
+`&lt;issued_at&gt;|&lt;grant id&gt;` position just after a page's last item,
+resolved strictly inside the path machine's windowed grant order, so paging
+never repeats or omits an item and never reads across machines;
+`next_cursor` is `null` and `has_more` is `false` on the last page and on an
+empty page. The entry adds no schema, is byte-identical on repeat calls
+against unchanged data, stays stable across application restarts, and is
+strictly read-only — it never creates, repairs, updates, revokes, or
+deletes a grant, use record, lifecycle event, authorization decision,
+decision basis, or chain hash, and it adds no renewal, transfer, or
+deletion; issue, consume, revoke, the listing, `changes`, integrity,
+decision, evidence, the other compliance and privacy exports, and the
+health check keep their original behavior.
