@@ -2638,10 +2638,12 @@ empty request body: any query parameter, repeated parameter, or carried body
 grant is read, so the same malformed request against a non-existent machine is
 still 422. After validation a missing machine, a missing grant, or a grant
 owned by another machine is `404 {"error":{"code":"not_found"}}`. Consuming an
-already-consumed grant answers `409 {"error":{"code":"grant_consumed"}}`; a
-grant whose current UTC instant is at or past its `expires_at` answers
+already-consumed grant answers `409 {"error":{"code":"grant_consumed"}}`;
+consuming an already-revoked grant answers
+`409 {"error":{"code":"grant_revoked"}}`; a grant whose current UTC instant is
+at or past its `expires_at` answers
 `409 {"error":{"code":"grant_expired"}}` (expiry is derived from the immutable
-stamp; an expired grant is never updated), and neither rejection writes
+stamp; an expired grant is never updated), and none of the rejections writes
 anything. On success the grant flips to `consumed` and one use record is
 inserted — carrying its own fresh UUID and the UTC consumption moment — inside
 the same locked write transaction, so a concurrent consumption burst has
@@ -2651,15 +2653,47 @@ the use record commit together or leave no trace, and a database-level unique
 constraint on the use record's `grant_id` makes a second consumption
 impossible.
 
+`POST /machines/{machine_id}/authorization-grants/{grant_id}/revoke`
+performs the one-way emergency revocation of one grant. It accepts only an
+empty query string and an empty request body: any query parameter, repeated
+parameter, or carried body (including an empty JSON object) is
+`422 {"error":{"code":"invalid_query"}}`, validated before the machine or
+grant is read, so the same malformed request against a non-existent machine is
+still 422. After validation a missing machine, a missing grant, or a grant
+owned by another machine is `404 {"error":{"code":"not_found"}}`. Only an
+unconsumed, unrevoked grant whose current UTC instant precedes `expires_at`
+can be revoked: revoking an already-consumed grant answers
+`409 {"error":{"code":"grant_consumed"}}` (consumption is the terminal
+winner), revoking an already-revoked grant answers
+`409 {"error":{"code":"grant_revoked"}}`, and revoking an expired grant
+answers `409 {"error":{"code":"grant_expired"}}`; no rejection writes state or
+a use record, and an expired grant is never rewritten. On success the grant
+flips to `revoked`, its `revoked_at` UTC moment (an RFC 3339 stamp ending in
+`Z`) is persisted in the same locked write transaction, and the response is
+exactly `{grant_id, revoked_at, status}` in this fixed order with
+`status` `"revoked"`. A concurrent revocation burst has exactly one `200`
+success, every other request answering `grant_revoked`. Revocation and
+consumption serialize on the same write lock, so a revoke racing a consume has
+exactly one terminal-state winner: when consumption commits first the later
+revoke answers `grant_consumed` and the single use record stands, and when
+revocation commits first the later consume answers `grant_revoked` and no use
+record exists. Revocation touches only the grant's own status columns; it
+never modifies the decision event, its immutable basis, any hash chain,
+evidence, incidents, diagnostics, or exports, and it creates no use record.
+
 Grants and use records live in their own tables, persist across application
 restarts, and are strictly isolated by machine (another machine can never
-consume a grant it does not own, and such an attempt leaves the grant
-consumable by its real owner). Grants cannot be revoked, renewed, or
-transferred; there is no update, delete, or list entry, and a failure leaves
-neither a half-consumed grant nor a use record. On startup the two tables are
-created safely on databases that predate the feature (`Base.metadata.create_all`),
-an empty database can issue and consume grants directly, and re-issuing,
-consuming, and reading events and their bases through the existing query
-entries observes the same stable results; the decision chain, decision bases,
-audits, diagnostics, compliance and privacy exports, and health-check
-semantics are unchanged.
+consume or revoke a grant it does not own, and such an attempt leaves the
+grant usable by its real owner). Grants cannot be renewed, transferred, or
+deleted; there is no update (other than the consume and revoke terminal
+transitions), delete, or list entry, and a failure leaves neither a
+half-consumed grant, a half-revoked grant, nor a use record. On startup the
+two tables are created safely on databases that predate the feature
+(`Base.metadata.create_all`) and the `revoked_at` column is added safely to
+databases created before emergency revocation, leaving every old grant's
+`issued_at`, `expires_at`, `status`, `consumed_at`, and its single use record
+exactly as they were; an empty database can issue and consume grants directly,
+and re-issuing, consuming, revoking, and reading events and their bases
+through the existing query entries observes the same stable results; the
+decision chain, decision bases, audits, diagnostics, compliance and privacy
+exports, and health-check semantics are unchanged.

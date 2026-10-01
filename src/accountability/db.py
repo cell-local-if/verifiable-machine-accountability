@@ -396,11 +396,13 @@ class AuthorizationGrant(Base):
     A grant is minted only for an existing decision event of the path machine
     that committed ``allowed = true`` with ``reason = "allowed_by_policy"`` and
     whose immutable decision-basis snapshot passes the read-only consistency
-    audit. Rows are never updated after issue except the one atomic transition
-    performed by the consume operation, and ``event_id`` is unique: at most one
-    grant can ever be signed per event, enforced by the database itself so a
-    concurrent burst of issue requests has exactly one winner. The table is
-    created automatically at startup on databases that predate the feature.
+    audit. Rows are never updated after issue except the one atomic terminal
+    transition performed by the consume or revoke operation, and
+    ``event_id`` is unique: at most one grant can ever be signed per event,
+    enforced by the database itself so a concurrent burst of issue requests
+    has exactly one winner. The table is created automatically at startup on
+    databases that predate the feature, and the ``revoked_at`` column is
+    added safely to databases created before emergency revocation.
     """
 
     __tablename__ = "authorization_grants"
@@ -417,11 +419,18 @@ class AuthorizationGrant(Base):
     )
     issued_at: Mapped[str] = mapped_column(String, nullable=False)
     expires_at: Mapped[str] = mapped_column(String, nullable=False)
-    # ``active`` after issue, then ``consumed`` exactly once. Grants are never
-    # revoked, renewed, or transferred; expiry is a derived state checked
-    # against ``expires_at`` and needs no column update.
+    # ``active`` after issue; exactly one terminal transition follows:
+    # ``consumed`` exactly once (with its single use record) or ``revoked``
+    # once by an emergency revocation. Grants are never renewed or
+    # transferred; expiry is a derived state checked against ``expires_at``
+    # and needs no column update.
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     consumed_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Set only by the one-way ``active`` -> ``revoked`` transition. Nullable
+    # so databases created before the revocation feature keep working; the
+    # startup migration adds the column and leaves every old grant's value
+    # null. Stays null on consumed and expired grants.
+    revoked_at: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class AuthorizationGrantUse(Base):
