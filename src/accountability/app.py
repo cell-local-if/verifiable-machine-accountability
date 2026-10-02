@@ -36,6 +36,7 @@ from . import (
     declaration_integrity,
     diagnostics,
     evidence_chain,
+    execution_receipts,
     grant_lifecycle,
     grants,
     incidents,
@@ -120,6 +121,7 @@ async def lifespan(app: FastAPI):
     diagnostics.migrate_schema(engine)
     grants.migrate_schema(engine)
     grant_lifecycle.migrate_schema(engine)
+    execution_receipts.migrate_schema(engine)
     # Finalize joint-write markers left by a crashed previous process from
     # the committed evidence, before serving any request.
     diagnostics.recover_pending(engine)
@@ -10475,6 +10477,218 @@ def get_authorization_grant_lifecycle_changes(
         "records": [grant_lifecycle_event_to_dict(record) for record in page],
         "next_cursor": next_cursor,
         "has_more": has_more,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
+# --- execution completion receipts --------------------------------------------
+
+
+class ExecutionReceiptOut(BaseModel):
+    id: str
+    machine_id: str
+    use_id: str
+    grant_id: str
+    authorization_event_id: str
+    occurred_at: str
+    previous_receipt_id: str | None
+    content_hash: str
+    chain_hash: str
+
+
+@app.post(
+    "/machines/{machine_id}/execution-receipts",
+    status_code=201,
+    response_model=ExecutionReceiptOut,
+)
+async def create_execution_receipt(machine_id: str, request: Request):
+    """Record the execution completion of one consumed authorization.
+
+    The request carries no query string and a JSON object body with exactly
+    five fields: ``use_id`` (a non-empty string naming a consumed grant use
+    of the path machine), ``action_type`` and ``resource`` (strings matching
+    the source decision event verbatim), ``outcome`` (``succeeded`` or
+    ``failed``), and ``result_digest`` (exactly 64 lowercase hexadecimal
+    characters). Validation runs before any machine, use, or event is read:
+
+    - any query parameter (or repeated parameter) is
+      ``422 {"error":{"code":"invalid_execution_receipt_request"}}``;
+    - a missing body, a body that is not a JSON object, a missing or extra
+      field, a non-string/empty ``use_id``, a non-string ``action_type`` or
+      ``resource``, an ``outcome`` other than ``succeeded``/``failed``, or a
+      ``result_digest`` that is not exactly 64 lowercase hexadecimal
+      characters is the same single ``invalid_execution_receipt_request``
+      outcome — even against a non-existent machine every format check still
+      precedes the lookups.
+
+    After validation a missing machine, a missing use, or a use owned by
+    another machine is ``404 {"error":{"code":"not_found"}}``. A source
+    decision event that is not a committed policy allow (``allowed = true``
+    with ``reason = "allowed_by_policy"``) is ``409
+    authorization_not_allowed``; an ``action_type``/``resource`` pair that
+    does not match the source event verbatim is ``409
+    execution_scope_mismatch``. Each use completes at most once: concurrent
+    requests for the same use have exactly one ``201`` success and every
+    other one ``409 receipt_already_exists``, enforced inside one locked
+    write transaction backed by a database-level unique constraint. The
+    success body is ``{id, machine_id, use_id, grant_id,
+    authorization_event_id, occurred_at, previous_receipt_id, content_hash,
+    chain_hash}``: the receipt identifiers and moment plus the per-machine
+    chain triple, with ``content_hash`` covering the receipt's ten content
+    fields and ``chain_hash`` chaining it to the machine's previous receipt
+    (empty previous on the first). The receipt and its chain link commit
+    atomically, and the write never modifies the use, the grant, the event,
+    or any other accountability record.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_execution_receipt_request")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_execution_receipt_request")
+    if not isinstance(payload, dict) or set(payload) != {
+        "use_id",
+        "action_type",
+        "resource",
+        "outcome",
+        "result_digest",
+    }:
+        return error_response(422, "invalid_execution_receipt_request")
+
+    raw_use_id = payload["use_id"]
+    action_type = payload["action_type"]
+    resource = payload["resource"]
+    outcome = payload["outcome"]
+    result_digest = payload["result_digest"]
+    # The use id follows the other path-scoped identifiers: a non-string or
+    # blank-after-trim value is an illegal body, not a looked-up object. The
+    # action and resource are compared verbatim against the source event, so
+    # they are type-checked here but never trimmed or normalized; a value the
+    # event does not carry is a scope mismatch, not a format error.
+    if isinstance(raw_use_id, bool) or not isinstance(raw_use_id, str):
+        return error_response(422, "invalid_execution_receipt_request")
+    use_id = raw_use_id.strip()
+    if not use_id:
+        return error_response(422, "invalid_execution_receipt_request")
+    for value in (action_type, resource):
+        if isinstance(value, bool) or not isinstance(value, str):
+            return error_response(422, "invalid_execution_receipt_request")
+    if outcome not in ("succeeded", "failed"):
+        return error_response(422, "invalid_execution_receipt_request")
+    if not isinstance(result_digest, str) or (
+        not execution_receipts.RESULT_DIGEST_RE.fullmatch(result_digest)
+    ):
+        return error_response(422, "invalid_execution_receipt_request")
+
+    engine = request.app.state.engine
+    result = execution_receipts.create_receipt(
+        engine,
+        machine_id=machine_id,
+        use_id=use_id,
+        action_type=action_type,
+        resource=resource,
+        outcome=outcome,
+        result_digest=result_digest,
+    )
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "authorization_not_allowed":
+        return error_response(409, "authorization_not_allowed")
+    if status == "execution_scope_mismatch":
+        return error_response(409, "execution_scope_mismatch")
+    if status == "receipt_already_exists":
+        return error_response(409, "receipt_already_exists")
+    return ExecutionReceiptOut(**result["receipt"])
+
+
+def validate_execution_receipt_integrity_params(request: Request) -> None:
+    """Validate the execution-receipt integrity query before any lookup.
+
+    The integrity check is keyed on the path machine alone and accepts no
+    business filter parameters and no request body; any parameter name or a
+    carried body is a 422 ``invalid_execution_receipt_request``. The check
+    runs before the machine is looked up and issues no database access, so an
+    extra parameter or a body against a non-existent machine still reports
+    422 rather than 404 and no receipt is read.
+    """
+    # A present non-zero Content-Length, or a chunked request without one,
+    # means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_execution_receipt_request")
+    if request.query_params:
+        raise QueryError("invalid_execution_receipt_request")
+
+
+@app.get("/machines/{machine_id}/execution-receipts/integrity")
+def check_execution_receipt_integrity(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_execution_receipt_integrity_params)],
+    session: SessionDep,
+):
+    """Read-only verification of one machine's execution-receipt hash chain.
+
+    The caller submits only the path machine id — no business filter
+    parameters and no request body; any query parameter or carried body is a
+    422 ``invalid_execution_receipt_request`` raised during validation before
+    the machine is looked up and before any receipt is read. A missing
+    machine is a 404 ``not_found`` carrying no integrity conclusion. Only
+    ``GET`` is routed; ``HEAD`` and every other method return 405 without
+    reading receipts, computing a chain conclusion, or writing anything. A
+    failure while reading the records is a 500 ``internal_error`` with no
+    partial conclusion.
+
+    On success the response carries exactly ``{valid, checked_count,
+    broken_receipt_id, anomaly}`` in this fixed field order. An empty or
+    fully sound chain reports ``true``, the machine's total receipt count
+    (``0`` when empty), ``null``, and ``null``; otherwise ``false``, the
+    total count, the first broken record — in (occurred-at instant, id)
+    order, an exact-second record before any fractional-second record of the
+    same second, with an unparseable moment sorting last — and the anomaly
+    category: ``timestamp_unparseable`` (the occurrence moment no longer
+    parses), ``chain_break`` (the previous-receipt link or chain digest does
+    not verify), ``ownership_mismatch`` (the referenced use or source event
+    belongs to another machine), ``use_mismatch`` (the use is missing or
+    names a different grant or decision event), ``scope_mismatch`` (the
+    receipt's action or resource differs from the source event), or
+    ``digest_mismatch`` (the stored content digest does not recompute from
+    the record's own fields, or the stored result digest is malformed). Only
+    the path machine's records are examined, so another machine's damaged
+    records never change this conclusion, and the query never writes,
+    repairs, recomputes, or deletes, so repeated calls and restarts return
+    stable results. The body is compact UTF-8 JSON terminated by a single
+    newline and contains no floating-point or non-finite value.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        valid, checked_count, broken_receipt_id, anomaly = (
+            execution_receipts.verify_machine_chain(session, machine_id)
+        )
+    except SQLAlchemyError:
+        # Never emit a partial conclusion when the records cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "valid": valid,
+        "checked_count": checked_count,
+        "broken_receipt_id": broken_receipt_id,
+        "anomaly": anomaly,
     }
     # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
     # fixed field order, terminated by a single newline, and free of any
