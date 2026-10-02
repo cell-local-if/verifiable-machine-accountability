@@ -23,6 +23,13 @@ result and to the per-machine tamper-evident receipt chain.
   ``scope_mismatch``, or ``digest_mismatch`` — and damaged stored values are
   reported, never crashed on, repaired, rewritten, or recomputed for
   storage.
+* :func:`coverage_report` is a strictly read-only use-to-receipt coverage
+  report for one machine: every consumed use is matched against the
+  machine's receipts by ``use_id`` alone, reporting both the consumed uses
+  that carry no receipt and the receipts whose ``use_id`` is not one of the
+  machine's consumptions. It never rebuilds, backfills, repairs, or mutates
+  a use, a receipt, or any chain; chain, scope, and digest soundness stay
+  the separate concern of :func:`verify_machine_receipts`.
 
 Each machine's receipts form an ordered chain following the same rules as
 the other per-machine chains:
@@ -577,4 +584,110 @@ def _anomaly(
         "checked_count": checked_count,
         "broken_receipt_id": broken_receipt_id,
         "anomaly": anomaly,
+    }
+
+
+def _consumed_at_instant(value: object) -> datetime:
+    """Parse a stored use ``consumed_at`` to its actual UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract,
+    so parsing cannot fail for them; a damaged value that no longer parses
+    sorts after every parseable record instead of crashing the read-only
+    report — it is reported, never repaired or rewritten.
+    """
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            pass
+    return _FAR_FUTURE
+
+
+def _use_id_key(value: object) -> tuple[int, str]:
+    """Tie-break key for a stored use id, tolerant of a damaged value."""
+    if isinstance(value, str):
+        return (0, value)
+    return (1, "")
+
+
+def coverage_report(session, machine_id: str) -> dict[str, Any]:
+    """Read-only use-to-receipt coverage report for one machine.
+
+    Reads only the path machine's consumption records (rows of
+    ``authorization_grant_uses`` owned by the machine) and its receipts
+    (rows of ``execution_receipts`` owned by the machine), then matches the
+    two sets by ``use_id`` one to one — nothing about the chain, the
+    authorization scope, or any content digest is adjudicated here; those
+    stay the independent concern of :func:`verify_machine_receipts`.
+
+    Returns a dict with, in this fixed order: ``consumed_count`` (the total
+    number of the machine's consumption records), ``receipt_count`` (the
+    total number of the machine's receipts), ``covered_count`` (the number
+    of consumed uses whose id is named by one of the machine's receipts),
+    ``missing_count``/``missing_use_ids`` (consumed uses with no receipt —
+    ordered by the actual UTC instant of ``consumed_at`` and then by id, a
+    stamp that no longer parses sorting last), and
+    ``orphan_count``/``orphan_receipt_ids`` (the machine's receipts whose
+    ``use_id`` is not one of the machine's consumption record ids — ordered
+    by the actual UTC instant of ``occurred_at`` and then by receipt id,
+    again with an unparseable stamp last). Every list is always present,
+    even when empty, and counts are plain integers.
+
+    Matching is by set membership over stored ids, so it never depends on
+    receipt chain order or soundness: a chain-damaged receipt that still
+    names one of the machine's consumed uses covers it, and another
+    machine's uses or receipts never enter either set. The report is
+    strictly read-only: it never creates, rebuilds, backfills, updates,
+    deletes, repairs, recomputes, or normalizes a use, a receipt, or any
+    chain, so a later legitimate receipt simply improves the next report.
+    """
+    use_rows = list(
+        session.execute(
+            _USE_TABLE.select().where(_USE_TABLE.c.machine_id == machine_id)
+        )
+    )
+    receipt_rows = list(
+        session.execute(
+            _TABLE.select().where(_TABLE.c.machine_id == machine_id)
+        )
+    )
+
+    consumed_count = len(use_rows)
+    receipt_count = len(receipt_rows)
+
+    # The machine's consumption set is defined by stored use id; a damaged
+    # non-string id still occupies a set slot (membership only), and the
+    # same value below reads it verbatim for ordering and output.
+    use_ids = {row._mapping["id"] for row in use_rows}
+    receipt_use_ids = {row._mapping["use_id"] for row in receipt_rows}
+
+    covered_count = sum(1 for use_id in use_ids if use_id in receipt_use_ids)
+
+    missing_rows = sorted(
+        (row for row in use_rows if row._mapping["id"] not in receipt_use_ids),
+        key=lambda row: (
+            _consumed_at_instant(row._mapping["consumed_at"]),
+            _use_id_key(row._mapping["id"]),
+        ),
+    )
+    orphan_rows = sorted(
+        (row for row in receipt_rows if row._mapping["use_id"] not in use_ids),
+        key=lambda row: (
+            occurred_at_instant(row._mapping["occurred_at"]),
+            _receipt_id_key(row._mapping["id"]),
+        ),
+    )
+
+    missing_use_ids = [row._mapping["id"] for row in missing_rows]
+    orphan_receipt_ids = [row._mapping["id"] for row in orphan_rows]
+
+    return {
+        "consumed_count": consumed_count,
+        "receipt_count": receipt_count,
+        "covered_count": covered_count,
+        "missing_count": len(missing_use_ids),
+        "missing_use_ids": missing_use_ids,
+        "orphan_count": len(orphan_receipt_ids),
+        "orphan_receipt_ids": orphan_receipt_ids,
+        "valid": not missing_use_ids and not orphan_receipt_ids,
     }

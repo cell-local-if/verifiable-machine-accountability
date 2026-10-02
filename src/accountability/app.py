@@ -10715,6 +10715,103 @@ def check_execution_receipts_integrity(
     return Response(content=body, media_type="application/json")
 
 
+def validate_execution_receipt_coverage_params(request: Request) -> None:
+    """Validate the receipt-coverage query before any machine lookup.
+
+    The coverage report is keyed on the path machine alone and accepts no
+    query parameters or request body; either is a 422 ``invalid_query``
+    raised before the machine is looked up and before any consumption or
+    receipt is read, so the same malformed request against a non-existent
+    machine is still 422.
+    """
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/execution-receipts/coverage")
+def check_execution_receipts_coverage(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_execution_receipt_coverage_params)],
+    session: SessionDep,
+):
+    """Read-only use-to-receipt coverage report for one machine.
+
+    The caller submits only the path machine id — no query parameters and
+    no request body; any query parameter (including a repeated name) or a
+    carried body is ``422 invalid_query`` during validation, before either
+    the machine or any consumption or receipt record is read, so the same
+    malformed request against a non-existent machine is still 422. After
+    validation a missing machine is a 404 ``not_found`` carrying no report.
+    Only ``GET`` is routed; ``HEAD`` and every other method return ``405``
+    without reading consumption or receipt records or writing anything. A
+    real failure while reading the consumptions or receipts is a 500
+    ``internal_error`` with no partial report.
+
+    On success the body carries exactly ``{machine_id, consumed_count,
+    receipt_count, covered_count, missing_count, missing_use_ids,
+    orphan_count, orphan_receipt_ids, valid}`` in this fixed order:
+    ``machine_id`` echoes the path value, ``consumed_count`` is the total
+    number of the machine's authorization-grant consumption records,
+    ``receipt_count`` the total number of its execution receipts, and
+    ``covered_count`` the number of consumed uses whose id is matched by one
+    of the machine's receipts on ``use_id`` alone. ``missing_count`` and
+    ``missing_use_ids`` report the consumed uses that carry no receipt; the
+    ids are ordered by the actual UTC instant of ``consumed_at`` and then by
+    id ascending, with a stamp that no longer parses sorting last.
+    ``orphan_count`` and ``orphan_receipt_ids`` report the machine's
+    receipts whose ``use_id`` is not one of the machine's consumption
+    records; those ids are ordered the same way by ``occurred_at`` and then
+    by receipt id, again with an unparseable stamp last. Both lists are
+    present even when empty, every count is a JSON integer, and ``valid`` is
+    true exactly when both counts are zero — so an empty machine and a
+    machine with exactly one receipt per consumed use and no orphan receipt
+    both report ``true``.
+
+    Coverage only checks the one-to-one ``use_id`` correspondence: chain
+    breaks, authorization-scope errors, and digest errors remain the
+    independent verdict of the integrity entry and never change this
+    result. Only the path machine's consumptions and receipts are read, so
+    another machine's records never affect the conclusion; the report never
+    rebuilds, backfills, updates, deletes, repairs, recomputes, or
+    normalizes a use, a receipt, or any chain — a gap is reported, not
+    filled, and a later legitimate receipt simply improves the next report.
+    The body is compact UTF-8 JSON terminated by a single newline and
+    contains no floating-point, ``-0.0``, or non-finite value.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        report = execution_receipts.coverage_report(session, machine_id)
+    except SQLAlchemyError:
+        # Never emit a partial report when the records cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": machine_id,
+        "consumed_count": report["consumed_count"],
+        "receipt_count": report["receipt_count"],
+        "covered_count": report["covered_count"],
+        "missing_count": report["missing_count"],
+        "missing_use_ids": report["missing_use_ids"],
+        "orphan_count": report["orphan_count"],
+        "orphan_receipt_ids": report["orphan_receipt_ids"],
+        "valid": report["valid"],
+    }
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- read-only stable incremental execution-receipt query -------------------
 
 
