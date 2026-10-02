@@ -2889,3 +2889,55 @@ revocation, the grant audit listing, the lifecycle chain and its queries,
 the authorization decisions and their bases, evidence, incidents,
 diagnostics, compliance and privacy exports, and the health check are
 unchanged.
+
+### Read-only receipt compliance window export
+
+`GET /machines/{machine_id}/execution-receipts/compliance-export` returns a
+deterministic, read-only slice of one machine's execution-completion
+receipts over a closed UTC execution-time window. It is a separate audit
+entry point under the machine execution-receipt path: receipt registration,
+the integrity audit, the coverage report, and the incremental `changes`
+query are unchanged, this endpoint never writes, backfills, or repairs a
+receipt, a use, a grant, an event, or any chain, and it adds no on-disk
+format, so old and empty databases work unchanged. Only `GET` is routed
+(other methods, including `HEAD`, return `405` without reading or
+filtering receipts or writing anything). Both query parameters are
+required and every check runs before the machine is looked up, so a
+parameter error against a non-existent machine is still `422`:
+
+- `from_occurred_at`, `to_occurred_at` — UTC RFC 3339 date-times ending in
+  `Z` (fractional seconds optional; offset forms such as `+00:00`,
+  surrounding whitespace, and out-of-range calendar/time values are
+  rejected); `from_occurred_at` must not be later than `to_occurred_at`
+  (equal bounds are allowed). A missing, blank, malformed, or inverted
+  bound returns `422 {"error":{"code":"bad_time"}}`.
+- An unknown parameter, a repeated `from_occurred_at`/`to_occurred_at`, or
+  a request body returns `422 {"error":{"code":"invalid_query"}}`.
+
+After validation, a missing machine returns
+`404 {"error":{"code":"not_found"}}`; a real read failure returns
+`500 {"error":{"code":"internal_error"}}` with no partial records.
+
+The response is `{machine_id, from_occurred_at, to_occurred_at,
+execution_receipts}` in this fixed key order; the machine id and the
+original bound text are echoed verbatim, and `execution_receipts` is an
+empty array (never omitted) for an empty window, a machine with no
+receipts, or an empty database. The array contains only the path machine's
+receipts whose own `occurred_at` actual UTC instant falls inside the
+closed interval `[from_occurred_at, to_occurred_at]` (both edges
+included), each carrying the complete fields in the same fixed order as
+the execution-receipts `changes` query — the ten content fields `{id,
+machine_id, use_id, grant_id, authorization_event_id, action_type,
+resource, outcome, result_digest, occurred_at}` exactly as stored,
+followed by `previous_receipt_id`, `content_hash`, and `chain_hash` —
+ordered by the actual UTC instant of `occurred_at` and then by receipt id,
+so an exact-second record sorts before any fractional-second record of the
+same second. A stored `occurred_at` that no longer parses has no actual
+UTC instant, so it never enters a finite window; its original value is
+kept verbatim and is not repaired, recomputed, or deleted. Damaged,
+missing, misowned, or duplicated field values inside in-window records are
+kept exactly as stored, never filtered, normalized, or re-adjudicated, and
+another machine's receipts never appear. The export adds no persistence
+surface, repeats byte-identically against unchanged data, reads across
+restarts, and its body is compact UTF-8 JSON terminated by a single
+newline with no floating-point, `-0.0`, or non-finite value.
