@@ -10715,6 +10715,101 @@ def check_execution_receipts_integrity(
     return Response(content=body, media_type="application/json")
 
 
+# --- read-only execution-receipt coverage -----------------------------------
+
+
+def validate_execution_receipt_coverage_params(request: Request) -> None:
+    """Validate the receipt-coverage query before any machine lookup.
+
+    The coverage check is keyed on the path machine alone and accepts no
+    query parameters or request body; any parameter — including a repeated
+    one — or a carried body is a 422 ``invalid_query`` raised before the
+    machine is looked up and before any use or receipt is read, so the same
+    malformed request against a non-existent machine is still 422.
+    """
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/execution-receipts/coverage")
+def check_execution_receipts_coverage(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_execution_receipt_coverage_params)],
+    session: SessionDep,
+):
+    """Read-only coverage check pairing one machine's consumed grant uses
+    with its execution receipts.
+
+    The caller submits only the path machine id — no query parameters and
+    no request body; either is ``422 invalid_query`` before the machine is
+    looked up. A missing machine is ``404 not_found`` with no coverage
+    conclusion. Only ``GET`` is routed; ``HEAD`` and every other method
+    return ``405`` without reading uses or receipts or writing anything. A
+    real failure while reading the uses or receipts is
+    ``500 internal_error`` with no partial conclusion.
+
+    On success the body carries exactly ``{machine_id, consumed_count,
+    receipt_count, covered_count, missing_count, missing_use_ids,
+    orphan_count, orphan_receipt_ids, valid}`` in this fixed order: the path
+    machine id, the machine's total consumed-use count, its total receipt
+    count, and the count of consumed uses paired with a receipt by
+    ``use_id``. ``missing_count`` and ``missing_use_ids`` report the
+    consumed uses no receipt covers — the ids ordered by the actual UTC
+    instant of ``consumed_at`` and then by id, with an unparseable stamp
+    sorted last — and ``orphan_count`` and ``orphan_receipt_ids`` report
+    the receipts whose ``use_id`` is not one of the machine's consumed
+    uses, ordered the same way over ``occurred_at``; both lists are always
+    present, empty when there is nothing to report, and every count is an
+    integer. ``valid`` is true exactly when both lists are empty, so an
+    empty machine and a machine whose every consumed use carries exactly
+    one receipt with no orphan both report ``true``.
+
+    Coverage is a pure one-to-one ``use_id`` correspondence check: chain
+    linkage, authorization scope, and digest soundness stay with the
+    independent ``integrity`` audit. The check is strictly read-only — a
+    missing coverage is reported, never backfilled, and no use, receipt, or
+    chain record is created, rewritten, repaired, or deleted — so a later
+    legitimate receipt improves the result, and another machine's records
+    never change this machine's conclusion. The body is compact UTF-8 JSON
+    terminated by a single newline and contains no floating-point or
+    non-finite value.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        conclusion = execution_receipts.check_machine_coverage(
+            session, machine_id
+        )
+    except SQLAlchemyError:
+        # Never emit a partial conclusion when the records cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": machine_id,
+        "consumed_count": conclusion["consumed_count"],
+        "receipt_count": conclusion["receipt_count"],
+        "covered_count": conclusion["covered_count"],
+        "missing_count": conclusion["missing_count"],
+        "missing_use_ids": conclusion["missing_use_ids"],
+        "orphan_count": conclusion["orphan_count"],
+        "orphan_receipt_ids": conclusion["orphan_receipt_ids"],
+        "valid": conclusion["valid"],
+    }
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- read-only stable incremental execution-receipt query -------------------
 
 

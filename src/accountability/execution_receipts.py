@@ -23,6 +23,13 @@ result and to the per-machine tamper-evident receipt chain.
   ``scope_mismatch``, or ``digest_mismatch`` — and damaged stored values are
   reported, never crashed on, repaired, rewritten, or recomputed for
   storage.
+* :func:`check_machine_coverage` is the strictly read-only coverage check:
+  it pairs the machine's consumed grant uses with its receipts by
+  ``use_id`` alone and reports the consumed uses that have no receipt and
+  the receipts whose ``use_id`` is not one of the machine's consumed uses.
+  It never fabricates a missing receipt, rewrites a record, or re-judges
+  chain, scope, or digest soundness — those stay with
+  :func:`verify_machine_receipts`.
 
 Each machine's receipts form an ordered chain following the same rules as
 the other per-machine chains:
@@ -577,4 +584,79 @@ def _anomaly(
         "checked_count": checked_count,
         "broken_receipt_id": broken_receipt_id,
         "anomaly": anomaly,
+    }
+
+
+def check_machine_coverage(session, machine_id: str) -> dict[str, Any]:
+    """Read-only use/receipt coverage check for one machine.
+
+    Pairs the machine's consumed grant uses with its receipts by ``use_id``
+    alone — one consumed use is covered when exactly the machine's receipt
+    set contains its id — and returns ``{consumed_count, receipt_count,
+    covered_count, missing_count, missing_use_ids, orphan_count,
+    orphan_receipt_ids, valid}``. ``missing_use_ids`` names the consumed
+    uses no receipt covers, ordered by the actual UTC instant of
+    ``consumed_at`` and then by id, with a stamp that no longer parses
+    sorted last; ``orphan_receipt_ids`` names the receipts whose ``use_id``
+    is not one of the machine's consumed uses, ordered the same way over
+    ``occurred_at``. ``valid`` is true exactly when both lists are empty —
+    an empty machine and a fully paired machine are both valid.
+
+    Coverage is a pure one-to-one ``use_id`` correspondence check: chain
+    linkage, authorization scope, and digest soundness are judged
+    independently by :func:`verify_machine_receipts`, and a receipt that
+    fails those audits still covers its use here. Only the path machine's
+    rows are read, nothing is created, rewritten, repaired, or deleted, and
+    a missing coverage is reported, never backfilled.
+    """
+    use_rows = list(
+        session.execute(
+            _USE_TABLE.select().where(_USE_TABLE.c.machine_id == machine_id)
+        )
+    )
+    receipt_rows = list(
+        session.execute(
+            _TABLE.select().where(_TABLE.c.machine_id == machine_id)
+        )
+    )
+
+    receipt_use_ids = {row._mapping["use_id"] for row in receipt_rows}
+    consumed_use_ids = {row._mapping["id"] for row in use_rows}
+
+    missing = [
+        row._mapping
+        for row in use_rows
+        if row._mapping["id"] not in receipt_use_ids
+    ]
+    orphans = [
+        row._mapping
+        for row in receipt_rows
+        if row._mapping["use_id"] not in consumed_use_ids
+    ]
+
+    # Order by the actual UTC instant of the stored stamp and then by id;
+    # a damaged stamp sorts deterministically last and a damaged non-string
+    # id sorts as empty rather than crashing the read-only check.
+    missing.sort(
+        key=lambda mapping: (
+            occurred_at_instant(mapping["consumed_at"]),
+            _receipt_id_key(mapping["id"]),
+        )
+    )
+    orphans.sort(
+        key=lambda mapping: (
+            occurred_at_instant(mapping["occurred_at"]),
+            _receipt_id_key(mapping["id"]),
+        )
+    )
+
+    return {
+        "consumed_count": len(use_rows),
+        "receipt_count": len(receipt_rows),
+        "covered_count": len(use_rows) - len(missing),
+        "missing_count": len(missing),
+        "missing_use_ids": [mapping["id"] for mapping in missing],
+        "orphan_count": len(orphans),
+        "orphan_receipt_ids": [mapping["id"] for mapping in orphans],
+        "valid": not missing and not orphans,
     }
