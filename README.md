@@ -2747,3 +2747,104 @@ and consume grants directly, and re-issuing, consuming, revoking, and reading
 events and their bases through the existing query entries observes the same
 stable results; the decision chain, decision bases, audits, diagnostics,
 compliance and privacy exports, and health-check semantics are unchanged.
+
+## Immutable execution receipts for consumed grants
+
+A consumed grant can be bound to exactly one immutable **execution receipt**,
+closing the loop between the one-time authorization and what actually
+happened: the receipt cites one evidence record of the grant's own
+authorization event, records the action actually performed
+(`action_type`/`resource`) and its `outcome`, and carries the
+`matches_authorization` verdict comparing the actual action with the original
+authorization event.
+
+`POST /machines/{machine_id}/authorization-grants/{grant_id}/execution-receipts`
+carries no query string and a JSON object body with exactly four fields:
+
+- `evidence_id`, `action_type`, `resource` — non-empty strings. The free-text
+  fields trim like the other path-scoped text values; a missing, non-string
+  (including `null`, booleans, numbers, arrays, objects), or
+  blank-after-trim value is `422 {"error":{"code":"invalid_value"}}`;
+- `outcome` — the exact token `"succeeded"` or `"failed"`; a non-string,
+  `null`, blank, or any other text (case and surrounding whitespace are
+  significant) is `422 {"error":{"code":"invalid_value"}}`.
+
+A body that is missing, not a JSON object, lacks one of the four fields, or
+adds an extra field is `422 {"error":{"code":"invalid_receipt"}}`; any query
+parameter or repeated parameter is
+`422 {"error":{"code":"invalid_query"}}`. Validation runs before any machine,
+grant, consumption, or evidence is read, in the order
+`invalid_query` → `invalid_receipt` → `invalid_value`, so the same malformed
+request against a non-existent machine is still answered by the validation
+outcome.
+
+After validation:
+
+- a missing machine, a missing grant, a grant owned by another machine, or a
+  consumed grant whose consumption record is missing or cross-machine is
+  `404 {"error":{"code":"not_found"}}`;
+- evidence that does not exist or is not attached to the grant's own
+  authorization event under the path machine (including another event's or
+  another machine's evidence) is
+  `404 {"error":{"code":"evidence_not_found"}}`;
+- a grant that has never been consumed (active, derived-expired, or
+  emergency-revoked) is `409 {"error":{"code":"grant_not_consumed"}}`;
+- a grant whose consumption already has a receipt is
+  `409 {"error":{"code":"duplicate_receipt"}}` — the check runs inside one
+  locked write transaction with database-level unique constraints on both
+  `grant_id` and `use_id`, so a concurrent burst has exactly one `201`
+  winner.
+
+The actual action is compared with the original event after all lookups: on a
+mismatch the real `action_type`/`resource` values are stored verbatim (never
+coerced to the authorized pair) and `matches_authorization` is `false`; the
+execution `outcome` is recorded but never changes the verdict. A rejected
+attempt writes nothing and never modifies the grant, its consumption record,
+the event, the evidence, any chain, or any other record.
+
+The `201` body carries exactly
+`{evidence_id, action_type, resource, outcome, id, grant_id, use_id,
+matches_authorization, created_at, previous_receipt_id, content_hash,
+chain_hash}` in this fixed order: the four input fields, a fresh UUID `id`,
+the grant and its unique consumption record echoed, the boolean verdict,
+`created_at` a UTC RFC 3339 instant ending in `Z`, and the per-machine
+tamper-evident chain fields. Receipts of one machine chain in
+(`created_at` instant, `id`) order; `content_hash` is SHA-256 of the compact
+key-sorted JSON over the eleven content fields `{id, machine_id, grant_id,
+use_id, authorization_event_id, evidence_id, action_type, resource, outcome,
+matches_authorization, created_at}`, and `chain_hash` is SHA-256 of
+`&lt;previous chain_hash&gt;:&lt;content_hash&gt;` with the empty string as the
+first prefix (`previous_receipt_id` is `null` on the machine's first receipt).
+
+`GET /machines/{machine_id}/authorization-grants/{grant_id}/execution-receipts`
+is the strictly read-only unique-receipt query: it accepts no query
+parameters and no body (a query parameter or carried body is
+`422 invalid_query`), returns the exact same twelve-field document the `201`
+returned when the grant's receipt exists, and answers
+`404 {"error":{"code":"receipt_not_found"}}` whenever no receipt exists under
+the path machine for the grant — including a missing machine, a missing or
+cross-machine grant, an unconsumed grant, or a consumed grant without a
+receipt. Other methods (including `HEAD`) answer `405` without reading or
+writing.
+
+`GET /machines/{machine_id}/execution-receipts/integrity` is the read-only
+chain audit, accepting no query parameters and no body (a malformed query is
+`422 invalid_query` before the machine lookup; a missing machine is
+`404 not_found`). It returns exactly
+`{valid, checked_count, broken_receipt_id}` in this fixed order: an empty
+chain reports `true`, `0`, `null`; a sound chain reports `true`, the total
+receipt count, and `null`; the first receipt (in created-at instant, then id
+order) whose stored content hash, previous-receipt link, or chain hash does
+not recompute — or whose `created_at` no longer parses — makes the result
+`false` with that receipt's id, and later records cannot change it. Only the
+path machine's receipts are examined, and the audit never writes, repairs,
+recomputes, or deletes.
+
+Receipts live in their own table, persist across application restarts, and
+are isolated per machine. The table is created safely at startup on databases
+that predate the feature; chain columns are added safely to a partial table
+and no existing row is rewritten. The feature adds no update or delete entry,
+and issue, consume, revoke, the grant audit listing, the lifecycle chain, the
+authorization events and their bases, evidence, incidents, diagnostics,
+compliance and privacy exports, and health checks keep their original
+behavior.

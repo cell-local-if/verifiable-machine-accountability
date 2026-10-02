@@ -36,6 +36,7 @@ from . import (
     declaration_integrity,
     diagnostics,
     evidence_chain,
+    execution_receipts,
     grant_lifecycle,
     grants,
     incidents,
@@ -120,6 +121,7 @@ async def lifespan(app: FastAPI):
     diagnostics.migrate_schema(engine)
     grants.migrate_schema(engine)
     grant_lifecycle.migrate_schema(engine)
+    execution_receipts.migrate_schema(engine)
     # Finalize joint-write markers left by a crashed previous process from
     # the committed evidence, before serving any request.
     diagnostics.recover_pending(engine)
@@ -9840,6 +9842,248 @@ async def revoke_authorization_grant(
     if status == "grant_expired":
         return error_response(409, "grant_expired")
     return AuthorizationGrantRevocationOut(**result["revocation"])
+
+
+# --- immutable execution receipts for consumed grants -------------------------
+
+
+_RECEIPT_BODY_FIELDS = {"evidence_id", "action_type", "resource", "outcome"}
+_RECEIPT_OUTCOMES = {"succeeded", "failed"}
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-grants/{grant_id}/execution-receipts",
+    status_code=201,
+)
+async def create_authorization_grant_execution_receipt(
+    machine_id: str, grant_id: str, request: Request
+):
+    """Bind one consumed grant's single, immutable execution receipt.
+
+    The request carries no query string and a JSON object body with exactly
+    four fields: ``evidence_id`` (a non-empty string naming evidence attached
+    to the grant's own authorization event), ``action_type`` and ``resource``
+    (non-empty strings naming the action actually performed), and ``outcome``
+    (``"succeeded"`` or ``"failed"``). Validation runs before any machine,
+    grant, consumption, or evidence is read:
+
+    - any query parameter (or repeated parameter) is
+      ``422 {"error":{"code":"invalid_query"}}``;
+    - a missing body, a body that is not a JSON object, a missing or extra
+      field is ``422 {"error":{"code":"invalid_receipt"}}``;
+    - a non-string, null, or blank-after-trim ``evidence_id``,
+      ``action_type``, or ``resource``, or an ``outcome`` that is not a
+      non-empty string equal to ``succeeded``/``failed`` is
+      ``422 {"error":{"code":"invalid_value"}}`` — booleans, numbers, and
+      arrays are non-string values and fail here as well.
+
+    After validation a missing machine, a missing grant, or a grant owned by
+    another machine is ``404 {"error":{"code":"not_found"}}``; a consumed
+    grant whose consumption record is missing or cross-machine is the same
+    ``not_found``. Evidence that does not exist or is attached to another
+    event (or another machine's event) is ``404 evidence_not_found``. A grant
+    that has never been consumed (active, expired, or emergency-revoked) is
+    ``409 grant_not_consumed``. A grant whose consumption already has a
+    receipt answers ``409 duplicate_receipt``: each consumed authorization has
+    at most one receipt, enforced inside one locked write transaction backed
+    by database-level unique constraints, so a concurrent burst has exactly
+    one ``201`` success. On success the response carries, in this fixed key
+    order, the four input fields followed by ``id``, ``grant_id``, ``use_id``,
+    ``matches_authorization``, ``created_at`` (a UTC ``Z`` RFC 3339 instant),
+    ``previous_receipt_id``, ``content_hash``, and ``chain_hash``. The actual
+    action is compared with the original authorization event: on a mismatch
+    the real values are stored verbatim and ``matches_authorization`` is
+    ``false``. A failed attempt writes nothing and never changes the grant,
+    its consumption record, the event, the evidence, or any other record.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_receipt")
+    if not isinstance(payload, dict) or set(payload) != _RECEIPT_BODY_FIELDS:
+        return error_response(422, "invalid_receipt")
+
+    values: dict[str, str] = {}
+    for name in ("evidence_id", "action_type", "resource"):
+        raw = payload[name]
+        # Booleans are not strings; null, numbers, arrays, and objects are
+        # non-string values as well. Text is trimmed like the other
+        # path-scoped identifiers, and a blank value is an illegal value
+        # rather than a malformed shape.
+        if isinstance(raw, bool) or not isinstance(raw, str):
+            return error_response(422, "invalid_value")
+        text_value = raw.strip()
+        if not text_value:
+            return error_response(422, "invalid_value")
+        values[name] = text_value
+
+    raw_outcome = payload["outcome"]
+    # The outcome is an exact enum token: surrounding whitespace never makes a
+    # legal value (unlike the free-text fields, which trim like the other
+    # path-scoped text), so it is compared verbatim against the two tokens.
+    if isinstance(raw_outcome, bool) or not isinstance(raw_outcome, str):
+        return error_response(422, "invalid_value")
+    if raw_outcome not in _RECEIPT_OUTCOMES:
+        return error_response(422, "invalid_value")
+    outcome = raw_outcome
+
+    engine = request.app.state.engine
+    result = execution_receipts.append_receipt(
+        engine,
+        machine_id=machine_id,
+        grant_id=grant_id,
+        evidence_id=values["evidence_id"],
+        action_type=values["action_type"],
+        resource=values["resource"],
+        outcome=outcome,
+    )
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "evidence_not_found":
+        return error_response(404, "evidence_not_found")
+    if status == "grant_not_consumed":
+        return error_response(409, "grant_not_consumed")
+    if status == "duplicate_receipt":
+        return error_response(409, "duplicate_receipt")
+
+    body = (
+        json.dumps(
+            result["receipt"],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    return Response(content=body, status_code=201, media_type="application/json")
+
+
+def validate_execution_receipt_params(request: Request) -> None:
+    """Validate an execution-receipt GET query before any lookup.
+
+    The single-receipt query and the integrity query are keyed on the path
+    alone and accept no query parameters and no request body; any parameter
+    name, a repeated parameter, or a carried body is a 422
+    ``invalid_query``. Every check runs before the machine or any receipt is
+    read, so an extra parameter against a non-existent machine still reports
+    422 rather than 404.
+    """
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-grants/{grant_id}/execution-receipts"
+)
+def get_authorization_grant_execution_receipt(
+    machine_id: str,
+    grant_id: str,
+    _: Annotated[None, Depends(validate_execution_receipt_params)],
+    session: SessionDep,
+):
+    """Read the unique receipt of one consumed grant, if it exists.
+
+    Only ``GET`` is routed for the read, so every other method (including
+    ``HEAD`` and the collection's ``POST`` write on a different method)
+    returns 405 without reading a receipt or writing anything. The caller
+    submits only the path machine and grant ids — any query parameter or
+    carried body is a 422 ``invalid_query`` raised during validation before
+    the machine, grant, or receipt is read. When no receipt exists for the
+    grant under the path machine — including a missing machine, a missing or
+    cross-machine grant, an unconsumed grant, or a consumed grant without a
+    receipt — the answer is ``404 {"error":{"code":"receipt_not_found"}}``.
+
+    On success the response carries the exact same twelve-field document the
+    ``201`` creation returned, in the same fixed key order. The query is
+    strictly read-only: it never creates, updates, deletes, repairs, or
+    normalizes a receipt or any other record, and the body is compact UTF-8
+    JSON terminated by a single newline, byte-identical on repeat calls
+    against unchanged data.
+    """
+    try:
+        receipt = execution_receipts.load_receipt(
+            session, machine_id=machine_id, grant_id=grant_id
+        )
+    except SQLAlchemyError:
+        return error_response(500, "internal_error")
+    if receipt is None:
+        return error_response(404, "receipt_not_found")
+
+    body = (
+        json.dumps(
+            execution_receipts.receipt_to_dict(receipt),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
+@app.get("/machines/{machine_id}/execution-receipts/integrity")
+def check_execution_receipt_integrity(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_execution_receipt_params)],
+    session: SessionDep,
+):
+    """Read-only integrity audit of one machine's execution-receipt chain.
+
+    The caller submits only the path machine id — any query parameter or
+    carried body is a 422 ``invalid_query`` raised during validation before
+    the machine is looked up and before any receipt is read. A missing
+    machine is a 404 ``not_found`` carrying no integrity conclusion. Only
+    ``GET`` is routed; ``HEAD`` and every other method return 405 without
+    reading receipts, computing a chain conclusion, or writing anything. A
+    failure while reading the records is a 500 ``internal_error`` with no
+    partial conclusion.
+
+    On success the response carries exactly
+    ``{valid, checked_count, broken_receipt_id}`` in this fixed field order.
+    An empty or fully sound chain reports ``true``, the machine's total
+    receipt count (``0`` when empty), and ``null``; otherwise ``false``, the
+    total count, and the first receipt — in (created-at instant, id) order,
+    an exact-second receipt before any fractional-second receipt of the same
+    second — whose creation moment, identifier, content hash, previous-
+    receipt link, or chain hash does not verify. Only the path machine's
+    receipts are examined, so another machine's damaged receipts never change
+    this conclusion, and the query never writes, repairs, recomputes, or
+    deletes, so repeated calls and restarts return stable results. The body
+    is compact UTF-8 JSON terminated by a single newline.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        valid, checked_count, broken_receipt_id = (
+            execution_receipts.verify_machine_chain(session, machine_id)
+        )
+    except SQLAlchemyError:
+        # Never emit a partial conclusion when the records cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "valid": valid,
+        "checked_count": checked_count,
+        "broken_receipt_id": broken_receipt_id,
+    }
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 # --- read-only authorization grant audit listing ------------------------------

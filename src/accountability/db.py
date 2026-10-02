@@ -510,6 +510,65 @@ class AuthorizationGrantLifecycleEvent(Base):
     chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class AuthorizationGrantExecutionReceipt(Base):
+    """The single immutable execution receipt of one consumed grant's use.
+
+    A receipt binds a grant's actual execution to its unique consumption
+    record: at most one receipt can exist per grant (and per use), enforced by
+    database-level unique constraints so a concurrent burst has exactly one
+    winner. The receipt records the claimed action exactly as executed
+    (``action_type`` / ``resource``, even when they do not match the original
+    authorization event), its ``outcome``, the evidence it cites, and the
+    computed ``matches_authorization`` verdict. Rows are append-only: never
+    updated or deleted. Each row also carries a per-machine tamper-evident
+    hash chain (``previous_receipt_id``/``content_hash``/``chain_hash``),
+    chained in (``created_at`` instant, ``id``) order within one machine.
+    """
+
+    __tablename__ = "authorization_grant_execution_receipts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    grant_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_grants.id"),
+        nullable=False,
+        unique=True,
+    )
+    use_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_grant_uses.id"),
+        nullable=False,
+        unique=True,
+    )
+    # The authorization event the grant was minted for, denormalized from the
+    # grant so the evidence-association and action-match checks run on the row.
+    authorization_event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        index=True,
+    )
+    evidence_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_evidence.id"),
+        nullable=False,
+    )
+    action_type: Mapped[str] = mapped_column(String, nullable=False)
+    resource: Mapped[str] = mapped_column(String, nullable=False)
+    # ``succeeded`` or ``failed``.
+    outcome: Mapped[str] = mapped_column(String, nullable=False)
+    matches_authorization: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    # Per-machine hash chain. Nullable so databases created before the chain
+    # feature keep working; the startup migration backfills missing values.
+    previous_receipt_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
 class WriteTransactionDiagnostic(Base):
     """One read-only diagnostic record per joint-write transaction attempt.
 
