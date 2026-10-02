@@ -2889,3 +2889,46 @@ revocation, the grant audit listing, the lifecycle chain and its queries,
 the authorization decisions and their bases, evidence, incidents,
 diagnostics, compliance and privacy exports, and the health check are
 unchanged.
+
+### Read-only receipt-window compliance export
+
+`GET /machines/{machine_id}/execution-receipts/compliance-export` returns a
+deterministic, strictly read-only slice of one machine's receipts for a
+closed UTC time window, without changing any write or audit semantics. It
+requires exactly two query parameters, `from_occurred_at` and
+`to_occurred_at`: UTC RFC 3339 date-times ending in `Z`, fractional seconds
+optional, with `from` not later than `to` (equal bounds allowed). An extra
+or repeated parameter, or a request carrying a body, is
+`422 {"error":{"code":"invalid_query"}}`; a missing, blank, malformed,
+whitespace-padded, offset-form, out-of-calendar-range, or inverted bound is
+`422 {"error":{"code":"bad_time"}}` (`invalid_query` takes priority). Every
+parameter check completes before the machine or any receipt is read, so the
+same malformed request against a non-existent machine is still 422. After
+validation a missing machine is `404 {"error":{"code":"not_found"}}`; a real
+failure while reading the machine or the receipts is
+`500 {"error":{"code":"internal_error"}}` with no partial records. Only
+`GET` is routed — `HEAD` and every other method return `405` without
+reading, filtering, or writing.
+
+The success body is exactly `{machine_id, from_occurred_at, to_occurred_at,
+receipts}` in this fixed order, echoing the path machine id and the original
+bound text verbatim; `receipts` is always present (an empty array for an
+empty window, a machine with no receipts, or an empty database). It contains
+only receipts owned by the path machine whose own `occurred_at` parses to an
+instant inside the closed interval, ordered by the actual UTC instant and
+then by id ascending — an exact-second stamp precedes any
+fractional-second stamp of the same second. A receipt whose `occurred_at`
+cannot be parsed is not exported (it also never falls inside any finite
+window), while its stored text is left untouched. Each item carries exactly
+`id`, `machine_id`, `use_id`, `grant_id`, `authorization_event_id`,
+`action_type`, `resource`, `outcome`, `result_digest`, `occurred_at`,
+`previous_receipt_id`, `content_hash`, and `chain_hash` in this fixed order,
+every value exactly as stored: a parseable-time receipt whose chain hashes,
+predecessor reference, or content digest are inconsistent is still exported —
+never repaired, recomputed, normalized, or screened out. The export outputs
+no keys or policy text, adds no migration or on-disk format (empty and old
+databases serve directly), never writes to or modifies the receipt chain or
+any other table, and repeated calls against unchanged data return
+byte-identical compact UTF-8 JSON terminated by a single newline. Receipt
+creation, revocation, the integrity audit above, and all other semantics are
+unchanged.

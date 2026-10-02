@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -60,6 +60,7 @@ from .db import (
     AuthorizationGrantUse,
     Base,
     BehaviorDeclaration,
+    ExecutionReceipt,
     IncidentResponsibilityAssignment,
     IncidentStatusEvent,
     KeyRotationEvent,
@@ -10631,6 +10632,242 @@ async def create_execution_receipt(machine_id: str, request: Request):
     if status == "execution_scope_mismatch":
         return error_response(409, "execution_scope_mismatch")
     return ExecutionReceiptOut(**result["receipt"])
+
+
+class ExecutionReceiptExportParams(BaseModel):
+    from_occurred_at: str
+    to_occurred_at: str
+
+
+def validate_execution_receipt_export_params(
+    request: Request,
+) -> ExecutionReceiptExportParams:
+    """Validate the receipt compliance-export query before any lookup.
+
+    Exactly two parameters are accepted: the required ``from_occurred_at``
+    and ``to_occurred_at``, both UTC RFC 3339 date-times ending in ``Z``
+    (fractional seconds optional; offset forms, surrounding whitespace, and
+    non-``Z`` suffixes are rejected), with the lower bound not later than the
+    upper bound (equal bounds allowed). Any other parameter name, a repeated
+    bound, or a request that carries a body is a 422 ``invalid_query`` and
+    takes priority; a missing, blank, malformed, out-of-range, or inverted
+    bound is a 422 ``bad_time``. Every check here runs before the machine or
+    any receipt is read and issues no database access, so a parameter error
+    against a non-existent machine still reports 422 rather than 404.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or receipt is read. A present non-zero Content-Length, or a
+    # chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"from_occurred_at", "to_occurred_at"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``from_occurred_at=a&from_occurred_at=b`` rather than silently taking
+    # one occurrence, regardless of which bound was repeated.
+    if len(request.query_params.getlist("from_occurred_at")) > 1:
+        raise QueryError("invalid_query")
+    if len(request.query_params.getlist("to_occurred_at")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_from = request.query_params.get("from_occurred_at")
+    raw_to = request.query_params.get("to_occurred_at")
+
+    def _valid(value: str | None) -> bool:
+        if not value or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+            return False
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            return False
+        return True
+
+    if not _valid(raw_from) or not _valid(raw_to):
+        raise QueryError("bad_time")
+
+    if parse_utc_z_datetime(raw_from) > parse_utc_z_datetime(raw_to):
+        raise QueryError("bad_time")
+
+    return ExecutionReceiptExportParams(
+        from_occurred_at=raw_from,  # type: ignore[arg-type]
+        to_occurred_at=raw_to,  # type: ignore[arg-type]
+    )
+
+
+_RECEIPT_EXPORT_FIELDS = (
+    "id",
+    "machine_id",
+    "use_id",
+    "grant_id",
+    "authorization_event_id",
+    "action_type",
+    "resource",
+    "outcome",
+    "result_digest",
+    "occurred_at",
+    "previous_receipt_id",
+    "content_hash",
+    "chain_hash",
+)
+
+
+def _receipt_occurred_instant(value: object) -> datetime | None:
+    """Parse a stored receipt ``occurred_at`` to its UTC instant, else None.
+
+    Window membership is decided on parsed instants: a stored stamp that is
+    missing, not text, or no longer parses has no instant and can never fall
+    inside a finite window, so its record is excluded from the export without
+    ever touching its stored text.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return None
+
+
+def _receipt_export_id_key(value: object) -> tuple[int, str]:
+    """Tie-break key for a stored receipt id in the export ordering.
+
+    Legitimately written ids are strings; a damaged non-string id never
+    crashes the ordering — it sorts after string ids within one instant, and
+    the stored value is still emitted verbatim.
+    """
+    if isinstance(value, str):
+        return (0, value)
+    return (1, "")
+
+
+def _receipt_export_record_to_dict(row: Any) -> dict[str, object]:
+    """One stored receipt in the export's fixed thirteen-field order.
+
+    Every value is emitted exactly as stored — a damaged chain hash, a wrong
+    predecessor reference, or a content mismatch is exported, never repaired,
+    recomputed, normalized, or screened out.
+    """
+    mapping = row._mapping
+    return {key: mapping[key] for key in _RECEIPT_EXPORT_FIELDS}
+
+
+@app.get("/machines/{machine_id}/execution-receipts/compliance-export")
+def export_machine_execution_receipts_compliance(
+    machine_id: str,
+    params: Annotated[
+        ExecutionReceiptExportParams,
+        Depends(validate_execution_receipt_export_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only compliance export of one machine's receipt time window.
+
+    The real entry point is the ``compliance-export`` sub-entry under the
+    machine execution-receipts path; only ``GET`` is routed, so ``HEAD`` and
+    every other method return ``405`` without reading receipts, filtering,
+    computing a result, or writing anything. The caller submits only the
+    path machine id and the two required bounds
+    ``from_occurred_at``/``to_occurred_at`` — UTC RFC 3339 date-times ending
+    in ``Z`` (fractional seconds optional, equal bounds allowed). Query
+    validation (``invalid_query`` for an unknown parameter, a repeated bound,
+    or a carried request body; ``bad_time`` for a missing, blank, offset,
+    whitespace-padded, malformed, out-of-range, or inverted bound) completes
+    before the machine or any receipt is read, so a parameter error takes
+    priority even against a missing machine; a valid query against a missing
+    machine is a 404 ``not_found`` carrying no records.
+
+    On success the response carries exactly ``{machine_id,
+    from_occurred_at, to_occurred_at, receipts}`` in this fixed key order; the
+    path machine id and the original bound text are echoed back, and
+    ``receipts`` is always present (an empty array for an empty window, a
+    machine with no receipts, or an empty database). The array holds only the
+    path machine's receipts whose own ``occurred_at`` parses to an instant in
+    the closed UTC interval; a receipt whose ``occurred_at`` cannot be parsed
+    is not exported, while its stored text is left untouched. Items are
+    ordered by the actual UTC instant of ``occurred_at`` and then by receipt
+    id ascending, so an exact-second receipt sorts before any
+    fractional-second receipt of the same second. Each item carries exactly
+    ``id``, ``machine_id``, ``use_id``, ``grant_id``,
+    ``authorization_event_id``, ``action_type``, ``resource``, ``outcome``,
+    ``result_digest``, ``occurred_at``, ``previous_receipt_id``,
+    ``content_hash``, and ``chain_hash`` in this fixed order, every value
+    exactly as stored: a parseable-time receipt whose chain values,
+    predecessor reference, or content digest is inconsistent is still
+    exported — never repaired, recomputed, normalized, or screened out.
+    Another machine's receipts never enter the result. A real failure while
+    reading the machine or the receipts returns 500 ``internal_error`` with no
+    partial records. The query is strictly read-only: it never writes,
+    repairs, or deletes, outputs no keys or policy text, and adds no
+    persistence surface — repeated calls against unchanged data are
+    byte-identical, results survive restarts, and old and empty databases
+    serve directly with no new on-disk format. The body is compact UTF-8 JSON
+    terminated by a single newline and contains no floating-point, ``-0.0``,
+    or non-finite value.
+    """
+    # Any failure while *reading* — the machine lookup, the receipt rows, or
+    # the ordering over them — is an internal read-layer fault: answer 500
+    # internal_error with no partial records. Damaged stored values are not a
+    # read failure — rows read successfully are filtered and ordered with the
+    # tolerant instant key, and their stored values are emitted verbatim.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+
+        window_start = parse_utc_z_datetime(params.from_occurred_at)
+        window_end = parse_utc_z_datetime(params.to_occurred_at)
+
+        rows = list(
+            session.execute(
+                ExecutionReceipt.__table__.select().where(
+                    ExecutionReceipt.__table__.c.machine_id == machine_id
+                )
+            )
+        )
+
+        in_window: list[Any] = []
+        for row in rows:
+            instant = _receipt_occurred_instant(row._mapping["occurred_at"])
+            if instant is not None and window_start <= instant <= window_end:
+                in_window.append(row)
+
+        # Every in-window row has a parseable stamp, so its parsed instant is
+        # the ordering key; ties break by receipt id ascending.
+        ordered = sorted(
+            in_window,
+            key=lambda row: (
+                _receipt_occurred_instant(row._mapping["occurred_at"]),
+                _receipt_export_id_key(row._mapping["id"]),
+            ),
+        )
+    except Exception:
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": machine_id,
+        "from_occurred_at": params.from_occurred_at,
+        "to_occurred_at": params.to_occurred_at,
+        "receipts": [
+            _receipt_export_record_to_dict(record) for record in ordered
+        ],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 def validate_execution_receipt_integrity_params(request: Request) -> None:
