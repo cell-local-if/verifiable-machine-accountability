@@ -510,6 +510,68 @@ class AuthorizationGrantLifecycleEvent(Base):
     chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class ExecutionReceipt(Base):
+    """The execution-completion receipt bound to one consumed grant use.
+
+    Exactly one receipt can ever exist per consumption record (``use_id`` is
+    unique, enforced by the database itself), so a concurrent burst of
+    receipts for the same use has exactly one winner — the losing requests
+    answer ``409 receipt_already_exists`` and write nothing. A receipt is
+    accepted only when the use belongs to the path machine and has been
+    consumed, the use's source decision event is a committed
+    ``allowed_by_policy`` allow, and the receipt's ``action_type`` and
+    ``resource`` match the source event verbatim. Rows are append-only: they
+    are never updated, deleted, or recomputed afterwards, and creating one
+    never modifies the use, the grant, the source event, or any chain.
+
+    Each row also carries a per-machine tamper-evident hash chain
+    (``previous_receipt_id``/``content_hash``/``chain_hash``) computed from
+    the ten content columns, chained in (``occurred_at`` instant, ``id``)
+    order within one machine only. The table is created automatically at
+    startup on databases that predate the feature; old values are never
+    rewritten and no receipts are fabricated for historical uses.
+    """
+
+    __tablename__ = "execution_receipts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    machine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("machines.id"), nullable=False, index=True
+    )
+    use_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_grant_uses.id"),
+        nullable=False,
+        unique=True,
+    )
+    grant_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_grants.id"),
+        nullable=False,
+        index=True,
+    )
+    authorization_event_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("authorization_decision_events.id"),
+        nullable=False,
+        index=True,
+    )
+    action_type: Mapped[str] = mapped_column(String, nullable=False)
+    resource: Mapped[str] = mapped_column(String, nullable=False)
+    # ``succeeded`` or ``failed``.
+    outcome: Mapped[str] = mapped_column(String, nullable=False)
+    # Client-supplied result fingerprint: exactly 64 lowercase hexadecimal
+    # characters, compared as stored with no case folding.
+    result_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    occurred_at: Mapped[str] = mapped_column(String, nullable=False)
+    # Per-machine hash chain. Nullable so databases created before the chain
+    # feature keep working; the startup migration adds any missing columns
+    # and never rewrites existing rows.
+    previous_receipt_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chain_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
 class WriteTransactionDiagnostic(Base):
     """One read-only diagnostic record per joint-write transaction attempt.
 

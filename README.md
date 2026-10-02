@@ -2747,3 +2747,145 @@ and consume grants directly, and re-issuing, consuming, revoking, and reading
 events and their bases through the existing query entries observes the same
 stable results; the decision chain, decision bases, audits, diagnostics,
 compliance and privacy exports, and health-check semantics are unchanged.
+
+## Execution-completion receipts on consumed grant uses
+
+After a grant has been consumed exactly once, the action it authorized is
+executed and the execution must leave a completion receipt that binds the
+consumed authorization to its result and to the accountability chains.
+
+`POST /machines/{machine_id}/execution-receipts` records one such receipt.
+The request carries no query string and a JSON object body with exactly five
+fields:
+
+- `use_id` — a non-empty string naming one consumed authorization-grant use
+  of the path machine; a missing, non-string, or blank-after-trim value is
+  `422 {"error":{"code":"invalid_execution_receipt_request"}}`;
+- `action_type`, `resource` — strings naming the executed action and
+  resource, compared **verbatim** (no trimming or folding) against the use's
+  source decision event; a missing, non-string, or blank value is the same
+  `422 invalid_execution_receipt_request`;
+- `outcome` — the string `"succeeded"` or `"failed"`; any other value is
+  `422 invalid_execution_receipt_request`;
+- `result_digest` — exactly 64 lowercase hexadecimal characters
+  (`^[0-9a-f]{64}$`), compared as stored with no case folding; an
+  uppercase, wrong-length, non-hex, non-string, or missing value is
+  `422 invalid_execution_receipt_request`.
+
+A body that is missing, not a JSON object, does not parse, lacks or adds a
+top-level field, or carries any query parameter (including a repeated one) is
+the same single `422 invalid_execution_receipt_request`, and every format
+check completes before the machine or use is read — the same malformed
+request against a non-existent machine is still 422. After validation a
+missing machine, a missing use, or a use owned by another machine is
+`404 {"error":{"code":"not_found"}}`. The use's source decision event must
+still commit `allowed = true` with `reason = "allowed_by_policy"`; otherwise
+the answer is `409 {"error":{"code":"authorization_not_allowed"}}`. The
+receipt's `action_type` and `resource` must match the source event character
+for character; a mismatch is
+`409 {"error":{"code":"execution_scope_mismatch"}}` and writes nothing. Every
+use carries at most one receipt: a second receipt for the same use answers
+`409 {"error":{"code":"receipt_already_exists"}}`, and a database-level
+unique constraint on `use_id` is the final backstop, so a concurrent burst
+for one use has exactly one `201` winner and every loser gets 409; the
+machine, use, grant, and event lookups, the eligibility checks, the
+duplicate check, and the chain-tail insert all run inside one locked write
+transaction — the same lock the grant actions take — so receipts for
+different uses can never fork the per-machine chain.
+
+The success body is exactly `{id, machine_id, use_id, grant_id,
+authorization_event_id, occurred_at, previous_receipt_id, content_hash,
+chain_hash}` in this fixed order: a fresh UUID `id`, the path machine and
+the consumed use echoed verbatim, the `grant_id` and the
+`authorization_event_id` the use bound together, `occurred_at` the UTC
+commit moment ending in `Z`, and the receipt's link into the machine's
+per-machine receipt chain. Creating a receipt never modifies the use, the
+grant, the source event, its basis, or any other chain; a rejected attempt
+leaves no receipt and no chain entry.
+
+### Receipt hash chain
+
+Each machine's execution receipts form a per-machine, tamper-evident hash
+chain following the same rules as the other per-machine chains. Every
+receipt carries:
+
+- `previous_receipt_id` — `null` for the machine's first receipt, otherwise
+  the id of the preceding receipt in `(occurred_at, id)` order (the actual
+  UTC instant, then id);
+- `content_hash` — `SHA-256(UTF-8(compact key-sorted JSON of {id,
+  machine_id, use_id, grant_id, authorization_event_id, action_type,
+  resource, outcome, result_digest, occurred_at}))`, covering the record
+  identifier, machine ownership, the consumed-use/grant/event binding, the
+  executed scope, the result outcome and fingerprint, and the commit
+  moment;
+- `chain_hash` — `SHA-256(UTF-8("" + ":" + content_hash))` for the first
+  receipt and `SHA-256(UTF-8(previous_chain_hash + ":" + content_hash))`
+  thereafter.
+
+All hashes are 64-character lowercase hexadecimal strings. Each machine is
+an independent chain: a receipt never points across machines or skips a
+link, the first receipt is rooted at the empty prefix, and no two receipts
+can share a predecessor. On startup the table is created safely on
+databases that predate the feature (`Base.metadata.create_all`) and the
+chain columns are added safely to a pre-existing partial table; old rows
+are never rewritten, no receipt is ever fabricated for a historical
+consumed use (old uses simply carry no receipt until one is recorded), and
+restarting with an already complete chain performs no writes.
+
+### Read-only receipt-chain integrity audit
+
+`GET /machines/{machine_id}/execution-receipts/integrity` verifies the
+receipt chain read-only. It accepts no query parameters and no request
+body — either is `422 {"error":{"code":"invalid_query"}}` validated before
+the machine is looked up or any receipt is read, so the same malformed
+request against a non-existent machine is still 422. After validation a
+missing machine is `404 {"error":{"code":"not_found"}}`; only `GET` is
+routed (`HEAD` and every other method return `405` without reading or
+writing), and a real failure while reading the receipts, uses, grants, or
+events is `500 {"error":{"code":"internal_error"}}` with no partial
+conclusion.
+
+The success body is exactly `{valid, checked_count, broken_receipt_id,
+anomaly}` in this fixed order. An empty or fully sound chain reports
+`true`, the machine's total receipt count (`0` when empty), and `null` for
+both the broken id and the anomaly. Otherwise it reports `false`, the
+total count (damaged rows included), the first receipt that fails, and the
+stable first-anomaly category. Receipts are examined by the actual UTC
+instant of `occurred_at` and then by id — an exact-second stamp precedes
+any fractional-second stamp of the same second; a stamp that no longer
+parses sorts deterministically last and is reported first (before the
+link scan) as its own category. The anomaly categories, in the order a
+single receipt is examined, are:
+
+- `timestamp_unparseable` — a stored `occurred_at` that is not text or no
+  longer parses to a UTC instant;
+- `chain_break` — a `previous_receipt_id` that is not the immediately
+  preceding receipt in chain order (empty for the first), a chain hash
+  that is not 64 lowercase hex characters, or one that does not equal
+  `SHA-256(previous_chain_hash:content_hash)` over the stored content
+  hash, including a damaged stored content hash;
+- `ownership_mismatch` — the receipt names a use, grant, or source event
+  that does not exist under the path machine;
+- `use_mismatch` — the receipt does not agree with its consumed use: the
+  named grant is not the use's grant, the named event is not the use's
+  source event, or the grant does not bind that same event;
+- `scope_mismatch` — the source event is not a committed
+  `allowed_by_policy` allow, or the receipt's `action_type`/`resource`
+  does not match it verbatim;
+- `digest_mismatch` — the outcome is not `succeeded`/`failed`, the
+  `result_digest` or stored `content_hash` is not 64 lowercase hex
+  characters, or the stored content hash does not equal the digest of the
+  ten covered fields as stored.
+
+A damaged stored value is reported, never crashed on, repaired,
+rewritten, recomputed, or normalized for storage, and a missing referenced
+record never removes the receipt from the total. Only the path machine's
+receipts are examined, so another machine's damaged records never change
+this machine's conclusion; the audit is strictly read-only, repeated reads
+of unchanged data are byte-identical compact UTF-8 JSON terminated by a
+single newline (with no floating-point or non-finite value), and the
+conclusion is stable across application restarts. Grant issue, consume,
+revocation, the grant audit listing, the lifecycle chain and its queries,
+the authorization decisions and their bases, evidence, incidents,
+diagnostics, compliance and privacy exports, and the health check are
+unchanged.
