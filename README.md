@@ -2889,3 +2889,66 @@ revocation, the grant audit listing, the lifecycle chain and its queries,
 the authorization decisions and their bases, evidence, incidents,
 diagnostics, compliance and privacy exports, and the health check are
 unchanged.
+
+## Read-only single-event execution accountability trace
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/execution-trace`
+returns a deterministic, read-only, single-event execution accountability
+trace in one response: from the decision event it reads the related
+credential, consumption records, grant lifecycle events, and execution
+receipts, cross-checking authorization issue, consumption, revocation, and
+the execution result. It adds a new query only; grant issue, consumption,
+revocation, receipt registration, the hash chains, the exports, the
+diagnostics, and the health check are unchanged and no write entry is
+added. The caller submits only the path machine id and the path event id —
+no query parameters, repeated parameters, request body, or business
+filter:
+
+- any query string (including a repeated parameter), or a body carried on
+  the GET, returns `422 {"error":{"code":"invalid_query"}}` before the
+  machine or event is looked up and without reading any record;
+- a missing machine, a missing event, or an event owned by another machine
+  returns `404 {"error":{"code":"not_found"}}` with no trace data;
+- a failure while reading the event or any associated record returns
+  `500 {"error":{"code":"internal_error"}}` with no event summary and none
+  of the execution-chain arrays — never a partial result;
+- the path accepts `GET` only; `HEAD` and every other method return `405`
+  without reading records, computing a trace, or writing anything.
+
+A successful response is exactly five groups in this fixed order. The
+first, `event_summary`, is a single object (never an array) carrying the
+selected event's result and reason (`allowed`, `reason`), its creation
+moment (`created_at`), and its chain fields (`previous_event_id`,
+`content_hash`, `chain_hash`). The other four groups are arrays: `grants`,
+`grant_uses`, `lifecycle_events`, and `execution_receipts`.
+
+`grants` and `grant_uses` contain only records whose own `machine_id` is
+the path machine and whose own `event_id` is the selected event;
+`lifecycle_events` and `execution_receipts` contain only records whose own
+`machine_id` is the path machine and whose own `authorization_event_id` is
+the selected event. Membership never resolves a parent: a dangling stored
+reference (a consumption, lifecycle event, or receipt whose stored grant
+or use no longer exists) never filters the child record out, and another
+machine's records can never enter a group. Every record is output with its
+complete stored fields exactly as stored — the grant's stored `status`
+included, with no derived expiry view against the current instant — with
+no repair, recomputation, normalization, or dropping of a damaged,
+duplicated, or dangling value.
+
+Each array is ordered by the actual UTC instant of its own business
+timestamp (`issued_at` for grants, `consumed_at` for consumption records,
+`occurred_at` for lifecycle events and receipts) and then by record id
+ascending, so an exact-second record precedes a fractional-second record
+of the same second; a stored stamp whose original text no longer parses is
+kept verbatim and sorts after every parseable instant (damaged stamps
+ordered among themselves by id) instead of crashing. Every array is
+present, an empty array when the event has no record of that kind: an
+event without a credential traces four empty arrays, a complete flow
+surfaces grant, use, lifecycle event, and receipt in order, and a denied
+decision traces an empty execution chain. The query is strictly read-only
+and machine isolated, and the body is compact UTF-8 JSON in a fixed field
+order terminated by a single newline, free of floating-point, `-0.0`, or
+non-finite values, byte-identical on repeat calls against unchanged data
+and across application restarts. The existing accountability-trace, grant
+issue/consumption/revocation, receipt registration, the hash chains, the
+exports, the diagnostics, and the health check are unchanged.

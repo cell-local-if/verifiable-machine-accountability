@@ -8404,6 +8404,264 @@ def get_authorization_decision_event_accountability_trace(
     return Response(content=body, media_type="application/json")
 
 
+# --- read-only single-event execution accountability trace ------------------
+
+
+def validate_execution_trace_params(request: Request) -> None:
+    """Validate the single-event execution-trace request before reads.
+
+    The trace is keyed on the path machine and the path authorization event
+    alone: it accepts no query parameters, no repeated parameters, no
+    business filter, and no request body. Any query-string content or a
+    carried body is a 422 ``invalid_query``. The check runs as a dependency
+    before the handler reads the machine, the event, or any associated
+    record, so a malformed request against a non-existent machine still
+    reports 422 rather than 404 and never touches a record.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+    # A body on a GET is an unknown-shape request rejected in the validation
+    # phase, before any machine, event, or associated record is read. A
+    # present non-zero Content-Length, or a chunked request without one,
+    # means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+
+def _order_execution_trace_rows(rows: list, attribute: str) -> list:
+    """Order stored rows by the actual UTC instant of their business stamp.
+
+    Each group sorts by its own business timestamp (``issued_at`` for
+    grants, ``consumed_at`` for consumption records, ``occurred_at`` for
+    lifecycle events and execution receipts). Within one instant ties break
+    by the record id ascending; a stored stamp whose original text does not
+    parse sorts after every parseable instant (damaged text last), never
+    raising, and is still emitted verbatim.
+    """
+    return sorted(
+        rows,
+        key=lambda row: (
+            _trace_created_instant(getattr(row, attribute)),
+            _trace_id_key(row.id),
+        ),
+    )
+
+
+def _execution_trace_grant_to_dict(
+    record: AuthorizationGrant,
+) -> dict[str, object]:
+    """Complete stored fields of one authorization credential, as stored.
+
+    The stored ``status`` is emitted verbatim: the read-only trace never
+    derives an ``expired`` view from the current instant and never repairs,
+    recomputes, or normalizes a stored value.
+    """
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "event_id": record.event_id,
+        "issued_at": record.issued_at,
+        "expires_at": record.expires_at,
+        "status": record.status,
+        "consumed_at": record.consumed_at,
+        "revoked_at": record.revoked_at,
+    }
+
+
+def _execution_trace_grant_use_to_dict(
+    record: AuthorizationGrantUse,
+) -> dict[str, object]:
+    """Complete stored fields of one grant consumption record."""
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "grant_id": record.grant_id,
+        "event_id": record.event_id,
+        "consumed_at": record.consumed_at,
+    }
+
+
+def _execution_trace_lifecycle_event_to_dict(
+    record: AuthorizationGrantLifecycleEvent,
+) -> dict[str, object]:
+    """Complete stored fields of one grant lifecycle event, chains included."""
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "grant_id": record.grant_id,
+        "authorization_event_id": record.authorization_event_id,
+        "type": record.type,
+        "occurred_at": record.occurred_at,
+        "previous_event_id": record.previous_event_id,
+        "content_hash": record.content_hash,
+        "chain_hash": record.chain_hash,
+    }
+
+
+def _execution_trace_receipt_to_dict(
+    record: ExecutionReceipt,
+) -> dict[str, object]:
+    """Complete stored fields of one execution-completion receipt, chains."""
+    return {
+        "id": record.id,
+        "machine_id": record.machine_id,
+        "use_id": record.use_id,
+        "grant_id": record.grant_id,
+        "authorization_event_id": record.authorization_event_id,
+        "action_type": record.action_type,
+        "resource": record.resource,
+        "outcome": record.outcome,
+        "result_digest": record.result_digest,
+        "occurred_at": record.occurred_at,
+        "previous_receipt_id": record.previous_receipt_id,
+        "content_hash": record.content_hash,
+        "chain_hash": record.chain_hash,
+    }
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/"
+    "execution-trace"
+)
+def get_authorization_decision_event_execution_trace(
+    machine_id: str,
+    event_id: str,
+    _: Annotated[None, Depends(validate_execution_trace_params)],
+    session: SessionDep,
+):
+    """Read-only single-event execution accountability trace.
+
+    The real entry point is the ``execution-trace`` sub-entry under the
+    machine authorization event path; only ``GET`` is routed, so ``HEAD`` and
+    every other method return ``405`` without reading records, computing a
+    trace, or writing anything. The caller submits only the path machine id
+    and the path authorization event id — no query parameters, no repeated
+    parameters, no request body, and no business filter; any query string or
+    carried body is a 422 ``invalid_query`` raised during validation before
+    the machine, the event, or any associated record is read, so a malformed
+    request against a non-existent machine still reports 422 rather than 404.
+    A missing machine, a missing event, or an event owned by another machine
+    is a 404 ``not_found`` carrying no execution-trace data.
+
+    On success the response carries exactly five groups in this fixed order:
+    ``event_summary`` (a single object, never an array) with the selected
+    event's result (``allowed``), ``reason``, creation moment
+    (``created_at``), and chain fields (``previous_event_id``,
+    ``content_hash``, ``chain_hash``); followed by the four arrays
+    ``grants``, ``grant_uses``, ``lifecycle_events``, and
+    ``execution_receipts``. ``grants`` and ``grant_uses`` contain only rows
+    whose own ``machine_id`` is the path machine and whose own ``event_id``
+    is the selected event; ``lifecycle_events`` and ``execution_receipts``
+    contain only rows whose own ``machine_id`` is the path machine and whose
+    own ``authorization_event_id`` is the selected event. Membership never
+    resolves a parent: a dangling stored reference (a consumption, lifecycle
+    event, or receipt whose stored grant or use no longer exists) never
+    filters the child record out, and another machine's records can never
+    enter a group. Every record is output with its complete stored fields
+    exactly as stored — the grant's stored ``status`` included, with no
+    derived expiry view — no repair, recomputation, normalization, or
+    dropping of a damaged, duplicated, or dangling value, and no status
+    fabricated against the current instant.
+
+    Each array is ordered by the actual UTC instant of its own business
+    timestamp (``issued_at`` for grants, ``consumed_at`` for consumption
+    records, ``occurred_at`` for lifecycle events and receipts) and then by
+    record id ascending, so an exact-second record sorts before any
+    fractional-second record of the same second; a stored stamp whose
+    original text does not parse is kept verbatim and deterministically
+    sorts after every parseable instant instead of crashing the query. Every
+    array is present and empty when the event has no record of that kind —
+    an event without a credential, and equally a denied decision, traces an
+    empty execution chain. The query is strictly read-only: it never
+    creates, updates, deletes, repairs, recomputes, or normalizes a record,
+    and repeated calls against unchanged data return the body byte-for-byte
+    identically. The body is compact UTF-8 JSON in a fixed field order
+    terminated by a single newline, free of any floating-point, ``-0.0``, or
+    non-finite value. A failure while reading the machine, event, or
+    associated records is a 500 ``internal_error`` carrying no event summary
+    and none of the four arrays.
+    """
+    # A failure while *reading* — the event, any associated row, or the
+    # machine lookup — is an internal read-layer fault: answer 500
+    # internal_error with no event summary and no execution-chain arrays.
+    # Damaged stored values are not a read failure: rows read successfully
+    # are filtered by their stored ownership/event columns and emitted
+    # verbatim, with an unparseable stamp sorting last, so only a true read
+    # fault reaches the except branch.
+    try:
+        event = get_machine_event(session, machine_id, event_id)
+        if event is None:
+            return error_response(404, "not_found")
+
+        grant_rows = _order_execution_trace_rows(
+            session.scalars(
+                select(AuthorizationGrant).where(
+                    AuthorizationGrant.machine_id == machine_id,
+                    AuthorizationGrant.event_id == event_id,
+                )
+            ).all(),
+            "issued_at",
+        )
+        use_rows = _order_execution_trace_rows(
+            session.scalars(
+                select(AuthorizationGrantUse).where(
+                    AuthorizationGrantUse.machine_id == machine_id,
+                    AuthorizationGrantUse.event_id == event_id,
+                )
+            ).all(),
+            "consumed_at",
+        )
+        lifecycle_rows = _order_execution_trace_rows(
+            session.scalars(
+                select(AuthorizationGrantLifecycleEvent).where(
+                    AuthorizationGrantLifecycleEvent.machine_id == machine_id,
+                    AuthorizationGrantLifecycleEvent.authorization_event_id
+                    == event_id,
+                )
+            ).all(),
+            "occurred_at",
+        )
+        receipt_rows = _order_execution_trace_rows(
+            session.scalars(
+                select(ExecutionReceipt).where(
+                    ExecutionReceipt.machine_id == machine_id,
+                    ExecutionReceipt.authorization_event_id == event_id,
+                )
+            ).all(),
+            "occurred_at",
+        )
+    except Exception:
+        return error_response(500, "internal_error")
+
+    payload = {
+        "event_summary": _trace_event_summary_to_dict(event),
+        "grants": [_execution_trace_grant_to_dict(row) for row in grant_rows],
+        "grant_uses": [
+            _execution_trace_grant_use_to_dict(row) for row in use_rows
+        ],
+        "lifecycle_events": [
+            _execution_trace_lifecycle_event_to_dict(row)
+            for row in lifecycle_rows
+        ],
+        "execution_receipts": [
+            _execution_trace_receipt_to_dict(row) for row in receipt_rows
+        ],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- read-only immutable authorization decision basis snapshot --------------
 
 
