@@ -15,13 +15,15 @@ which it is ``consumed``, and a grant past ``expires_at`` answers
 to one definite terminal winner. These tests cover the success shapes, every
 validation and lookup outcome, the unavailable/invalid-basis cases,
 exactly-once issue, consume, and revoke under concurrency (including revoke
-versus consume), expiry, atomicity (no half records), restart persistence,
-old-database table creation and column migration, and non-interference with
-the existing event and basis views.
+versus consume and machine suspension versus consume), expiry, atomicity (no
+half records), restart persistence, old-database table creation and column
+migration, non-interference with the existing event and basis views, and the
+suspended-machine gate that blocks only a still-usable grant's consumption.
 """
 import json
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -1371,3 +1373,392 @@ def test_revocation_is_isolated_between_independent_grants(client):
     assert client.post(
         consume_url(machine_id, first_grant["id"])
     ).status_code == 409
+
+
+# --------------------------------------------------------------------------- #
+# Suspended machines may not consume a still-usable grant
+# --------------------------------------------------------------------------- #
+
+
+def set_machine_status(client, machine_id, status):
+    response = client.post(
+        f"/machines/{machine_id}/status", json={"status": status}
+    )
+    assert response.status_code == 200
+    return response
+
+
+def _grant_snapshot(client, grant_id):
+    """The grant row, its use count, and its lifecycle rows, verbatim."""
+    with client.app.state.engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT id, machine_id, event_id, status, issued_at, "
+                "expires_at, consumed_at, revoked_at FROM authorization_grants "
+                "WHERE id = :id"
+            ).bindparams(id=grant_id)
+        ).one()
+        use_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM authorization_grant_uses "
+                "WHERE grant_id = :id"
+            ).bindparams(id=grant_id)
+        ).scalar_one()
+        lifecycle = conn.execute(
+            text(
+                "SELECT type, occurred_at FROM "
+                "authorization_grant_lifecycle_events WHERE grant_id = :id "
+                "ORDER BY occurred_at, id"
+            ).bindparams(id=grant_id)
+        ).all()
+    return row, use_count, [(r.type, r.occurred_at) for r in lifecycle]
+
+
+def test_suspended_machine_consume_is_machine_suspended(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    set_machine_status(client, machine_id, "suspended")
+
+    response = client.post(consume_url(machine_id, grant["id"]))
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": "machine_suspended"}}
+
+
+def test_suspended_consume_writes_nothing_and_changes_no_stamp(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    set_machine_status(client, machine_id, "suspended")
+    before, use_before, life_before = _grant_snapshot(client, grant["id"])
+
+    response = client.post(consume_url(machine_id, grant["id"]))
+    assert response.status_code == 409
+
+    after, use_after, life_after = _grant_snapshot(client, grant["id"])
+    assert tuple(after) == tuple(before)
+    assert after.status == "active"
+    assert after.consumed_at is None
+    assert after.revoked_at is None
+    assert after.issued_at == grant["issued_at"]
+    assert after.expires_at == grant["expires_at"]
+    assert use_before == 0 and use_after == 0
+    # Only the issuance lifecycle event exists; the rejection appends none.
+    assert life_before == [("issued", grant["issued_at"])]
+    assert life_after == life_before
+
+    with client.app.state.engine.connect() as conn:
+        machine_status = conn.execute(
+            text("SELECT status FROM machines WHERE id = :id")
+            .bindparams(id=machine_id)
+        ).scalar_one()
+    assert machine_status == "suspended"
+
+
+def test_repeated_suspended_consumes_are_stable_and_identical(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    set_machine_status(client, machine_id, "suspended")
+
+    first = client.post(consume_url(machine_id, grant["id"]))
+    second = client.post(consume_url(machine_id, grant["id"]))
+    assert first.status_code == 409
+    assert second.status_code == 409
+    assert first.content == second.content
+
+    _, use_count, lifecycle = _grant_snapshot(client, grant["id"])
+    assert use_count == 0
+    assert [event_type for event_type, _ in lifecycle] == ["issued"]
+
+
+def test_consume_resumes_along_same_success_path_after_reactivation(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    set_machine_status(client, machine_id, "suspended")
+    rejected = client.post(consume_url(machine_id, grant["id"]))
+    assert rejected.status_code == 409
+    assert rejected.json() == {"error": {"code": "machine_suspended"}}
+
+    set_machine_status(client, machine_id, "active")
+    response = client.post(consume_url(machine_id, grant["id"]))
+    assert response.status_code == 200
+    body = response.json()
+    assert list(body.keys()) == ["grant_id", "use_id", "consumed_at"]
+    assert body["grant_id"] == grant["id"]
+
+    # Exactly one use and one consumed lifecycle event; the earlier rejection
+    # left no trace, and the second consumption still answers consumed.
+    _, use_count, lifecycle = _grant_snapshot(client, grant["id"])
+    assert use_count == 1
+    assert [event_type for event_type, _ in lifecycle] == [
+        "issued",
+        "consumed",
+    ]
+    again = client.post(consume_url(machine_id, grant["id"]))
+    assert again.status_code == 409
+    assert again.json() == {"error": {"code": "grant_consumed"}}
+
+
+def test_suspension_does_not_extend_or_revive_an_expiring_grant(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"], ttl_seconds=1).json()
+    set_machine_status(client, machine_id, "suspended")
+
+    # Suspended while it would still be usable: machine_suspended.
+    assert (
+        client.post(consume_url(machine_id, grant["id"])).status_code == 409
+    )
+    time.sleep(1.2)
+    # Once the TTL elapses, expiry takes over even though the machine stays
+    # suspended.
+    expired_while_suspended = client.post(
+        consume_url(machine_id, grant["id"])
+    )
+    assert expired_while_suspended.status_code == 409
+    assert expired_while_suspended.json() == {
+        "error": {"code": "grant_expired"}
+    }
+
+    # Reactivation neither reissues nor resurrects: the grant is expired.
+    set_machine_status(client, machine_id, "active")
+    after_reactivation = client.post(consume_url(machine_id, grant["id"]))
+    assert after_reactivation.status_code == 409
+    assert after_reactivation.json() == {
+        "error": {"code": "grant_expired"}
+    }
+    row, use_count, lifecycle = _grant_snapshot(client, grant["id"])
+    assert row.status == "active"
+    assert use_count == 0
+    assert [event_type for event_type, _ in lifecycle] == ["issued"]
+
+
+def test_consumed_grant_keeps_grant_consumed_when_machine_suspended(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    assert client.post(consume_url(machine_id, grant["id"])).status_code == 200
+    set_machine_status(client, machine_id, "suspended")
+
+    response = client.post(consume_url(machine_id, grant["id"]))
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": "grant_consumed"}}
+    row, use_count, lifecycle = _grant_snapshot(client, grant["id"])
+    assert row.status == "consumed"
+    assert use_count == 1
+    assert [event_type for event_type, _ in lifecycle] == [
+        "issued",
+        "consumed",
+    ]
+
+
+def test_revoked_grant_keeps_grant_revoked_when_machine_suspended(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    assert client.post(revoke_url(machine_id, grant["id"])).status_code == 200
+    set_machine_status(client, machine_id, "suspended")
+
+    response = client.post(consume_url(machine_id, grant["id"]))
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": "grant_revoked"}}
+    row, use_count, lifecycle = _grant_snapshot(client, grant["id"])
+    assert row.status == "revoked"
+    assert use_count == 0
+    assert [event_type for event_type, _ in lifecycle] == [
+        "issued",
+        "revoked",
+    ]
+
+
+def test_expired_grant_keeps_grant_expired_when_machine_suspended(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    grant = _backdated_grant(client, machine_id, event["id"])
+    set_machine_status(client, machine_id, "suspended")
+
+    response = client.post(consume_url(machine_id, grant["id"]))
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": "grant_expired"}}
+    row, use_count, lifecycle = _grant_snapshot(client, grant["id"])
+    assert row.status == "active"
+    assert use_count == 0
+    assert [event_type for event_type, _ in lifecycle] == ["issued"]
+
+
+def test_suspended_consume_of_another_machines_grant_is_not_found(client):
+    # The path machine owns no grant: suspension never turns a foreign or
+    # missing grant into machine_suspended.
+    owner_id = create_machine(client, external_id="machine-owner")
+    declare(client, owner_id)
+    create_rule(client)
+    event = record_event(client, owner_id).json()
+    grant = issue(client, owner_id, event["id"]).json()
+
+    other_id = create_machine(client, external_id="machine-other")
+    set_machine_status(client, other_id, "suspended")
+    response = client.post(consume_url(other_id, grant["id"]))
+    assert response.status_code == 404
+    assert response.json() == {"error": {"code": "not_found"}}
+    # The grant stays consumable by its owner.
+    assert client.post(consume_url(owner_id, grant["id"])).status_code == 200
+
+
+@pytest.mark.parametrize("query", ["?x=1", "?=", "?foo", "?x=1&x=2"])
+def test_suspended_consume_with_query_is_invalid_query_before_lookup(
+    allowed_event, client, query
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    set_machine_status(client, machine_id, "suspended")
+
+    response = client.post(consume_url(machine_id, grant["id"]) + query)
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+    # Validation precedes the machine/grant state gate: nothing was written.
+    row, use_count, lifecycle = _grant_snapshot(client, grant["id"])
+    assert row.status == "active"
+    assert use_count == 0
+    assert [event_type for event_type, _ in lifecycle] == ["issued"]
+
+
+@pytest.mark.parametrize("send", [b"{}", b'{"x":1}', b"null", b"[]", b"text"])
+def test_suspended_consume_with_body_is_invalid_query(
+    allowed_event, client, send
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    set_machine_status(client, machine_id, "suspended")
+
+    response = client.post(
+        consume_url(machine_id, grant["id"]),
+        content=send,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+    _, use_count, lifecycle = _grant_snapshot(client, grant["id"])
+    assert use_count == 0
+    assert [event_type for event_type, _ in lifecycle] == ["issued"]
+
+
+def test_suspended_consume_leaves_event_basis_chains_and_diagnostics(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    basis_url = (
+        f"/machines/{machine_id}/authorization-decision-events/"
+        f"{event['id']}/decision-basis"
+    )
+    events_url = f"/machines/{machine_id}/authorization-decision-events"
+    lifecycle_integrity_url = (
+        f"/machines/{machine_id}/authorization-grant-lifecycle-events/"
+        "integrity"
+    )
+    grant = issue(client, machine_id, event["id"]).json()
+    set_machine_status(client, machine_id, "suspended")
+    basis_before = client.get(basis_url).content
+    events_before = client.get(events_url).content
+
+    assert client.post(consume_url(machine_id, grant["id"])).status_code == 409
+
+    assert client.get(basis_url).content == basis_before
+    assert client.get(events_url).content == events_before
+    assert client.get(
+        f"/machines/{machine_id}/authorization-decision-events/integrity"
+    ).json()["valid"] is True
+    assert client.get(lifecycle_integrity_url).json()["valid"] is True
+
+
+def test_suspend_racing_consume_has_one_definite_serial_outcome(
+    allowed_event, client
+):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    gate = threading.Event()
+
+    def suspend_hit():
+        gate.wait()
+        return client.post(
+            f"/machines/{machine_id}/status", json={"status": "suspended"}
+        )
+
+    def consume_hit():
+        gate.wait()
+        return client.post(consume_url(machine_id, grant["id"]))
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [pool.submit(suspend_hit)] + [
+            pool.submit(consume_hit) for _ in range(15)
+        ]
+        gate.set()
+        responses = [f.result() for f in futures]
+
+    consume_responses = [
+        r for r in responses if "consume" in str(r.request.url.path)
+    ]
+    suspend_responses = [r for r in responses if r not in consume_responses]
+
+    # The single suspension either serialized before or after the winning
+    # consumption; exactly one suspension request was accepted.
+    assert len(suspend_responses) == 1
+    assert suspend_responses[0].status_code == 200
+
+    consume_codes = {
+        r.json()["error"]["code"]
+        for r in consume_responses
+        if r.status_code == 409
+    }
+    successes = [r for r in consume_responses if r.status_code == 200]
+    assert consume_codes <= {"machine_suspended", "grant_consumed"}
+
+    with client.app.state.engine.connect() as conn:
+        final_status = conn.execute(
+            text("SELECT status FROM authorization_grants WHERE id = :id")
+            .bindparams(id=grant["id"])
+        ).scalar_one()
+        use_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM authorization_grant_uses "
+                "WHERE grant_id = :id"
+            ).bindparams(id=grant["id"])
+        ).scalar_one()
+        machine_status = conn.execute(
+            text("SELECT status FROM machines WHERE id = :id")
+            .bindparams(id=machine_id)
+        ).scalar_one()
+        lifecycle_types = [
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT type FROM "
+                    "authorization_grant_lifecycle_events "
+                    "WHERE grant_id = :id ORDER BY occurred_at, id"
+                ).bindparams(id=grant["id"])
+            )
+        ]
+
+    assert machine_status == "suspended"
+    assert len(successes) == use_count
+    assert use_count in (0, 1)
+    if use_count == 1:
+        # Consumption committed first: unique success, unique use, unique
+        # consumed event; losers lost either to the consumption or to the
+        # suspension that followed.
+        assert final_status == "consumed"
+        assert lifecycle_types == ["issued", "consumed"]
+    else:
+        # Suspension committed first: every consumption saw machine_suspended
+        # and no record of any attempt landed.
+        assert final_status == "active"
+        assert consume_codes == {"machine_suspended"}
+        assert lifecycle_types == ["issued"]
+

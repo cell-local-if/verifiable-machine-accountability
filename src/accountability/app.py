@@ -10135,12 +10135,19 @@ async def consume_authorization_grant(
     ``404 {"error":{"code":"not_found"}}``. Consuming an already-consumed
     grant answers ``409 grant_consumed``, consuming an emergency-revoked
     grant answers ``409 grant_revoked``, and a grant past its ``expires_at``
-    answers ``409 grant_expired``; none of these writes anything. On success
+    answers ``409 grant_expired``; these outcomes keep their precedence and
+    do not change when the machine is suspended. Only a still-unconsumed,
+    unrevoked, unexpired grant on a suspended machine answers
+    ``409 machine_suspended``; none of these writes anything. On success
     the grant flips to ``consumed`` and its single use record is inserted in
     one locked write transaction, so a concurrent consumption burst has
     exactly one ``200`` success carrying ``{grant_id, use_id, consumed_at}``;
     the state change and the use record commit together or leave no trace.
     A revocation racing this consumption has one definite terminal winner.
+    The machine status change takes the same write lock, so a suspension that
+    commits first turns the consumption into ``machine_suspended`` while a
+    consumption that commits first keeps its unique success; after the
+    machine returns to active the same still-valid grant consumes normally.
     """
     if request.query_params:
         return error_response(422, "invalid_query")
@@ -10163,6 +10170,8 @@ async def consume_authorization_grant(
         return error_response(409, "grant_revoked")
     if status == "grant_expired":
         return error_response(409, "grant_expired")
+    if status == "machine_suspended":
+        return error_response(409, "machine_suspended")
     return AuthorizationGrantUseOut(**result["use"])
 
 

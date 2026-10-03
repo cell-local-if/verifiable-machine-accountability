@@ -2736,7 +2736,17 @@ consuming an emergency-revoked grant answers
 at or past its `expires_at` answers
 `409 {"error":{"code":"grant_expired"}}` (expiry is derived from the immutable
 stamp; an expired grant is never updated), and none of these rejections writes
-anything. On success the grant flips to `consumed` and one use record is
+anything. Only a still-unconsumed, unrevoked, unexpired grant is gated by the
+machine's enablement state: when its machine is `suspended` the consumption
+answers `409 {"error":{"code":"machine_suspended"}}`; that rejection changes
+no grant state or timestamp and adds no use record or lifecycle event. The
+machine status change takes the same locked write transaction, so a suspension
+racing a consumption has one definite serial outcome — consume first keeps
+its unique success, suspend first makes every later consumption answer
+`machine_suspended`; after the machine returns to `active` the same
+still-unexpired, still-`active` grant consumes along the original success
+path (nothing is reissued, renewed, or transferred, and an expired grant is
+not revived). On success the grant flips to `consumed` and one use record is
 inserted — carrying its own fresh UUID and the UTC consumption moment — inside
 the same locked write transaction, so a concurrent consumption burst has
 exactly one `200` success returning
