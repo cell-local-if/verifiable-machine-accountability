@@ -38,6 +38,12 @@ result and to the per-machine tamper-evident receipt chain.
   machine's consumptions. It never rebuilds, backfills, repairs, or mutates
   a use, a receipt, or any chain; chain, scope, and digest soundness stay
   the separate concern of :func:`verify_machine_receipts`.
+* :func:`export_receipt_window` is the strictly read-only fixed-window
+  compliance slice: it returns one machine's receipts whose ``occurred_at``
+  is a parseable UTC ``Z`` instant inside a closed ``[start, end]``
+  interval, ordered by that instant and then by id, with every stored field
+  emitted verbatim. A receipt whose stamp no longer parses is excluded, not
+  repaired, and no reference, chain field, or hash is ever recomputed.
 
 Each machine's receipts form an ordered chain following the same rules as
 the other per-machine chains:
@@ -939,3 +945,100 @@ def coverage_report(session, machine_id: str) -> dict[str, Any]:
         "orphan_receipt_ids": orphan_receipt_ids,
         "valid": not missing_use_ids and not orphan_receipt_ids,
     }
+
+
+# Strict shape of a legitimately written ``occurred_at``: an RFC 3339
+# date-time in UTC with a literal ``Z`` suffix and optional fractional
+# seconds. The window export admits a row only when its stored stamp has
+# this shape and range-checks, unlike the chain audit whose tolerant parser
+# only needs a total ordering; offset forms and damaged text are excluded
+# from the window rather than admitted or repaired.
+_UTC_Z_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
+def _parse_occurred_at_utc(value: object) -> datetime | None:
+    """Parse a stored ``occurred_at`` to its UTC instant, or ``None``.
+
+    Returns the actual UTC instant only for a stamp that satisfies the RFC
+    3339 ``Z`` contract; a missing, non-text, offset-form, malformed, or
+    out-of-range value returns ``None`` so the read-only window export can
+    exclude the row without crashing, deleting, or rewriting its stored
+    text.
+    """
+    if isinstance(value, str) and _UTC_Z_STAMP_RE.fullmatch(value):
+        try:
+            return datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            return None
+    return None
+
+
+_EXPORT_FIELDS = (
+    "id",
+    "machine_id",
+    "use_id",
+    "grant_id",
+    "authorization_event_id",
+    "action_type",
+    "resource",
+    "outcome",
+    "result_digest",
+    "occurred_at",
+    "previous_receipt_id",
+    "content_hash",
+    "chain_hash",
+)
+
+
+def export_receipt_window(
+    session,
+    machine_id: str,
+    *,
+    start: datetime,
+    end: datetime,
+) -> list[dict[str, Any]]:
+    """Read-only fixed-window compliance slice of one machine's receipts.
+
+    Reads only rows of ``execution_receipts`` owned by ``machine_id`` (the
+    ownership column is the sole machine boundary) and keeps a row only when
+    its stored ``occurred_at`` parses to a UTC instant inside the closed
+    interval ``[start, end]``. A stamp that no longer parses — non-text,
+    missing the ``Z`` suffix, carrying an offset, malformed, or
+    out-of-range — is excluded from the slice and left exactly as stored;
+    the read never crashes on, repairs, normalizes, or recomputes it.
+
+    The retained receipts are ordered by the actual UTC instant of
+    ``occurred_at`` and then by receipt id ascending, so an exact-second
+    stamp sorts before any fractional-second stamp of the same second. Each
+    item carries exactly the thirteen stored fields in fixed order — the ten
+    content fields followed by ``previous_receipt_id``, ``content_hash``,
+    and ``chain_hash`` — emitted verbatim: references, chain links, and
+    hashes are never fixed or recomputed, and a chain-damaged receipt inside
+    the window is exported exactly as stored. The query is strictly
+    read-only: it never inserts, updates, deletes, backfills, or normalizes
+    a receipt or any related row, so repeated reads of unchanged data return
+    byte-identical results and the data survives restarts untouched.
+    """
+    rows = list(
+        session.execute(
+            _TABLE.select().where(_TABLE.c.machine_id == machine_id)
+        )
+    )
+
+    in_window: list[tuple[datetime, Any]] = []
+    for row in rows:
+        instant = _parse_occurred_at_utc(row._mapping["occurred_at"])
+        if instant is not None and start <= instant <= end:
+            in_window.append((instant, row))
+
+    in_window.sort(
+        key=lambda item: (
+            item[0],
+            _receipt_id_key(item[1]._mapping["id"]),
+        )
+    )
+
+    return [
+        {field: row._mapping[field] for field in _EXPORT_FIELDS}
+        for _, row in in_window
+    ]
