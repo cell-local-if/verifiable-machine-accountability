@@ -31,6 +31,7 @@ and no events are fabricated for them.
 
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -361,3 +362,107 @@ def verify_machine_chain(
         previous_chain_hash = chain_hash
 
     return True, len(rows), None
+
+
+# --- read-only fixed-window compliance export ---------------------------------
+
+# A record only enters a finite export window when its stored ``occurred_at``
+# still satisfies the RFC 3339 ``Z`` contract under which events are written.
+_UTC_Z_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
+def _parse_occurred_at_utc(value: object) -> datetime | None:
+    """Parse a stored ``occurred_at`` to its UTC instant, or ``None``.
+
+    Returns the actual UTC instant only for a stamp that satisfies the RFC
+    3339 ``Z`` contract; a missing, non-text, offset-form, malformed, or
+    out-of-range value returns ``None`` so the read-only window export can
+    exclude the row without crashing, deleting, or rewriting its stored
+    text.
+    """
+    if isinstance(value, str) and _UTC_Z_STAMP_RE.fullmatch(value):
+        try:
+            return datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            return None
+    return None
+
+
+def _event_id_key(value: object) -> tuple[int, str]:
+    """Tie-break key for a stored lifecycle event id.
+
+    Legitimately written ids are strings; a damaged non-string id never
+    crashes the ordering — it sorts after string ids within one instant,
+    and the stored value is still emitted verbatim.
+    """
+    if isinstance(value, str):
+        return (0, value)
+    return (1, "")
+
+
+_EXPORT_FIELDS = (
+    "id",
+    "machine_id",
+    "grant_id",
+    "authorization_event_id",
+    "type",
+    "occurred_at",
+    "previous_event_id",
+    "content_hash",
+    "chain_hash",
+)
+
+
+def export_lifecycle_window(
+    session,
+    machine_id: str,
+    *,
+    start: datetime,
+    end: datetime,
+) -> list[dict[str, Any]]:
+    """Read-only fixed-window compliance slice of one machine's events.
+
+    Reads only lifecycle rows owned by ``machine_id`` (the ownership column
+    is the sole machine boundary) and keeps a row only when its stored
+    ``occurred_at`` parses to a UTC instant inside the closed interval
+    ``[start, end]``. A stamp that no longer parses — non-text, missing the
+    ``Z`` suffix, carrying an offset, malformed, or out-of-range — is
+    excluded from the slice and left exactly as stored; the read never
+    crashes on, repairs, normalizes, or recomputes it.
+
+    The retained events are ordered by the actual UTC instant of
+    ``occurred_at`` and then by event id ascending, so an exact-second
+    stamp sorts before any fractional-second stamp of the same second. Each
+    item carries exactly the nine stored fields in fixed order — the six
+    content fields followed by ``previous_event_id``, ``content_hash``, and
+    ``chain_hash`` — emitted verbatim: references, the event type, chain
+    links, and hashes are never fixed or recomputed, and a chain-damaged
+    event inside the window is exported exactly as stored. The query is
+    strictly read-only: it never inserts, updates, deletes, backfills, or
+    normalizes an event or any related row, so repeated reads of unchanged
+    data return byte-identical results and the data survives restarts
+    untouched.
+    """
+    rows = list(
+        session.execute(
+            _TABLE.select().where(_TABLE.c.machine_id == machine_id)
+        )
+    )
+
+    in_window: list[tuple[datetime, Any]] = []
+    for row in rows:
+        instant = _parse_occurred_at_utc(row._mapping["occurred_at"])
+        if instant is not None and start <= instant <= end:
+            in_window.append((instant, row))
+
+    in_window.sort(
+        key=lambda item: (
+            item[0],
+            _event_id_key(item[1]._mapping["id"]),
+        )
+    )
+
+    return [
+        {field: row._mapping[field] for field in _EXPORT_FIELDS}
+        for _, row in in_window
+    ]

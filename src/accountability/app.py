@@ -10756,6 +10756,179 @@ def get_authorization_grant_lifecycle_changes(
     return Response(content=body, media_type="application/json")
 
 
+# --- read-only fixed-window grant-lifecycle compliance export ----------------
+
+
+class GrantLifecycleExportParams(BaseModel):
+    from_occurred_at: str
+    to_occurred_at: str
+
+
+def validate_grant_lifecycle_export_params(
+    request: Request,
+) -> GrantLifecycleExportParams:
+    """Validate the grant-lifecycle compliance-export query pre-lookup.
+
+    Exactly two parameters are accepted: the required ``from_occurred_at``
+    and ``to_occurred_at``, both UTC RFC 3339 date-times ending in ``Z``
+    (fractional seconds optional; offset forms such as ``+00:00``,
+    surrounding whitespace, and non-``Z`` suffixes are rejected), with the
+    lower bound not later than the upper bound (equal bounds allowed). Any
+    other parameter name, a repeated ``from_occurred_at``/
+    ``to_occurred_at``, or a request that carries a body is a 422
+    ``invalid_query`` and takes priority; a missing, blank, malformed,
+    out-of-range, or inverted bound is a 422 ``bad_time``. Every check here
+    runs before the machine or any lifecycle event is read and issues no
+    database access, so a parameter error against a non-existent machine
+    still reports 422 rather than 404.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or lifecycle event is read. A present non-zero Content-Length,
+    # or a chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"from_occurred_at", "to_occurred_at"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``from_occurred_at=a&from_occurred_at=b`` rather than silently taking
+    # one occurrence, regardless of which bound was repeated.
+    if len(request.query_params.getlist("from_occurred_at")) > 1:
+        raise QueryError("invalid_query")
+    if len(request.query_params.getlist("to_occurred_at")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_from = request.query_params.get("from_occurred_at")
+    raw_to = request.query_params.get("to_occurred_at")
+
+    def _valid(value: str | None) -> bool:
+        if not value or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+            return False
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            return False
+        return True
+
+    if not _valid(raw_from) or not _valid(raw_to):
+        raise QueryError("bad_time")
+
+    if parse_utc_z_datetime(raw_from) > parse_utc_z_datetime(raw_to):
+        raise QueryError("bad_time")
+
+    return GrantLifecycleExportParams(
+        from_occurred_at=raw_from,  # type: ignore[arg-type]
+        to_occurred_at=raw_to,  # type: ignore[arg-type]
+    )
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-grant-lifecycle-events/"
+    "compliance-export"
+)
+def export_authorization_grant_lifecycle_events(
+    machine_id: str,
+    params: Annotated[
+        GrantLifecycleExportParams,
+        Depends(validate_grant_lifecycle_export_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only compliance export of one machine's lifecycle events in a
+    fixed time window.
+
+    The real entry point is the ``compliance-export`` sub-entry under the
+    machine grant-lifecycle path; only ``GET`` is routed, so ``HEAD`` and
+    every other method return ``405`` without reading events, filtering,
+    computing a slice, or writing anything. The caller submits only the
+    path machine id and the two required bounds
+    ``from_occurred_at``/``to_occurred_at`` — UTC RFC 3339 date-times ending
+    in ``Z`` (fractional seconds optional, equal bounds allowed; offset
+    forms such as ``+00:00`` are rejected). Query validation
+    (``invalid_query`` for an unknown parameter, a repeated bound, or a
+    carried request body; ``bad_time`` for a missing, blank, offset,
+    whitespace-padded, malformed, out-of-range, or inverted bound)
+    completes before the machine or any lifecycle event is read, so a
+    parameter error takes priority even against a missing machine; a valid
+    query against a missing machine is a 404 ``not_found`` carrying no
+    events.
+
+    On success the response carries exactly ``{machine_id,
+    from_occurred_at, to_occurred_at, events}`` in this fixed key order;
+    the path machine id and the original bound text are echoed back, and
+    ``events`` is always present (an empty array for an empty window, a
+    machine with no lifecycle events, or an empty database). The array
+    holds only the path machine's events whose own ``occurred_at`` still
+    satisfies the RFC 3339 ``Z`` contract and parses to a UTC instant
+    inside the closed interval — an event with a damaged, offset-form, or
+    unparseable stamp is excluded from the slice while its stored text is
+    left untouched — and items are ordered by the actual UTC instant of
+    ``occurred_at`` and then by event id ascending, so an exact-second
+    event sorts before any fractional-second event of the same second.
+    Each item carries exactly the nine stored fields ``{id, machine_id,
+    grant_id, authorization_event_id, type, occurred_at,
+    previous_event_id, content_hash, chain_hash}`` exactly as stored, with
+    no repair or recomputation of references, the event type, chain
+    fields, or hashes, so chain-damaged content inside the window is
+    emitted verbatim. Another machine's events never enter the result. A
+    real failure while reading the machine or the events returns 500
+    ``internal_error`` with no partial events. The query is strictly
+    read-only and adds no persistence surface: it never creates,
+    fabricates, migrates, or rewrites a record; repeated calls against
+    unchanged data are byte-identical, results survive restarts, and old
+    and empty databases serve directly. The body is compact UTF-8 JSON
+    terminated by a single newline and contains no floating-point,
+    ``-0.0``, or non-finite value.
+    """
+    # Any failure while *reading* — the machine lookup, the event rows, or
+    # the ordering over them — is an internal read-layer fault: answer 500
+    # internal_error with no partial events. Damaged stored values are not
+    # a read failure — rows read successfully are filtered with the strict
+    # stamp parser (an unparseable stamp never enters a finite window) and
+    # the retained rows are emitted verbatim.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+
+        window_start = parse_utc_z_datetime(params.from_occurred_at)
+        window_end = parse_utc_z_datetime(params.to_occurred_at)
+
+        events = grant_lifecycle.export_lifecycle_window(
+            session,
+            machine_id,
+            start=window_start,
+            end=window_end,
+        )
+    except SQLAlchemyError:
+        # Never emit partial events when the records cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": machine_id,
+        "from_occurred_at": params.from_occurred_at,
+        "to_occurred_at": params.to_occurred_at,
+        "events": events,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- execution-completion receipts bound to consumed grant uses ---------------
 
 
