@@ -38,6 +38,7 @@ from . import (
     evidence_chain,
     execution_receipts,
     grant_lifecycle,
+    grant_reconciliation,
     grants,
     incidents,
     machine_status_chain,
@@ -10509,6 +10510,107 @@ def list_authorization_grants(
             for record in page
         ],
         "next_cursor": next_cursor,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
+# --- authorization grant reconciliation ---------------------------------------
+
+
+def validate_grant_reconciliation_params(request: Request) -> None:
+    """Validate the grant reconciliation query before any lookup.
+
+    The reconciliation is keyed on the path machine alone and accepts no
+    query parameters and no request body; any parameter name (including a
+    repeated one) or a carried body is a 422 ``invalid_query``. The check
+    runs before the machine is looked up and issues no database access, so
+    an extra parameter or a body against a non-existent machine still
+    reports 422 rather than 404 and no grant, use, or lifecycle event is
+    read.
+    """
+    # A present non-zero Content-Length, or a chunked request without one,
+    # means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/authorization-grants/reconciliation")
+def check_authorization_grants_reconciliation(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_grant_reconciliation_params)],
+    session: SessionDep,
+):
+    """Read-only reconciliation of one machine's grants, uses, and events.
+
+    The caller submits only the path machine id — no query parameters and
+    no request body; any query parameter (including a repeated name) or a
+    carried body is a 422 ``invalid_query`` raised during validation before
+    the machine is looked up and before any grant, use, or lifecycle event
+    is read. A missing machine is a 404 ``not_found`` carrying no
+    conclusion. Only ``GET`` is routed; ``HEAD`` and every other method
+    return 405 without reading records, computing a conclusion, or writing
+    anything. A failure while reading the records is a 500
+    ``internal_error`` with no partial conclusion.
+
+    On success the response carries exactly ``{valid,
+    checked_grant_count, historical_grant_count, broken_grant_id,
+    anomaly}`` in this fixed field order. ``checked_grant_count`` is the
+    machine's total grant count and ``historical_grant_count`` the number
+    of grants carrying no lifecycle event — historical rows from databases
+    that predate the lifecycle feature, counted for compatibility, never
+    judged and never backfilled. Every other grant is checked against its
+    lifecycle events and its use record: the sequence must open with a
+    unique ``issued`` event, an ``active`` grant carries no terminal event
+    and no use, a ``consumed`` grant carries exactly one ``consumed``
+    event and one use of the same ownership and consumption moment, a
+    ``revoked`` grant carries exactly one ``revoked`` event and no use,
+    and every event's ``authorization_event_id``, ``grant_id``, and
+    terminal moment must agree with the grant. The first problem grant —
+    ordered by the actual UTC instant of ``issued_at`` and then by grant
+    id — sets ``broken_grant_id`` and ``anomaly``; a grant whose own stamp
+    no longer parses is reported first of all as
+    ``timestamp_unparseable``, and an orphan event is located by its
+    stored ``grant_id``. ``anomaly`` is one of
+    ``timestamp_unparseable``, ``reference_mismatch``,
+    ``sequence_or_state_mismatch``, or ``use_mismatch``; when everything
+    is consistent ``valid`` is ``true`` and both ``broken_grant_id`` and
+    ``anomaly`` are ``null``. Only the path machine's records are
+    examined, the query never writes, repairs, recomputes, or deletes, so
+    repeated calls and restarts return stable results. The body is compact
+    UTF-8 JSON terminated by a single newline and contains no
+    floating-point or non-finite value.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        conclusion = grant_reconciliation.reconcile_machine_grants(
+            session, machine_id
+        )
+    except SQLAlchemyError:
+        # Never emit a partial conclusion when the records cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "valid": conclusion["valid"],
+        "checked_grant_count": conclusion["checked_grant_count"],
+        "historical_grant_count": conclusion["historical_grant_count"],
+        "broken_grant_id": conclusion["broken_grant_id"],
+        "anomaly": conclusion["anomaly"],
     }
     # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
     # fixed field order, terminated by a single newline, and free of any
