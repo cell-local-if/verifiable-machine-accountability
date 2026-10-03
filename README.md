@@ -2688,6 +2688,40 @@ plus exactly `ttl_seconds`, and `status` always `"active"`. Issuing a grant
 never modifies the event, its basis, any hash chain, evidence, incidents, or
 any other accountability record.
 
+`POST /machines/{machine_id}/authorization-grants/batch` signs several
+qualified allow events into independent grants in one request. The request
+carries no query string and a JSON object body with exactly one field,
+`items`: a non-empty array whose order is preserved, whose every element is a
+JSON object with exactly the two fields of the single-issue body (`event_id`
+a non-empty string, `ttl_seconds` a non-boolean integer from `1` to `300`),
+and in which no event id repeats. Any query parameter or repeated parameter
+is `422 {"error":{"code":"invalid_query"}}` validated before any record is
+read; a body that is missing, unparseable, not a JSON object, has a missing
+or extra top-level field, has an `items` value that is not a non-empty array,
+has an element with a wrong shape or field value, or repeats an event id is
+`422 {"error":{"code":"invalid_grant_request"}}`, likewise before any lookup.
+
+After validation every item is checked in input order against exactly the
+single-issue eligibility rules, and the first failing item decides the whole
+batch: a missing machine, a missing event, or an event owned by another
+machine is `404 {"error":{"code":"not_found"}}`; an event that is not a
+committed policy allow is `409 event_not_allowed`; an event without a
+historical decision-basis snapshot is `409 decision_basis_unavailable`; one
+whose snapshot fails the read-only consistency audit is
+`409 decision_basis_invalid`; an event that already has a grant is
+`409 grant_already_exists`. All eligibility reads, audits, and inserts run in
+one locked write transaction, so a rejected batch writes nothing — no partial
+issue is ever committed — and a concurrent single or batch issue racing for
+any of the same events has exactly one `201` winner, with the database-level
+unique constraint on `event_id` as the final backstop. The success body is
+the array of grant objects in input order, each with the single-issue shape
+`{id, machine_id, event_id, issued_at, expires_at, status}` and
+`status "active"`: every grant of the batch shares one UTC issue moment, and
+each `expires_at` is that moment plus the item's own `ttl_seconds`. Each
+issued grant is consumed, revoked, listed, and audited exactly like a
+singly-issued one, and batch issue never modifies the events, their bases,
+any chain, or any other accountability record.
+
 `POST /machines/{machine_id}/authorization-grants/{grant_id}/consume`
 atomically consumes one grant. It accepts only an empty query string and an
 empty request body: any query parameter, repeated parameter, or carried body
