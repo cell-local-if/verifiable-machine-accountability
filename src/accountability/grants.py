@@ -15,6 +15,11 @@ a short-lived credential that can be consumed exactly once:
   transaction, so a concurrent burst of consumptions has exactly one success;
   already-consumed, revoked, and expired grants are rejected and nothing is
   written.
+* :func:`issue_grants_batch` signs several eligible allow events into
+  independent grants inside one locked write transaction: the items are
+  checked in submission order, the first failure rejects the whole batch
+  with no partial issue, and every grant of the batch shares one UTC issue
+  instant with its own TTL.
 * :func:`revoke_grant` performs the emergency revocation: it atomically flips
   one unused, unexpired, unrevoked grant to ``revoked`` and stamps
   ``revoked_at`` in the same kind of locked transaction, so a concurrent burst
@@ -196,6 +201,136 @@ def issue_grant(
     except IntegrityError:
         # The unique event_id constraint is the cross-backstop race guard: a
         # concurrent transaction that committed the first grant first wins.
+        return {"status": "grant_already_exists"}
+
+
+def issue_grants_batch(
+    engine: Engine,
+    *,
+    machine_id: str,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Mint one one-time grant per item, all under one locked transaction.
+
+    ``items`` carries already-validated ``{event_id, ttl_seconds}`` dicts in
+    submission order with no repeated event id. The machine lookup, every
+    per-item eligibility check, and all inserts run in the same locked write
+    transaction :func:`issue_grant` uses, so the batch either commits
+    together or leaves no trace. Items are checked in submission order and
+    the first failure decides the whole batch's status:
+
+    * ``not_found`` — the path machine is missing, or an item's event is
+      missing or owned by another machine;
+    * ``event_not_allowed`` — the first item whose event did not commit
+      ``allowed = true`` / ``reason = "allowed_by_policy"``;
+    * ``decision_basis_unavailable`` — the first item whose event has no
+      historical decision-basis snapshot;
+    * ``decision_basis_invalid`` — the first item whose snapshot fails the
+      read-only consistency audit;
+    * ``grant_already_exists`` — the first item whose event already has a
+      grant (including one committed by a concurrent single issue or batch);
+    * ``ok`` — with ``grants``, the new grant dicts in submission order.
+
+    Every grant of the batch shares one UTC issue instant; each
+    ``expires_at`` is that instant plus its own ``ttl_seconds``. Nothing is
+    written on any non-ok outcome, and the batch never modifies an event, a
+    basis, or any other record.
+    """
+
+    def _work(conn) -> dict[str, Any]:
+        machine = conn.execute(
+            Machine.__table__.select().where(Machine.__table__.c.id == machine_id)
+        ).first()
+        if machine is None:
+            return {"status": "not_found"}
+
+        events = []
+        for item in items:
+            event_id = item["event_id"]
+            event_row = conn.execute(
+                _EVENT_TABLE.select().where(
+                    _EVENT_TABLE.c.id == event_id,
+                    _EVENT_TABLE.c.machine_id == machine_id,
+                )
+            ).first()
+            if event_row is None:
+                return {"status": "not_found"}
+
+            event = event_row._mapping
+            # Only a committed policy allow may ever be signed into a grant.
+            if not event["allowed"] or event["reason"] != "allowed_by_policy":
+                return {"status": "event_not_allowed"}
+
+            document = decision_basis.load_document(
+                conn, machine_id=machine_id, event_id=event_id
+            )
+            if document is None:
+                # An event committed before the basis feature has no
+                # historical basis: never reconstruct one from current data.
+                return {"status": "decision_basis_unavailable"}
+
+            conclusion = decision_basis_integrity.verify(
+                conn, machine_id=machine_id, event=event_row, document=document
+            )
+            if not conclusion["valid"]:
+                return {"status": "decision_basis_invalid"}
+
+            existing = conn.execute(
+                select(_GRANT_TABLE.c.id).where(
+                    _GRANT_TABLE.c.event_id == event_id
+                )
+            ).first()
+            if existing is not None:
+                return {"status": "grant_already_exists"}
+            events.append(event_id)
+
+        # One shared issue instant for the whole batch; each grant's expiry
+        # is that instant plus its own TTL.
+        issued = datetime.now(timezone.utc)
+        issued_at = _utc_iso(issued)
+        grants = []
+        for item, event_id in zip(items, events):
+            expires_at = _utc_iso(issued + timedelta(seconds=item["ttl_seconds"]))
+            grant_id = str(uuid.uuid4())
+            conn.execute(
+                _GRANT_TABLE.insert().values(
+                    id=grant_id,
+                    machine_id=machine_id,
+                    event_id=event_id,
+                    issued_at=issued_at,
+                    expires_at=expires_at,
+                    status="active",
+                    consumed_at=None,
+                )
+            )
+            # The audit event commits in the same locked transaction as the
+            # grant, reusing the response's issued_at as its occurred_at.
+            grant_lifecycle.append_event(
+                conn,
+                machine_id=machine_id,
+                grant_id=grant_id,
+                authorization_event_id=event_id,
+                type="issued",
+                occurred_at=issued_at,
+            )
+            grants.append(
+                {
+                    "id": grant_id,
+                    "machine_id": machine_id,
+                    "event_id": event_id,
+                    "issued_at": issued_at,
+                    "expires_at": expires_at,
+                    "status": "active",
+                }
+            )
+        return {"status": "ok", "grants": grants}
+
+    try:
+        return _run_with_lock_retry(engine, _work)
+    except IntegrityError:
+        # The unique event_id constraint is the cross-backstop race guard: a
+        # concurrent single issue or batch that committed a grant for one of
+        # these events first wins, and this batch leaves no trace.
         return {"status": "grant_already_exists"}
 
 

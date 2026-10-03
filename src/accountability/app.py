@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -10002,6 +10002,132 @@ async def create_authorization_grant(machine_id: str, request: Request):
     if status == "grant_already_exists":
         return error_response(409, "grant_already_exists")
     return AuthorizationGrantOut(**result["grant"])
+
+
+def _parse_grant_batch_payload(
+    payload: object,
+) -> list[dict[str, Any]] | None:
+    """Validate the batch-issue body before any machine or event is read.
+
+    The body must be a JSON object carrying exactly ``items``: a non-empty
+    array of objects, each with exactly ``event_id`` (a non-empty string
+    after trimming, like the single-issue field) and ``ttl_seconds`` (a
+    non-boolean integer from 1 to 300), with no event id repeated inside the
+    batch. Any other shape returns ``None`` for the single
+    ``invalid_grant_request`` outcome.
+    """
+    if not isinstance(payload, dict) or set(payload) != {"items"}:
+        return None
+    raw_items = payload["items"]
+    if not isinstance(raw_items, list) or not raw_items:
+        return None
+
+    items: list[dict[str, Any]] = []
+    seen_event_ids: set[str] = set()
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict) or set(raw_item) != {
+            "event_id",
+            "ttl_seconds",
+        }:
+            return None
+        raw_event_id = raw_item["event_id"]
+        ttl_seconds = raw_item["ttl_seconds"]
+        # The single-issue field rules apply item by item: booleans are
+        # integers in Python and must never be accepted as a TTL, and a
+        # blank-after-trim event id is an illegal body, not a lookup.
+        if isinstance(raw_event_id, bool) or not isinstance(raw_event_id, str):
+            return None
+        event_id = raw_event_id.strip()
+        if not event_id:
+            return None
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, int)
+            or not 1 <= ttl_seconds <= 300
+        ):
+            return None
+        # A repeated event id inside the batch is a format error, decided
+        # before any record is read.
+        if event_id in seen_event_ids:
+            return None
+        seen_event_ids.add(event_id)
+        items.append({"event_id": event_id, "ttl_seconds": ttl_seconds})
+    return items
+
+
+@app.post(
+    "/machines/{machine_id}/authorization-grants/batch",
+    status_code=201,
+    response_model=list[AuthorizationGrantOut],
+)
+async def create_authorization_grants_batch(machine_id: str, request: Request):
+    """Mint one one-time grant per item, all-or-nothing, in one transaction.
+
+    The request carries no query string and a JSON object body with exactly
+    one field: ``items``, a non-empty array of objects each carrying exactly
+    ``event_id`` and ``ttl_seconds`` under the single-issue field rules, with
+    no event id repeated. Validation runs before any machine, event, or
+    basis is read:
+
+    - any query parameter (or repeated parameter) is
+      ``422 {"error":{"code":"invalid_query"}}``;
+    - an unparseable body, a body that is not a JSON object, a missing or
+      extra top-level field, an empty or non-array ``items``, a malformed
+      item, or a repeated event id is
+      ``422 {"error":{"code":"invalid_grant_request"}}`` — even against a
+      non-existent machine the query check still wins, and every body check
+      still precedes the lookups.
+
+    After validation the items are checked in submission order and the first
+    failure decides the whole batch: a missing machine, event, or ownership
+    is ``404 {"error":{"code":"not_found"}}``; an event that is not a
+    committed policy allow is ``409 event_not_allowed``; one without a
+    historical decision-basis snapshot is ``409 decision_basis_unavailable``;
+    one whose snapshot fails the read-only consistency audit is
+    ``409 decision_basis_invalid``; one that already has a grant is
+    ``409 grant_already_exists``. Any refusal commits nothing, so a rejected
+    batch leaves no partial grants and every other record is unchanged.
+
+    On success the whole batch commits in one locked write transaction — the
+    same lock the single issue takes, backed by the database-level unique
+    constraint on ``event_id`` — so a batch racing a single issue or another
+    batch for one event has exactly one winner and every loser answers
+    ``409 grant_already_exists``; no grant is ever overwritten, renewed, or
+    reused. Every grant of the batch shares one UTC issue instant and each
+    ``expires_at`` is that instant plus its own ``ttl_seconds``. The
+    response is ``201`` with a JSON array of the new grant objects in
+    submission order, each carrying the single-issue success fields
+    ``{id, machine_id, event_id, issued_at, expires_at, status}`` with
+    ``status "active"``. The batch never modifies an event, a basis, any
+    chain, or any other accountability record, and the new grants are
+    consumed, revoked, listed, and audited exactly like singly-issued ones.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_grant_request")
+    items = _parse_grant_batch_payload(payload)
+    if items is None:
+        return error_response(422, "invalid_grant_request")
+
+    engine = request.app.state.engine
+    result = grants.issue_grants_batch(engine, machine_id=machine_id, items=items)
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "event_not_allowed":
+        return error_response(409, "event_not_allowed")
+    if status == "decision_basis_unavailable":
+        return error_response(409, "decision_basis_unavailable")
+    if status == "decision_basis_invalid":
+        return error_response(409, "decision_basis_invalid")
+    if status == "grant_already_exists":
+        return error_response(409, "grant_already_exists")
+    return [AuthorizationGrantOut(**grant) for grant in result["grants"]]
 
 
 @app.post(
