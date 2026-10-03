@@ -10516,6 +10516,10 @@ class ExecutionReceiptOut(BaseModel):
     chain_hash: str
 
 
+class ExecutionReceiptBatchOut(BaseModel):
+    records: list[ExecutionReceiptOut]
+
+
 def _parse_execution_receipt_payload(payload: object) -> dict[str, str] | None:
     """Validate the receipt object before any machine or use is read.
 
@@ -10632,6 +10636,121 @@ async def create_execution_receipt(machine_id: str, request: Request):
     if status == "execution_scope_mismatch":
         return error_response(409, "execution_scope_mismatch")
     return ExecutionReceiptOut(**result["receipt"])
+
+
+_EXECUTION_RECEIPT_BATCH_MAX = 100
+
+
+def _parse_execution_receipt_batch_payload(
+    payload: object,
+) -> list[dict[str, str]] | None:
+    """Validate the batch body before any machine or record is read.
+
+    The body must be a JSON object carrying exactly ``records``: an array of
+    one to one hundred items, each satisfying the single-receipt field
+    contract (exactly ``use_id``, ``action_type``, ``resource``, ``outcome``,
+    and ``result_digest`` with the single-creation value rules), and no two
+    items naming the same (trimmed) ``use_id``. Any other shape returns
+    ``None`` for the single ``invalid_execution_receipt_batch_request``
+    outcome.
+    """
+    if not isinstance(payload, dict) or set(payload) != {"records"}:
+        return None
+    raw_records = payload["records"]
+    if (
+        not isinstance(raw_records, list)
+        or not 1 <= len(raw_records) <= _EXECUTION_RECEIPT_BATCH_MAX
+    ):
+        return None
+
+    records: list[dict[str, str]] = []
+    seen_use_ids: set[str] = set()
+    for item in raw_records:
+        fields = _parse_execution_receipt_payload(item)
+        if fields is None:
+            return None
+        # A repeated use inside one batch can never commit twice; reject the
+        # whole request as malformed rather than letting one item fail later.
+        if fields["use_id"] in seen_use_ids:
+            return None
+        seen_use_ids.add(fields["use_id"])
+        records.append(fields)
+    return records
+
+
+@app.post(
+    "/machines/{machine_id}/execution-receipts/batch",
+    status_code=201,
+    response_model=ExecutionReceiptBatchOut,
+)
+async def create_execution_receipts_batch(machine_id: str, request: Request):
+    """Record one machine's batch of execution-completion receipts atomically.
+
+    The request carries only an empty query string and a JSON object body
+    with exactly ``records``: an array of one to one hundred objects, each
+    carrying exactly ``use_id``, ``action_type``, ``resource``, ``outcome``,
+    and ``result_digest`` under the same field rules as the single-receipt
+    entry, with no repeated ``use_id`` inside the batch. Any query parameter
+    (including a repeated name), a non-object/wrong-key body, an empty or
+    over-long array, an invalid item, or a repeated ``use_id`` is
+    ``422 invalid_execution_receipt_batch_request``, answered before any
+    machine, use, grant, or event is read. After validation, a missing
+    machine or any record whose use, grant, or source decision event is
+    missing or owned by another machine is ``404 not_found``. The records
+    are then checked in request order — committed ``allowed_by_policy``
+    source, verbatim action/resource scope, no existing receipt for the use
+    — and the first rejection answers ``409 authorization_not_allowed``,
+    ``409 execution_scope_mismatch``, or ``409 receipt_already_exists``;
+    every rejection writes nothing.
+
+    On success the whole batch commits in one locked write transaction — the
+    same lock the single-receipt creation takes, so concurrent batches
+    serialize and the per-machine chain never forks; two batches naming the
+    same use have exactly one winner, backed by the database-level unique
+    constraint. All records share one UTC commit moment ending in ``Z``, and
+    the response order, the ``previous_receipt_id`` link order, and the
+    strictly increasing ids at that shared instant all follow the request
+    order. The status is 201 with ``{"records": [...]}``, each item carrying
+    the nine single-receipt success fields in their fixed order. A real
+    persistence failure answers ``500 internal_error`` with no partial
+    receipt, and non-POST methods answer ``405``.
+    """
+    # This entry accepts only the exact request shape: a non-empty query is
+    # part of the same single format-error outcome, and every check precedes
+    # the machine/record lookups.
+    if request.query_params:
+        return error_response(422, "invalid_execution_receipt_batch_request")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_execution_receipt_batch_request")
+    records = _parse_execution_receipt_batch_payload(payload)
+    if records is None:
+        return error_response(422, "invalid_execution_receipt_batch_request")
+
+    engine = request.app.state.engine
+    try:
+        result = execution_receipts.create_receipts_batch(
+            engine, machine_id=machine_id, records=records
+        )
+    except SQLAlchemyError:
+        # Never answer a partial receipt when the transaction cannot
+        # complete; the locked write leaves no trace.
+        return error_response(500, "internal_error")
+
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "receipt_already_exists":
+        return error_response(409, "receipt_already_exists")
+    if status == "authorization_not_allowed":
+        return error_response(409, "authorization_not_allowed")
+    if status == "execution_scope_mismatch":
+        return error_response(409, "execution_scope_mismatch")
+    return ExecutionReceiptBatchOut(
+        records=[ExecutionReceiptOut(**receipt) for receipt in result["receipts"]]
+    )
 
 
 def validate_execution_receipt_integrity_params(request: Request) -> None:

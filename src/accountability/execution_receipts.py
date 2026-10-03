@@ -14,6 +14,11 @@ result and to the per-machine tamper-evident receipt chain.
   database-level unique constraint, so a concurrent burst for one use has
   exactly one winner; the losers answer ``receipt_already_exists`` and write
   nothing. Old uses never receive a backfilled receipt.
+* :func:`create_receipts_batch` is the atomic multi-record entry: one to one
+  hundred already-validated records are resolved, checked, and appended in
+  request order inside the same single locked write transaction, sharing one
+  UTC commit moment and extending the chain link by link, so the batch
+  commits as a whole or leaves no trace.
 * :func:`verify_machine_receipts` is the independent, strictly read-only
   audit of one machine's receipt chain. Receipts are examined by the actual
   UTC instant of ``occurred_at`` and then by ``id``; a stored stamp that no
@@ -418,6 +423,230 @@ def create_receipt(
                 "chain_hash": chain_hash,
             },
         }
+
+    try:
+        return _run_with_lock_retry(engine, _work)
+    except IntegrityError:
+        # The unique use_id constraint is the cross-backstop race guard: a
+        # concurrent transaction that inserted the first receipt wins.
+        return {"status": "receipt_already_exists"}
+
+
+def _mint_increasing_id(floor_id: str | None) -> str:
+    """Mint a receipt id that sorts strictly after ``floor_id`` (if given).
+
+    Against a previous transaction's tail id — an ordinary random uuid — a
+    fresh draw already sorts after it half the time, so a couple of
+    rejection draws suffice. Against a floor this same batch just minted the
+    floor is a running record-high that random draws beat with vanishing
+    probability, so the numeric uuid value is bumped just past the floor
+    instead (canonical uuid strings order lexicographically exactly as their
+    128-bit values). A floor that is not a parseable uuid falls back to
+    rejection draws, matching the single-receipt creation's behavior.
+    """
+    candidate = str(uuid.uuid4())
+    if floor_id is None or candidate > floor_id:
+        return candidate
+    try:
+        bumped = uuid.UUID(floor_id).int + 1
+    except ValueError:
+        bumped = None
+    if bumped is not None and bumped < 1 << 128:
+        candidate = str(uuid.UUID(int=bumped))
+        if candidate > floor_id:
+            return candidate
+    while candidate <= floor_id:
+        candidate = str(uuid.uuid4())
+    return candidate
+
+
+def create_receipts_batch(
+    engine: Engine,
+    *,
+    machine_id: str,
+    records: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Record one machine's batch of execution-completion receipts atomically.
+
+    ``records`` carries one to one hundred already field-validated dicts of
+    the five receipt fields (``use_id``, ``action_type``, ``resource``,
+    ``outcome``, ``result_digest``), with no repeated ``use_id``; the request
+    order is the commit and chain-link order. The machine lookup, every
+    record's use/grant/event binding reads, the per-record eligibility
+    checks, and all chain-tail inserts run in one locked write transaction —
+    the same lock the single-receipt creation takes — so concurrent batches
+    serialize, the chain never forks, and the batch commits as a whole or
+    leaves no trace. Returns a status dict:
+
+    * ``not_found`` — the path machine is missing, or any record's use,
+      grant, or source event is missing or owned by another machine;
+    * ``authorization_not_allowed`` — the first record, in request order,
+      whose source event did not commit ``allowed = true`` /
+      ``reason = "allowed_by_policy"``;
+    * ``execution_scope_mismatch`` — the first record whose ``action_type``
+      or ``resource`` does not match its source event verbatim;
+    * ``receipt_already_exists`` — the first record whose use already
+      carries a receipt;
+    * ``ok`` — with ``receipts``, the new receipt dicts in request order.
+
+    Nothing is written on any non-ok outcome. All receipts of one batch
+    share the same UTC commit moment; their ids are minted strictly
+    increasing at that instant so the (instant, id) chain order matches the
+    request order. Creating the receipts never modifies a use, a grant, a
+    source event, or any other chain.
+    """
+
+    def _work(conn: Connection) -> dict[str, Any]:
+        machine = conn.execute(
+            Machine.__table__.select().where(Machine.__table__.c.id == machine_id)
+        ).first()
+        if machine is None:
+            return {"status": "not_found"}
+
+        # Resolve every record's use/grant/event binding first: a use owned
+        # by another machine is indistinguishable from a missing one, and
+        # any missing record fails the whole batch before the eligibility
+        # checks begin.
+        bindings: list[tuple[Any, Any, Any]] = []
+        for record in records:
+            use_row = conn.execute(
+                _USE_TABLE.select().where(
+                    _USE_TABLE.c.id == record["use_id"],
+                    _USE_TABLE.c.machine_id == machine_id,
+                )
+            ).first()
+            if use_row is None:
+                return {"status": "not_found"}
+            use = use_row._mapping
+
+            grant_row = conn.execute(
+                _GRANT_TABLE.select().where(
+                    _GRANT_TABLE.c.id == use["grant_id"],
+                    _GRANT_TABLE.c.machine_id == machine_id,
+                )
+            ).first()
+            if grant_row is None:
+                return {"status": "not_found"}
+
+            event_row = conn.execute(
+                _EVENT_TABLE.select().where(
+                    _EVENT_TABLE.c.id == use["event_id"],
+                    _EVENT_TABLE.c.machine_id == machine_id,
+                )
+            ).first()
+            if event_row is None:
+                return {"status": "not_found"}
+
+            bindings.append((use, grant_row._mapping, event_row._mapping))
+
+        # The eligibility checks run in request order; the first rejection
+        # decides the whole batch and nothing is written.
+        for record, (_use, _grant, event) in zip(records, bindings):
+            if not event["allowed"] or event["reason"] != "allowed_by_policy":
+                return {"status": "authorization_not_allowed"}
+            if (
+                record["action_type"] != event["action_type"]
+                or record["resource"] != event["resource"]
+            ):
+                return {"status": "execution_scope_mismatch"}
+            existing = conn.execute(
+                select(_TABLE.c.id).where(_TABLE.c.use_id == record["use_id"])
+            ).first()
+            if existing is not None:
+                return {"status": "receipt_already_exists"}
+
+        rows = _load_records(conn, machine_id)
+        # Every row this feature writes carries its hashes. If any row is
+        # missing chain data (e.g. an external writer), rebuild the whole
+        # machine chain before appending so the new links have a sound tail.
+        if any(
+            row._mapping["content_hash"] is None
+            or row._mapping["chain_hash"] is None
+            for row in rows
+        ):
+            for values in _recompute_rows(rows):
+                receipt_id = values.pop("id")
+                conn.execute(
+                    _TABLE.update()
+                    .where(_TABLE.c.id == receipt_id)
+                    .values(**values)
+                )
+            rows = _load_records(conn, machine_id)
+
+        tail = rows[-1] if rows else None
+
+        # One commit moment shared by the whole batch; the ids minted below
+        # are strictly increasing at that instant, so the (instant, id)
+        # chain order is exactly the request order.
+        occurred_at = _utc_iso(datetime.now(timezone.utc))
+        if tail is None:
+            previous_receipt_id: str | None = None
+            previous_chain_hash = ""
+            floor_id: str | None = None
+        else:
+            previous_receipt_id = tail._mapping["id"]
+            previous_chain_hash = tail._mapping["chain_hash"]
+            # Same-instant receipts must still sort strictly after the tail;
+            # the id is the only degree of freedom, since occurred_at is the
+            # commit moment shared by the response.
+            floor_id = (
+                previous_receipt_id
+                if occurred_at == tail._mapping["occurred_at"]
+                else None
+            )
+
+        receipts: list[dict[str, Any]] = []
+        for record, (_use, grant, event) in zip(records, bindings):
+            receipt_id = _mint_increasing_id(floor_id)
+
+            content_hash = compute_content_hash(
+                id=receipt_id,
+                machine_id=machine_id,
+                use_id=record["use_id"],
+                grant_id=grant["id"],
+                authorization_event_id=event["id"],
+                action_type=record["action_type"],
+                resource=record["resource"],
+                outcome=record["outcome"],
+                result_digest=record["result_digest"],
+                occurred_at=occurred_at,
+            )
+            chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+            conn.execute(
+                _TABLE.insert().values(
+                    id=receipt_id,
+                    machine_id=machine_id,
+                    use_id=record["use_id"],
+                    grant_id=grant["id"],
+                    authorization_event_id=event["id"],
+                    action_type=record["action_type"],
+                    resource=record["resource"],
+                    outcome=record["outcome"],
+                    result_digest=record["result_digest"],
+                    occurred_at=occurred_at,
+                    previous_receipt_id=previous_receipt_id,
+                    content_hash=content_hash,
+                    chain_hash=chain_hash,
+                )
+            )
+            receipts.append(
+                {
+                    "id": receipt_id,
+                    "machine_id": machine_id,
+                    "use_id": record["use_id"],
+                    "grant_id": grant["id"],
+                    "authorization_event_id": event["id"],
+                    "occurred_at": occurred_at,
+                    "previous_receipt_id": previous_receipt_id,
+                    "content_hash": content_hash,
+                    "chain_hash": chain_hash,
+                }
+            )
+            previous_receipt_id = receipt_id
+            previous_chain_hash = chain_hash
+            floor_id = receipt_id
+
+        return {"status": "ok", "receipts": receipts}
 
     try:
         return _run_with_lock_retry(engine, _work)
