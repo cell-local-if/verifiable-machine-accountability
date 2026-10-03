@@ -14,6 +14,14 @@ result and to the per-machine tamper-evident receipt chain.
   database-level unique constraint, so a concurrent burst for one use has
   exactly one winner; the losers answer ``receipt_already_exists`` and write
   nothing. Old uses never receive a backfilled receipt.
+* :func:`create_receipts_batch` applies the same binding semantics to a
+  whole batch of records in one locked write transaction: every record is
+  resolved and checked in submission order, the first refusal rejects the
+  whole batch with no partial receipts, and a committed batch shares one
+  UTC commit instant with chain links and response order following the
+  submission order. Concurrent batches serialize on the same lock and the
+  ``use_id`` unique constraint, so two batches naming one use have exactly
+  one winner and the chain never forks.
 * :func:`verify_machine_receipts` is the independent, strictly read-only
   audit of one machine's receipt chain. Receipts are examined by the actual
   UTC instant of ``occurred_at`` and then by ``id``; a stored stamp that no
@@ -91,6 +99,8 @@ _CONTENT_COLUMNS = (
 _OUTCOMES = ("succeeded", "failed")
 
 _FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+_UUID_MAX_INT = (1 << 128) - 1
 
 
 def compute_content_hash(
@@ -424,6 +434,244 @@ def create_receipt(
     except IntegrityError:
         # The unique use_id constraint is the cross-backstop race guard: a
         # concurrent transaction that inserted the first receipt wins.
+        return {"status": "receipt_already_exists"}
+
+
+def create_receipts_batch(
+    engine: Engine,
+    *,
+    machine_id: str,
+    records: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Atomically record one execution-completion receipt per record.
+
+    Every record carries the already-validated ``use_id``, ``action_type``,
+    ``resource``, ``outcome``, and ``result_digest`` of one consumed grant
+    use; the batch applies the single-receipt binding semantics to each item
+    in ``records`` order. The machine lookup, the per-record use/grant/event
+    binding reads, the source-event eligibility and verbatim scope checks,
+    the duplicate-use checks, and all chain-tail inserts run in one locked
+    write transaction — the same lock the single-receipt create takes — so
+    concurrent batches serialize, never fork the per-machine chain, and a
+    batch racing another writer for one use has exactly one winner. Returns
+    a status dict:
+
+    * ``not_found`` — the path machine is missing, or any record's use,
+      grant, or source event is missing or owned by another machine;
+    * ``authorization_not_allowed`` — the first record (in ``records``
+      order) whose source event did not commit ``allowed = true`` /
+      ``reason = "allowed_by_policy"``;
+    * ``execution_scope_mismatch`` — the first record whose ``action_type``
+      or ``resource`` does not match its source event verbatim;
+    * ``receipt_already_exists`` — the first record whose use already
+      carries a receipt (also the cross-backstop race-loser outcome);
+    * ``ok`` — with the ``receipts`` list in ``records`` order.
+
+    Every receipt of one batch shares one UTC commit instant, links to its
+    predecessor in ``records`` order, and carries an id that sorts after its
+    same-instant predecessor's. Nothing is written on any non-ok outcome:
+    the whole batch commits together or leaves no trace, and a rejected
+    batch never modifies a use, a grant, an event, or any other chain.
+    """
+
+    def _work(conn: Connection) -> dict[str, Any]:
+        machine = conn.execute(
+            Machine.__table__.select().where(Machine.__table__.c.id == machine_id)
+        ).first()
+        if machine is None:
+            return {"status": "not_found"}
+
+        # Binding pass: every record's use, grant, and source event must
+        # exist under the path machine before any business check runs — a
+        # record owned by another machine is indistinguishable from a
+        # missing one.
+        resolved: list[tuple[dict[str, str], Any, Any, Any]] = []
+        for record in records:
+            use_row = conn.execute(
+                _USE_TABLE.select().where(
+                    _USE_TABLE.c.id == record["use_id"],
+                    _USE_TABLE.c.machine_id == machine_id,
+                )
+            ).first()
+            if use_row is None:
+                return {"status": "not_found"}
+            use = use_row._mapping
+
+            grant_row = conn.execute(
+                _GRANT_TABLE.select().where(
+                    _GRANT_TABLE.c.id == use["grant_id"],
+                    _GRANT_TABLE.c.machine_id == machine_id,
+                )
+            ).first()
+            if grant_row is None:
+                return {"status": "not_found"}
+            grant = grant_row._mapping
+
+            event_row = conn.execute(
+                _EVENT_TABLE.select().where(
+                    _EVENT_TABLE.c.id == use["event_id"],
+                    _EVENT_TABLE.c.machine_id == machine_id,
+                )
+            ).first()
+            if event_row is None:
+                return {"status": "not_found"}
+            resolved.append((record, use, grant, event_row._mapping))
+
+        # Business pass in records order: the first refusal decides the
+        # whole batch, and nothing has been written yet.
+        for record, use, grant, event in resolved:
+            # The audit never trusts history: the source must still be a
+            # committed policy allow.
+            if not event["allowed"] or event["reason"] != "allowed_by_policy":
+                return {"status": "authorization_not_allowed"}
+            # The receipt attests the exact action/resource the
+            # authorization was issued for: verbatim, no trimming or folding.
+            if (
+                record["action_type"] != event["action_type"]
+                or record["resource"] != event["resource"]
+            ):
+                return {"status": "execution_scope_mismatch"}
+            # One receipt per consumed use is a hard, database-enforced
+            # invariant; a repeated or racing batch naming the same use gets
+            # the terminal conflict.
+            existing = conn.execute(
+                select(_TABLE.c.id).where(_TABLE.c.use_id == record["use_id"])
+            ).first()
+            if existing is not None:
+                return {"status": "receipt_already_exists"}
+
+        rows = _load_records(conn, machine_id)
+        # Every row this feature writes carries its hashes. If any row is
+        # missing chain data (e.g. an external writer), rebuild the whole
+        # machine chain before appending so the new links have a sound tail.
+        if any(
+            row._mapping["content_hash"] is None
+            or row._mapping["chain_hash"] is None
+            for row in rows
+        ):
+            for values in _recompute_rows(rows):
+                receipt_id = values.pop("id")
+                conn.execute(
+                    _TABLE.update()
+                    .where(_TABLE.c.id == receipt_id)
+                    .values(**values)
+                )
+            rows = _load_records(conn, machine_id)
+
+        tail = rows[-1] if rows else None
+
+        # One commit instant shared by the whole batch; the chain links and
+        # the response follow records order, and same-instant ids sort
+        # strictly after their predecessor's.
+        occurred_at = _utc_iso(datetime.now(timezone.utc))
+        previous_receipt_id: str | None = None
+        previous_chain_hash = ""
+        same_instant_floor: str | None = None
+        if tail is not None:
+            previous_receipt_id = tail._mapping["id"]
+            previous_chain_hash = tail._mapping["chain_hash"]
+            # Same-instant receipts must still sort strictly after the
+            # tail; the id is the only degree of freedom, since
+            # occurred_at is the commit moment shared by the batch.
+            if tail._mapping["occurred_at"] == occurred_at:
+                same_instant_floor = tail._mapping["id"]
+
+        # Canonical UUID strings order like their integers, so one random
+        # base (lifted above a same-instant tail) plus one increment per
+        # record gives the whole batch strictly increasing ids without a
+        # per-record redraw — redrawing against a rising floor would shrink
+        # the remaining id space exponentially with the batch size.
+        start_int: int | None = None
+        if same_instant_floor is None:
+            start_int = uuid.uuid4().int
+        else:
+            try:
+                start_int = max(
+                    uuid.uuid4().int, uuid.UUID(same_instant_floor).int + 1
+                )
+            except (ValueError, TypeError, AttributeError):
+                # A damaged non-UUID tail id has no integer floor.
+                start_int = None
+        if start_int is not None and (
+            start_int + len(resolved) - 1 > _UUID_MAX_INT
+        ):
+            # No room for the whole batch above the base — only reachable
+            # with an externally damaged near-maximum tail id.
+            start_int = None
+        if start_int is not None:
+            receipt_ids = [
+                str(uuid.UUID(int=start_int + offset))
+                for offset in range(len(resolved))
+            ]
+        else:
+            # Fall back to the single-receipt redraw discipline.
+            receipt_ids = []
+            floor = same_instant_floor
+            for _ in resolved:
+                candidate = str(uuid.uuid4())
+                if floor is not None:
+                    while candidate <= floor:
+                        candidate = str(uuid.uuid4())
+                receipt_ids.append(candidate)
+                floor = candidate
+
+        receipts: list[dict[str, Any]] = []
+        for (record, use, grant, event), receipt_id in zip(resolved, receipt_ids):
+
+            content_hash = compute_content_hash(
+                id=receipt_id,
+                machine_id=machine_id,
+                use_id=record["use_id"],
+                grant_id=grant["id"],
+                authorization_event_id=event["id"],
+                action_type=record["action_type"],
+                resource=record["resource"],
+                outcome=record["outcome"],
+                result_digest=record["result_digest"],
+                occurred_at=occurred_at,
+            )
+            chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+            conn.execute(
+                _TABLE.insert().values(
+                    id=receipt_id,
+                    machine_id=machine_id,
+                    use_id=record["use_id"],
+                    grant_id=grant["id"],
+                    authorization_event_id=event["id"],
+                    action_type=record["action_type"],
+                    resource=record["resource"],
+                    outcome=record["outcome"],
+                    result_digest=record["result_digest"],
+                    occurred_at=occurred_at,
+                    previous_receipt_id=previous_receipt_id,
+                    content_hash=content_hash,
+                    chain_hash=chain_hash,
+                )
+            )
+            receipts.append(
+                {
+                    "id": receipt_id,
+                    "machine_id": machine_id,
+                    "use_id": record["use_id"],
+                    "grant_id": grant["id"],
+                    "authorization_event_id": event["id"],
+                    "occurred_at": occurred_at,
+                    "previous_receipt_id": previous_receipt_id,
+                    "content_hash": content_hash,
+                    "chain_hash": chain_hash,
+                }
+            )
+            previous_receipt_id = receipt_id
+            previous_chain_hash = chain_hash
+
+        return {"status": "ok", "receipts": receipts}
+
+    try:
+        return _run_with_lock_retry(engine, _work)
+    except IntegrityError:
+        # The unique use_id constraint is the cross-backstop race guard: a
+        # concurrent transaction that inserted the first receipt wins, and
+        # the losing batch leaves no partial records.
         return {"status": "receipt_already_exists"}
 
 
