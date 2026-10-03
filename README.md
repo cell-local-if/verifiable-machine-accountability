@@ -2141,6 +2141,64 @@ body is compact UTF-8 JSON in a fixed field order terminated by a single
 newline, free of floating-point, `-0.0`, or non-finite values, and
 byte-identical on repeat calls and across application restarts.
 
+## Read-only single-event execution trace
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/execution-trace`
+returns a deterministic, read-only, single-event execution accountability
+trace in one response. It adds a new query only; grant issue, the single
+consumption, emergency revocation, grant-lifecycle events, execution receipts,
+the hash chains, the existing accountability-trace, exports, diagnostics, and
+the health check are unchanged and no write entry is added. The caller submits
+only the path machine id and the path event id — no query parameters, repeated
+parameters, request body, or business filter:
+
+- any query string (including a repeated parameter), or a body carried on the
+  GET, returns `422 {"error":{"code":"invalid_query"}}` before the machine or
+  event is looked up and without reading any record;
+- a missing machine, a missing event, or an event owned by another machine
+  returns `404 {"error":{"code":"not_found"}}` with no execution data;
+- a failure while reading the event or any grant, use, lifecycle, or receipt
+  record returns `500 {"error":{"code":"internal_error"}}` with no event
+  summary and none of the record arrays — never a partial result;
+- the path accepts `GET` only; `HEAD` and every other method return `405`
+  without reading records, assembling a trace, or writing anything.
+
+A successful response is exactly five groups in this fixed order. The first,
+`event_summary`, is a single object (never an array) carrying the selected
+event's result and reason (`allowed`, `reason`), its creation moment
+(`created_at`), and its chain fields (`previous_event_id`, `content_hash`,
+`chain_hash`). The other four groups are arrays: `grants`, `grant_uses`,
+`lifecycle_events`, and `execution_receipts`.
+
+Each array contains only records whose own `machine_id` is the path machine
+and whose own event reference equals the selected event id — the grant's and
+use's `event_id`, and the lifecycle event's and receipt's
+`authorization_event_id`. References are never resolved across tables, so a
+child record is still traced when its stored grant or use parent is damaged or
+missing, and a dangling or duplicated reference survives verbatim instead of
+filtering the record; another machine's records never enter a group. Every
+record is output with its complete stored fields exactly as stored — a grant
+keeps its stored `status`, `consumed_at`, and `revoked_at` with no derived
+"expired" state against the current time, lifecycle events keep their chain
+fields, and receipts keep `use_id`/`grant_id` and their chain fields — with no
+repair, recomputation, normalization, or dropping of a damaged, duplicated, or
+dangling value.
+
+Each array is ordered by the actual UTC instant of its own business timestamp
+— `issued_at` for grants, `consumed_at` for uses, and `occurred_at` for
+lifecycle events and receipts — and then by record id ascending, so an
+exact-second record precedes a fractional-second record of the same second; a
+timestamp whose original text no longer parses is kept verbatim and sorts
+after every parseable instant instead of crashing. Every array is present, an
+empty array when the event has no record of that kind: an event that was never
+signed has four empty arrays, and a denied decision returns the empty
+execution chain as well. In a complete flow the grant, its use, the
+issued/consumed (or issued/revoked) lifecycle events, and the execution
+receipt appear in that order. The body is compact UTF-8 JSON in a fixed field
+order terminated by a single newline, free of floating-point, `-0.0`, or
+non-finite values, and byte-identical on repeat calls and across application
+restarts.
+
 ## Read-only desensitized privacy responsibility export
 
 `GET /machines/{machine_id}/authorization-decision-events/privacy-responsibility/compliance-export`
