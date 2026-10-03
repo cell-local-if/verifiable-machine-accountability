@@ -20,7 +20,9 @@ a short-lived credential that can be consumed exactly once:
   grant to ``consumed`` and inserts its single use record in the same locked
   transaction, so a concurrent burst of consumptions has exactly one success;
   already-consumed, revoked, and expired grants are rejected and nothing is
-  written.
+  written. A grant that is still consumable but belongs to a ``suspended``
+  machine is rejected with ``machine_suspended`` — again writing nothing —
+  and can be consumed once the machine is ``active`` again.
 * :func:`revoke_grant` performs the emergency revocation: it atomically flips
   one unused, unexpired, unrevoked grant to ``revoked`` and stamps
   ``revoked_at`` in the same kind of locked transaction, so a concurrent burst
@@ -345,10 +347,20 @@ def consume_grant(
     * ``grant_consumed`` — the grant was already consumed;
     * ``grant_revoked`` — the grant was emergency-revoked;
     * ``grant_expired`` — the grant is past its ``expires_at``;
+    * ``machine_suspended`` — the grant is still consumable but the machine
+      is currently ``suspended``, so no new authorization action may run;
     * ``ok`` — with ``{grant_id, use_id, consumed_at}``.
 
     A rejection writes nothing; the status change and the use record commit
-    together or leave no trace.
+    together or leave no trace. The machine's status is read inside the same
+    locked write transaction the state flip commits in — the same lock a
+    machine status change takes — so a suspension racing a consumption has
+    one definite serial order: consume first keeps its single success, use
+    record, and ``consumed`` lifecycle event; suspend first makes the
+    consumption answer ``machine_suspended`` and write nothing. A
+    ``machine_suspended`` rejection leaves the grant untouched, and the same
+    still-active, unexpired grant can be consumed once the machine is
+    ``active`` again; nothing is reissued, renewed, transferred, or revived.
     """
 
     def _work(conn) -> dict[str, Any]:
@@ -380,6 +392,13 @@ def consume_grant(
             # Expiry is derived from the immutable expires_at; an expired
             # grant is never updated, renewed, or rewritten.
             return {"status": "grant_expired"}
+
+        if machine._mapping["status"] == "suspended":
+            # A suspended machine cannot run new authorization actions. The
+            # grant itself is untouched: no state flip, no use record, no
+            # lifecycle event, and the same still-active grant can be
+            # consumed once the machine is active again.
+            return {"status": "machine_suspended"}
 
         consumed_at = _utc_iso(now)
         use_id = str(uuid.uuid4())
