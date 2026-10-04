@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -11635,6 +11635,136 @@ def export_execution_receipts_compliance(
         "from_occurred_at": params.from_occurred_at,
         "to_occurred_at": params.to_occurred_at,
         "receipts": receipts,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
+# --- read-only desensitized privacy execution-receipt export -----------------
+
+
+def privacy_receipt_to_dict(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Desensitized privacy view of one exported execution receipt.
+
+    The raw ``action_type``/``resource`` never leave the service: their
+    positions carry ``action_ref``/``resource_ref``, the SHA-256 digests of
+    ``privacy:v1|action`` / ``privacy:v1|resource`` concatenated with the
+    path machine id and the stored value with surrounding whitespace removed
+    (``null`` when the stored value is not a string or is blank after
+    trimming). Every other field — the references, outcome, result digest,
+    occurred_at, and the receipt chain fields — is emitted exactly as
+    stored, in the same fixed thirteen-position order as the compliance
+    export with only the two desensitized positions renamed.
+    """
+    machine_id = receipt["machine_id"]
+    return {
+        "id": receipt["id"],
+        "machine_id": receipt["machine_id"],
+        "use_id": receipt["use_id"],
+        "grant_id": receipt["grant_id"],
+        "authorization_event_id": receipt["authorization_event_id"],
+        "action_ref": privacy_reference_digest(
+            "action", machine_id, receipt["action_type"]
+        ),
+        "resource_ref": privacy_reference_digest(
+            "resource", machine_id, receipt["resource"]
+        ),
+        "outcome": receipt["outcome"],
+        "result_digest": receipt["result_digest"],
+        "occurred_at": receipt["occurred_at"],
+        "previous_receipt_id": receipt["previous_receipt_id"],
+        "content_hash": receipt["content_hash"],
+        "chain_hash": receipt["chain_hash"],
+    }
+
+
+@app.get("/machines/{machine_id}/execution-receipts/privacy-export")
+def export_execution_receipts_privacy(
+    machine_id: str,
+    params: Annotated[
+        ExecutionReceiptExportParams,
+        Depends(validate_execution_receipt_export_params),
+    ],
+    session: SessionDep,
+):
+    """Read-only desensitized privacy export of one machine's receipts in a
+    time window.
+
+    The real entry point is the ``privacy-export`` sub-entry under the
+    machine execution-receipt path; only ``GET`` is routed, so ``HEAD`` and
+    every other method return ``405`` without reading receipts, digesting,
+    or writing anything. The caller submits only the path machine id and the
+    two required bounds ``from_occurred_at``/``to_occurred_at`` — UTC RFC
+    3339 date-times ending in ``Z`` (fractional seconds optional, equal
+    bounds allowed; offset forms such as ``+00:00`` are rejected). Query
+    validation (``invalid_query`` for an unknown parameter, a repeated
+    bound, or a carried request body; ``bad_time`` for a missing, blank,
+    offset, whitespace-padded, malformed, out-of-range, or inverted bound)
+    completes before the machine or any receipt is read, so a parameter
+    error takes priority even against a missing machine; a valid query
+    against a missing machine is a 404 ``not_found`` carrying no receipts.
+
+    On success the response carries exactly ``{machine_id,
+    from_occurred_at, to_occurred_at, receipts}`` in this fixed key order;
+    the path machine id and the original bound text are echoed back, and
+    ``receipts`` is always present (an empty array for an empty window, a
+    machine with no receipts, or an empty database). The array holds only
+    the path machine's receipts whose own ``occurred_at`` parses as a UTC
+    instant inside the closed interval — a receipt with a damaged,
+    unparseable stamp is excluded from the slice and left exactly as stored
+    — and items are ordered by the actual UTC instant of ``occurred_at``
+    and then by receipt id ascending. Each item carries exactly ``{id,
+    machine_id, use_id, grant_id, authorization_event_id, action_ref,
+    resource_ref, outcome, result_digest, occurred_at, previous_receipt_id,
+    content_hash, chain_hash}``: the raw action and resource are never
+    returned, only their desensitizing digests, while the binding
+    references, outcome, result digest, stamp, and chain fields are emitted
+    exactly as stored with no repair or recomputation, so a chain-damaged
+    receipt inside the window is exported with its stored values verbatim.
+    Another machine's receipts never enter the result. A real failure while
+    reading the machine or the receipts returns 500 ``internal_error`` with
+    no partial receipts. The query is strictly read-only: it never inserts,
+    updates, deletes, backfills, or normalizes a receipt or any related row,
+    so repeated reads of unchanged data return byte-identical results. The
+    body is compact UTF-8 JSON terminated by a single newline and contains
+    no floating-point, ``-0.0``, or non-finite value.
+    """
+    # Any failure while *reading* — the machine lookup, the receipt rows, or
+    # the ordering over them — is an internal read-layer fault: answer 500
+    # internal_error with no partial receipts. Damaged stored values are not
+    # a read failure — rows read successfully are filtered with the strict
+    # stamp parser and the retained rows are emitted verbatim.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+
+        window_start = parse_utc_z_datetime(params.from_occurred_at)
+        window_end = parse_utc_z_datetime(params.to_occurred_at)
+
+        receipts = execution_receipts.export_receipt_window(
+            session,
+            machine_id,
+            start=window_start,
+            end=window_end,
+        )
+    except SQLAlchemyError:
+        # Never emit partial receipts when the records cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": machine_id,
+        "from_occurred_at": params.from_occurred_at,
+        "to_occurred_at": params.to_occurred_at,
+        "receipts": [privacy_receipt_to_dict(receipt) for receipt in receipts],
     }
     # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
     # fixed field order, terminated by a single newline, and free of any
