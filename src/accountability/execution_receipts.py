@@ -44,6 +44,12 @@ result and to the per-machine tamper-evident receipt chain.
   interval, ordered by that instant and then by id, with every stored field
   emitted verbatim. A receipt whose stamp no longer parses is excluded, not
   repaired, and no reference, chain field, or hash is ever recomputed.
+* :func:`export_receipt_privacy_window` is the strictly read-only
+  desensitized fixed-window slice: the same membership, ordering, and
+  verbatim guarantees as :func:`export_receipt_window`, but the raw
+  ``action_type`` and ``resource`` text never leaves the service — their
+  positions carry the machine-scoped SHA-256 ``action_ref`` and
+  ``resource_ref`` digests instead.
 
 Each machine's receipts form an ordered chain following the same rules as
 the other per-machine chains:
@@ -990,6 +996,47 @@ _EXPORT_FIELDS = (
 )
 
 
+def _load_rows_in_window(
+    session,
+    machine_id: str,
+    *,
+    start: datetime,
+    end: datetime,
+) -> list[tuple[datetime, Any]]:
+    """Load one machine's receipts inside a closed UTC ``occurred_at`` window.
+
+    Reads only rows of ``execution_receipts`` owned by ``machine_id`` (the
+    ownership column is the sole machine boundary) and keeps a row only when
+    its stored ``occurred_at`` parses to a UTC instant inside the closed
+    interval ``[start, end]``. A stamp that no longer parses — non-text,
+    missing the ``Z`` suffix, carrying an offset, malformed, or
+    out-of-range — is excluded and left exactly as stored; the read never
+    crashes on, repairs, normalizes, or recomputes it. The retained rows are
+    ordered by the actual UTC instant of ``occurred_at`` and then by receipt
+    id ascending, so an exact-second stamp sorts before any
+    fractional-second stamp of the same second. Issues reads only.
+    """
+    rows = list(
+        session.execute(
+            _TABLE.select().where(_TABLE.c.machine_id == machine_id)
+        )
+    )
+
+    in_window: list[tuple[datetime, Any]] = []
+    for row in rows:
+        instant = _parse_occurred_at_utc(row._mapping["occurred_at"])
+        if instant is not None and start <= instant <= end:
+            in_window.append((instant, row))
+
+    in_window.sort(
+        key=lambda item: (
+            item[0],
+            _receipt_id_key(item[1]._mapping["id"]),
+        )
+    )
+    return in_window
+
+
 def export_receipt_window(
     session,
     machine_id: str,
@@ -1019,26 +1066,94 @@ def export_receipt_window(
     a receipt or any related row, so repeated reads of unchanged data return
     byte-identical results and the data survives restarts untouched.
     """
-    rows = list(
-        session.execute(
-            _TABLE.select().where(_TABLE.c.machine_id == machine_id)
-        )
-    )
-
-    in_window: list[tuple[datetime, Any]] = []
-    for row in rows:
-        instant = _parse_occurred_at_utc(row._mapping["occurred_at"])
-        if instant is not None and start <= instant <= end:
-            in_window.append((instant, row))
-
-    in_window.sort(
-        key=lambda item: (
-            item[0],
-            _receipt_id_key(item[1]._mapping["id"]),
-        )
+    in_window = _load_rows_in_window(
+        session, machine_id, start=start, end=end
     )
 
     return [
         {field: row._mapping[field] for field in _EXPORT_FIELDS}
         for _, row in in_window
     ]
+
+
+def privacy_reference_digest(kind: str, machine_id: str, raw: object) -> str | None:
+    """Desensitizing digest for one receipt scope field.
+
+    The three segments ``privacy:v1|<kind>``, the path machine id, and the
+    stored value with surrounding whitespace removed are joined directly
+    (no separator beyond the one inside the prefix) and hashed as UTF-8 with
+    SHA-256, yielding 64 lowercase hexadecimal characters. ``kind`` is
+    ``action`` or ``resource``. When the stored value is not a string or is
+    empty after stripping surrounding whitespace, the digest is ``None`` so
+    the raw value is never emitted.
+    """
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    message = f"privacy:v1|{kind}{machine_id}{value}"
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+
+def export_receipt_privacy_window(
+    session,
+    machine_id: str,
+    *,
+    start: datetime,
+    end: datetime,
+) -> list[dict[str, Any]]:
+    """Read-only desensitized fixed-window slice of one machine's receipts.
+
+    Shares the exact membership and ordering rules of
+    :func:`export_receipt_window`: only the path machine's receipts whose
+    own ``occurred_at`` parses as a UTC ``Z`` instant inside the closed
+    interval ``[start, end]`` are retained — a damaged stamp is excluded
+    without repair, never crashing the read — ordered by the actual UTC
+    instant and then by receipt id ascending.
+
+    Each item carries the compliance view's thirteen fields in the same
+    fixed order with only the two raw scope fields replaced:
+    ``action_ref`` is the SHA-256 lowercase hex digest of
+    ``privacy:v1|action``, the path machine id, and the stored
+    ``action_type`` with surrounding whitespace removed joined directly;
+    ``resource_ref`` is computed the same way from ``privacy:v1|resource``
+    and the stored ``resource``, and either ref is ``None`` when the stored
+    value is not a string or is blank after stripping. The raw
+    ``action_type``/``resource`` text is never emitted; every other field —
+    references, result digest, timestamp, chain link, and hashes — is
+    emitted exactly as stored, so a chain-damaged receipt inside the window
+    is still exported verbatim. The query is strictly read-only: it never
+    inserts, updates, deletes, backfills, normalizes, or recomputes a
+    receipt or any related row, so repeated reads of unchanged data return
+    byte-identical results.
+    """
+    in_window = _load_rows_in_window(
+        session, machine_id, start=start, end=end
+    )
+
+    records: list[dict[str, Any]] = []
+    for _, row in in_window:
+        mapping = row._mapping
+        records.append(
+            {
+                "id": mapping["id"],
+                "machine_id": mapping["machine_id"],
+                "use_id": mapping["use_id"],
+                "grant_id": mapping["grant_id"],
+                "authorization_event_id": mapping["authorization_event_id"],
+                "action_ref": privacy_reference_digest(
+                    "action", machine_id, mapping["action_type"]
+                ),
+                "resource_ref": privacy_reference_digest(
+                    "resource", machine_id, mapping["resource"]
+                ),
+                "outcome": mapping["outcome"],
+                "result_digest": mapping["result_digest"],
+                "occurred_at": mapping["occurred_at"],
+                "previous_receipt_id": mapping["previous_receipt_id"],
+                "content_hash": mapping["content_hash"],
+                "chain_hash": mapping["chain_hash"],
+            }
+        )
+    return records
