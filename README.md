@@ -2850,6 +2850,44 @@ events and their bases through the existing query entries observes the same
 stable results; the decision chain, decision bases, audits, diagnostics,
 compliance and privacy exports, and health-check semantics are unchanged.
 
+### Single-grant execution accountability trace
+
+`GET /machines/{machine_id}/authorization-grants/{grant_id}/grant-trace`
+assembles the read-only execution accountability view of one grant
+credential. It reads only the path machine and the path grant and adds no
+write entry. The request carries no query parameters, no repeated
+parameters, and no request body; any of these is
+`422 {"error":{"code":"invalid_query"}}` raised before the machine or the
+grant is read. After validation a missing machine, a missing grant, or a
+grant owned by another machine is `404 {"error":{"code":"not_found"}}`;
+non-`GET` methods (including `HEAD`) answer `405` without reading records
+or assembling a trace; a failure while reading is
+`500 {"error":{"code":"internal_error"}}` with no partial trace.
+
+On success the body is exactly `{grant, grant_uses, lifecycle_events,
+execution_receipts}` in this fixed order. `grant` is a single object with
+the same ten audit fields and derived-status semantics as the grant audit
+listing — `{id, machine_id, event_id, issued_at, expires_at, status,
+consumed_at, revoked_at, use_id, use_at}` — with the stamps emitted exactly
+as stored and `status` derived at read time (`active`, `expired`,
+`consumed`, `revoked`; the derived `expired` is never persisted). The three
+arrays contain only records of the path machine whose own stored `grant_id`
+equals the path grant id: the consumption records, the lifecycle events,
+and the execution receipts, each with its complete stored fields —
+identifiers, event references, action scope, outcome, digest, moment, and
+the per-machine chain fields — emitted verbatim, with dangling, duplicated,
+damaged, or cross-machine association values kept as stored and never
+repaired, normalized, filtered, or fabricated. Each array is ordered by the
+actual UTC instant of its own business timestamp (`consumed_at` for the
+uses, `occurred_at` for the lifecycle events and the receipts) and then by
+record id ascending; a stored timestamp that no longer parses is kept
+verbatim and sorts after every parseable instant. An array is empty when
+the grant has no record of that kind — no historical record is ever
+fabricated. The query is strictly read-only and machine isolated, and
+repeated calls against unchanged data return the compact,
+single-newline-terminated JSON body byte-for-byte identically across
+restarts.
+
 ## Execution-completion receipts on consumed grant uses
 
 After a grant has been consumed exactly once, the action it authorized is
