@@ -851,6 +851,52 @@ against an event it does not own), survive application restarts, and neither
 endpoint ever writes or modifies events, evidence, hash chains, or causal
 links.
 
+## Read-only cross-machine incident listing
+
+`GET /incidents` is the read-only, keyset-paginated entry that searches
+incidents across every machine and returns each incident's current
+responsibility-registration count. It accepts exactly four optional query
+parameters and no request body; multiple conditions combine with logical AND:
+
+- `status` — one of `open`, `acknowledged`, or `resolved`; any other value is
+  a `422 {"error":{"code":"invalid_query"}}`.
+- `machine_id` — an exact identifier after trimming surrounding whitespace;
+  it must stay non-empty, and an unknown machine returns a successful empty
+  collection rather than an error.
+- `limit` — a non-boolean integer from `1` to `200`, defaulting to `100`; a
+  missing value, fractional/boolean/non-decimal text, or an out-of-range
+  value is `422 invalid_query`.
+- `cursor` — must equal the `next_cursor` returned by the previous page (the
+  id of that page's last incident); a malformed shape is `422 invalid_query`,
+  and a well-formed value that does not point to an existing incident returns
+  `404 {"error":{"code":"cursor_not_found"}}`.
+
+A request body, an unknown or repeated parameter, or any of the malformed
+values above is `422 {"error":{"code":"invalid_query"}}`, all validated before
+any incident is read. Only `GET` is routed; other methods (including `HEAD`)
+return `405` without reading data, and a real read failure returns
+`500 {"error":{"code":"internal_error"}}` with no partial page.
+
+The success response is exactly `{items, next_cursor}` in that order, compact
+UTF-8 JSON terminated by a single newline. Each item contains exactly `{id,
+machine_id, event_id, incident_type, summary, status, created_at,
+responsibility_assignment_count}`: the seven incident fields exactly as stored
+plus the current count of distinct responsibility assignments registered for
+the incident (zero when none). Items are ordered by the actual UTC instant of
+`created_at` (an exact-second stamp precedes any fractional-second stamp of
+the same second) and then by `id` ascending; paging follows that order.
+`next_cursor` is the id of the page's last item when further items follow and
+`null` otherwise, including an empty result (no incidents, an unknown
+machine, or no filter matches). The cursor is an exclusive position, so
+paging never repeats or omits an item; a cursor that names a real incident
+positions the page even when the current `status`/`machine_id` filters exclude
+that incident itself. The query is strictly read-only — it never creates,
+updates, closes, or backfills an incident, assignment, event, evidence
+record, hash-chain link, or existing export — machine-scoped results never
+contain another machine's data, results are byte-identical on repeat calls
+against unchanged data, and incidents persisted across an application restart
+are listed.
+
 ## Incident status transitions and immutable history
 
 An incident moves through a fixed state machine: `open` (the status assigned

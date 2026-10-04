@@ -23,7 +23,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -3620,6 +3620,301 @@ def list_responsibility_assignments(
         )
     ).all()
     return [responsibility_assignment_to_out(record) for record in records]
+
+
+# --- read-only cross-machine incident listing --------------------------------
+
+
+_INCIDENT_LIST_DEFAULT_LIMIT = 100
+_INCIDENT_LIST_MAX_LIMIT = 200
+_INCIDENT_LIST_FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
+
+class IncidentListParams(BaseModel):
+    status: str | None = None
+    machine_id: str | None = None
+    limit: int
+    cursor: str | None = None
+
+
+def validate_incident_list_params(request: Request) -> IncidentListParams:
+    """Validate the cross-machine ``GET /incidents`` query before any read.
+
+    Exactly four optional parameters are accepted: ``status``,
+    ``machine_id``, ``limit``, and ``cursor``; no request body. Every
+    unknown-shape request — a carried body, an unknown or repeated parameter
+    name, a missing value, a value of the wrong type, an out-of-range
+    ``limit``, an illegal ``status``, or a malformed ``cursor`` — is the
+    single 422 ``invalid_query`` outcome, raised here before any incident,
+    assignment, or machine is read. ``status`` must be one of ``open``,
+    ``acknowledged``, or ``resolved``. ``machine_id`` is taken verbatim after
+    surrounding whitespace is stripped and must stay non-empty; an unknown
+    machine is a successful empty collection, not an error, and is checked
+    only in the handler. ``limit`` must be a non-boolean integer in 1..200 and
+    defaults to 100 when omitted. ``cursor`` must be the opaque id of an
+    incident a previous page returned; any shape that could not be a stored
+    incident id is rejected here, while a well-shaped id naming no incident is
+    a 404 ``cursor_not_found`` reported by the handler while incidents are
+    read.
+    """
+    # A body on a GET is an unknown-shape request, rejected in the validation
+    # phase before any incident is read. A present non-zero Content-Length, or
+    # a chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"status", "machine_id", "limit", "cursor"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``limit=1&limit=2`` rather than silently taking one occurrence.
+    for name in allowed:
+        if len(request.query_params.getlist(name)) > 1:
+            raise QueryError("invalid_query")
+
+    status = request.query_params.get("status")
+    if status is not None and status not in (
+        "open",
+        "acknowledged",
+        "resolved",
+    ):
+        raise QueryError("invalid_query")
+
+    raw_machine_id = request.query_params.get("machine_id")
+    if raw_machine_id is not None:
+        # Exact identifier after surrounding whitespace is trimmed; a blank or
+        # whitespace-only value carries no filter and is rejected. Whether the
+        # identifier names a stored machine is a data question answered by an
+        # empty collection in the handler, not a malformed query.
+        machine_id = raw_machine_id.strip()
+        if not machine_id:
+            raise QueryError("invalid_query")
+    else:
+        machine_id = None
+
+    raw_limit = request.query_params.get("limit")
+    if raw_limit is None:
+        limit = _INCIDENT_LIST_DEFAULT_LIMIT
+    else:
+        # Query parameters arrive as strings, so every value is text here; a
+        # boolean (``true``), fractional (``1.0``), blank, or otherwise
+        # non-decimal value never matches the integer shape. ``-?\d+`` also
+        # rejects surrounding whitespace and signs other than ``-``.
+        if not _INTEGER_QUERY_RE.fullmatch(raw_limit):
+            raise QueryError("invalid_query")
+        limit = int(raw_limit)
+        if not 1 <= limit <= _INCIDENT_LIST_MAX_LIMIT:
+            raise QueryError("invalid_query")
+
+    cursor = request.query_params.get("cursor")
+    if cursor is not None:
+        # The cursor is the opaque incident id the previous page returned.
+        # Only the stored-id shape is validated here: a non-empty UUID
+        # string (the shape every incident id has). A well-shaped id that
+        # names no incident is a 404 cursor_not_found in the handler,
+        # reported while incidents are read.
+        if not _UUID_RE.fullmatch(cursor):
+            raise QueryError("invalid_query")
+
+    return IncidentListParams(
+        status=status,
+        machine_id=machine_id,
+        limit=limit,
+        cursor=cursor,
+    )
+
+
+def _incident_created_instant(value: object) -> datetime:
+    """Parse a stored incident ``created_at`` to its actual UTC instant.
+
+    Legitimately written values always satisfy the RFC 3339 ``Z`` contract; a
+    damaged value sorts after every parseable record instead of crashing the
+    read-only listing, and its stored text is still emitted verbatim.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return _INCIDENT_LIST_FAR_FUTURE
+
+
+def _incident_id_key(value: object) -> tuple[int, str]:
+    """Tie-break key for a stored incident id, tolerant of a damaged value."""
+    if isinstance(value, str):
+        return (0, value)
+    return (1, "")
+
+
+@app.get("/incidents")
+def list_incidents_cross_machine(
+    params: Annotated[
+        IncidentListParams, Depends(validate_incident_list_params)
+    ],
+    session: SessionDep,
+):
+    """Read-only, keyset-paginated listing of incidents across all machines.
+
+    Only ``GET`` is routed, so non-GET methods (including ``HEAD``) return
+    ``405`` without reading incidents, computing a page, or writing anything.
+    The caller submits only the four optional parameters ``status``,
+    ``machine_id``, ``limit``, and ``cursor`` and no request body. Query
+    validation (a carried body; an unknown or repeated parameter; a missing,
+    blank, or illegal ``status``; a blank or non-string ``machine_id``; a
+    non-integer or out-of-range ``limit``; or a malformed ``cursor``) all
+    answer 422 ``invalid_query`` before any incident is read. ``status`` is
+    one of ``open``, ``acknowledged``, or ``resolved``; ``machine_id`` is an
+    exact identifier after surrounding whitespace is stripped, and an unknown
+    machine is a successful empty collection rather than an error; ``limit``
+    is a non-boolean integer from 1 to 200 defaulting to 100. The parameters
+    combine with logical AND. A well-formed ``cursor`` that does not point at
+    a stored incident answers 404 ``cursor_not_found``.
+
+    On success the response carries exactly ``{items, next_cursor}`` in this
+    fixed key order. Each item carries exactly the eight fields ``{id,
+    machine_id, event_id, incident_type, summary, status, created_at,
+    responsibility_assignment_count}`` in this fixed order, where the count is
+    the current number of distinct responsibility assignments registered for
+    that incident. Items are ordered by the actual UTC instant of
+    ``created_at`` and then by incident id ascending, so an exact-second
+    incident sorts before any fractional-second incident of the same second.
+
+    The cursor is the exclusive id position of a page's last item, so a page
+    returns only items strictly after it and paging never repeats or omits an
+    item. ``next_cursor`` is the id of the page's last item only when another
+    item follows and is ``null`` on the last page and for an empty result
+    (including an empty database or an unknown machine). The endpoint is
+    strictly read-only: it never creates, updates, closes, or backfills an
+    incident, assignment, event, evidence record, hash-chain link, or existing
+    export, and no machine's data is ever returned through another machine's
+    filter. The body is compact UTF-8 JSON terminated by a single newline,
+    byte-identical on repeat calls against unchanged data, and readable across
+    application restarts. A failure while reading the incidents, the
+    assignments, or a machine returns 500 ``internal_error`` with no partial
+    page.
+    """
+    # Any failure while *reading* — the incident rows, the assignment counts,
+    # the ordering over them, the cursor position, or the machine lookup — is
+    # an internal read-layer fault: answer 500 internal_error with no partial
+    # page. Damaged stored values are not a read failure — rows read
+    # successfully are ordered and emitted verbatim, with an unparseable stamp
+    # sorting last — so the tolerant key functions stay inside the guard but
+    # only a true read/order fault reaches the except branch.
+    try:
+        # The cursor points at a stored incident by id and is resolved for
+        # existence before the filters are applied: the 404 contract is "valid
+        # format but names no existing incident", independent of status or
+        # machine filters. Its sort position is used below as the exclusive
+        # keyset bound, so changing a filter between pages neither 404s nor
+        # repeats/omits a row after that position.
+        cursor_key: tuple[datetime, tuple[int, str]] | None = None
+        if params.cursor is not None:
+            cursor_incident = session.get(
+                AuthorizationDecisionIncident, params.cursor
+            )
+            if cursor_incident is None:
+                return error_response(404, "cursor_not_found")
+            cursor_key = (
+                _incident_created_instant(cursor_incident.created_at),
+                _incident_id_key(cursor_incident.id),
+            )
+
+        filters = []
+        if params.status is not None:
+            filters.append(
+                AuthorizationDecisionIncident.status == params.status
+            )
+        if params.machine_id is not None:
+            filters.append(
+                AuthorizationDecisionIncident.machine_id == params.machine_id
+            )
+
+        rows = session.scalars(
+            select(AuthorizationDecisionIncident).where(*filters)
+        ).all()
+
+        # Current responsibility-assignment totals: one row per incident with
+        # the count of its assignments. There is no join here, so every
+        # assignment row is counted exactly once — the number of distinct
+        # responsibility registrations currently attached to the incident.
+        # When a machine filter is present the count scan is scoped to that
+        # machine's assignments, so the machine-filtered view never reads
+        # another machine's responsibility records.
+        assignment_filters = []
+        if params.machine_id is not None:
+            assignment_filters.append(
+                IncidentResponsibilityAssignment.machine_id == params.machine_id
+            )
+        count_rows = session.execute(
+            select(
+                IncidentResponsibilityAssignment.incident_id,
+                func.count(IncidentResponsibilityAssignment.id),
+            )
+            .where(*assignment_filters)
+            .group_by(IncidentResponsibilityAssignment.incident_id)
+        ).all()
+        counts = {row[0]: row[1] for row in count_rows}
+
+        ordered = sorted(
+            (
+                (
+                    (
+                        _incident_created_instant(record.created_at),
+                        _incident_id_key(record.id),
+                    ),
+                    record,
+                )
+                for record in rows
+            ),
+            key=lambda entry: entry[0],
+        )
+
+        # Exclusive keyset position: keep only filtered rows strictly after
+        # the cursor incident's global (created_at instant, id) position.
+        if cursor_key is not None:
+            ordered = [
+                entry for entry in ordered if entry[0] > cursor_key
+            ]
+    except Exception:
+        return error_response(500, "internal_error")
+
+    page = [record for _, record in ordered[: params.limit]]
+    has_more = len(ordered) > len(page)
+    next_cursor = page[-1].id if has_more else None
+
+    payload = {
+        "items": [
+            {
+                "id": record.id,
+                "machine_id": record.machine_id,
+                "event_id": record.event_id,
+                "incident_type": record.incident_type,
+                "summary": record.summary,
+                "status": record.status,
+                "created_at": record.created_at,
+                "responsibility_assignment_count": int(
+                    counts.get(record.id, 0)
+                ),
+            }
+            for record in page
+        ],
+        "next_cursor": next_cursor,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
 
 
 class ResponsibilityAssignmentIntegrityOut(BaseModel):
