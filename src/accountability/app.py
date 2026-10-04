@@ -10524,6 +10524,98 @@ async def consume_authorization_grant(
 
 
 @app.post(
+    "/machines/{machine_id}/authorization-grants/batch-consume",
+    response_model=list[AuthorizationGrantUseOut],
+)
+async def consume_authorization_grants_batch(machine_id: str, request: Request):
+    """Atomically consume several unused, unexpired grants, or none at all.
+
+    The request carries no query string and a JSON object body with exactly
+    one field: ``grant_ids``, an order-preserving array of 1 to 100
+    non-blank-after-trim strings with no duplicates. Validation runs before
+    any machine or grant is read:
+
+    - any query parameter (or repeated parameter) is
+      ``422 {"error":{"code":"invalid_query"}}``;
+    - a missing body, a body that is not a JSON object, a missing or extra
+      top-level field, a ``grant_ids`` value that is not an array of 1 to
+      100 elements, an element that is not a string or is blank after
+      trimming, or a repeated grant id is
+      ``422 {"error":{"code":"invalid_grant_request"}}`` — even against a
+      non-existent machine the query check still wins, and every body check
+      still precedes the lookups.
+
+    After validation every grant is checked in input order against exactly
+    the single-consume rules, and the first failing grant decides the whole
+    batch: a missing machine, a missing grant, or a grant owned by another
+    machine is ``404 {"error":{"code":"not_found"}}``; an already-consumed
+    grant is ``409 grant_consumed``; an emergency-revoked grant is
+    ``409 grant_revoked``; a grant at or past its ``expires_at`` is
+    ``409 grant_expired``; and a still-usable grant on a suspended machine
+    is ``409 machine_suspended`` — the terminal and expired outcomes keep
+    their precedence even while the machine is suspended. A rejected batch
+    writes nothing: no partial consumption, no use record, no lifecycle
+    event is ever committed. On success every grant flips to ``consumed``
+    and its single use record is inserted in one locked write transaction —
+    the same lock the single consume, the revocation, and the machine
+    status change take — so a concurrent single or batch consumption racing
+    for any of these grants has exactly one winner and the loser rolls back
+    entirely, then answers with the first racing grant's terminal outcome
+    in its own input order. The success body is the array of
+    ``{grant_id, use_id, consumed_at}`` in input order, every entry stamped
+    with one shared UTC ``Z`` consumption moment.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_grant_request")
+    if not isinstance(payload, dict) or set(payload) != {"grant_ids"}:
+        return error_response(422, "invalid_grant_request")
+
+    raw_grant_ids = payload["grant_ids"]
+    if not isinstance(raw_grant_ids, list) or not 1 <= len(raw_grant_ids) <= 100:
+        return error_response(422, "invalid_grant_request")
+
+    grant_ids: list[str] = []
+    seen_grant_ids: set[str] = set()
+    for element in raw_grant_ids:
+        # The elements follow the other path-scoped identifiers: a
+        # non-string or blank-after-trim value is an illegal body, not a
+        # looked-up object, and a repeated id within one batch is the same
+        # single invalid_grant_request outcome.
+        if isinstance(element, bool) or not isinstance(element, str):
+            return error_response(422, "invalid_grant_request")
+        grant_id = element.strip()
+        if not grant_id:
+            return error_response(422, "invalid_grant_request")
+        if grant_id in seen_grant_ids:
+            return error_response(422, "invalid_grant_request")
+        seen_grant_ids.add(grant_id)
+        grant_ids.append(grant_id)
+
+    engine = request.app.state.engine
+    result = grants.consume_grants_batch(
+        engine, machine_id=machine_id, grant_ids=grant_ids
+    )
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "grant_consumed":
+        return error_response(409, "grant_consumed")
+    if status == "grant_revoked":
+        return error_response(409, "grant_revoked")
+    if status == "grant_expired":
+        return error_response(409, "grant_expired")
+    if status == "machine_suspended":
+        return error_response(409, "machine_suspended")
+    return [AuthorizationGrantUseOut(**use) for use in result["uses"]]
+
+
+@app.post(
     "/machines/{machine_id}/authorization-grants/{grant_id}/revoke",
     response_model=AuthorizationGrantRevocationOut,
 )
