@@ -382,6 +382,31 @@ def test_unknown_query_parameter_is_invalid_query(client):
     assert response.json() == {"error": {"code": "invalid_query"}}
 
 
+def test_repeated_parameter_is_invalid_query(client):
+    machine_id = create_machine(client)
+    for query in (
+        f"?from_created_at={T0}&from_created_at={T1}&to_created_at={T5}",
+        f"?from_created_at={T0}&to_created_at={T5}&to_created_at={T4}",
+    ):
+        response = client.get(
+            f"/machines/{machine_id}/accountability/compliance-export{query}"
+        )
+        assert response.status_code == 422
+        assert response.json() == {"error": {"code": "invalid_query"}}
+
+
+def test_request_body_is_invalid_query(client):
+    machine_id = create_machine(client)
+    response = client.request(
+        "GET",
+        export_url(machine_id, T0, T5),
+        content=b"{}",
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
 def test_validation_runs_before_machine_lookup(client):
     missing = "00000000-0000-0000-0000-000000000000"
     bad_time = client.get(
@@ -743,3 +768,162 @@ def test_export_persists_across_restart(tmp_path, monkeypatch):
     assert len(body["incidents"]) == 1
     assert len(body["status_history"]) == 1
     assert len(body["responsibility_assignments"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Damaged stored created_at values
+# --------------------------------------------------------------------------- #
+
+DAMAGED_CREATED_ATS = [
+    " 2026-03-01T00:00:02Z",           # leading whitespace
+    "2026-03-01T00:00:02Z ",           # trailing whitespace
+    "2026-03-01T00:00:02+00:00",       # offset form
+    "2026-03-01T00:00:02",             # missing Z
+    "2026-03-01T00:00:02z",            # lowercase suffix
+    "2026-02-30T00:00:02Z",            # calendar-invalid
+    "2026-03-01T24:00:02Z",            # bad hour
+    "not-a-timestamp",                 # unparseable
+    "",                                # blank
+]
+
+
+def update_created_at(client, table, record_id, created_at):
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(f"UPDATE {table} SET created_at = :ca WHERE id = :id"),
+            {"ca": created_at, "id": record_id},
+        )
+
+
+def delete_row(client, table, record_id):
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(f"DELETE FROM {table} WHERE id = :id"), {"id": record_id}
+        )
+
+
+def insert_all_groups(client, machine_id, created_at, n):
+    """Insert one row per accountability group sharing one created_at."""
+    insert_event_row(client, machine_id, rid(n), created_at)
+    insert_evidence_row(client, machine_id, rid(n + 10), rid(n), created_at)
+    insert_incident_row(client, machine_id, rid(n + 20), rid(n), created_at)
+    insert_history_row(
+        client, machine_id, rid(n + 30), rid(n), rid(n + 20), created_at
+    )
+    insert_assignment_row(
+        client, machine_id, rid(n + 40), rid(n), rid(n + 20), created_at
+    )
+
+
+def group_ids(body):
+    return {
+        group: [r["id"] for r in body[group]]
+        for group in (
+            "events",
+            "evidence",
+            "incidents",
+            "status_history",
+            "responsibility_assignments",
+        )
+    }
+
+
+@pytest.mark.parametrize("damaged", DAMAGED_CREATED_ATS)
+def test_damaged_created_at_is_excluded_without_failure(client, damaged):
+    machine_id = create_machine(client)
+    insert_all_groups(client, machine_id, T1, 1)
+    insert_all_groups(client, machine_id, damaged, 2)
+    insert_all_groups(client, machine_id, T3, 3)
+
+    response = client.get(export_url(machine_id, T0, T5))
+    assert response.status_code == 200
+    # Every group keeps only its legitimate rows, in instant order; the
+    # damaged row vanishes from its own group and touches no other group.
+    assert group_ids(response.json()) == {
+        "events": [rid(1), rid(3)],
+        "evidence": [rid(11), rid(13)],
+        "incidents": [rid(21), rid(23)],
+        "status_history": [rid(31), rid(33)],
+        "responsibility_assignments": [rid(41), rid(43)],
+    }
+
+    # The result is identical to the damaged rows never having existed.
+    for table, record_id in (
+        ("authorization_decision_events", rid(2)),
+        ("authorization_decision_evidence", rid(12)),
+        ("authorization_decision_incidents", rid(22)),
+        ("incident_status_events", rid(32)),
+        ("incident_responsibility_assignments", rid(42)),
+    ):
+        delete_row(client, table, record_id)
+    assert client.get(export_url(machine_id, T0, T5)).content == response.content
+
+
+def test_damaged_created_at_repeat_requests_are_byte_stable(client):
+    machine_id = create_machine(client)
+    insert_all_groups(client, machine_id, T1, 1)
+    insert_all_groups(client, machine_id, "garbage", 2)
+
+    first = client.get(export_url(machine_id, T0, T5))
+    second = client.get(export_url(machine_id, T0, T5))
+    assert first.status_code == 200
+    assert first.content == second.content
+
+
+def test_repaired_created_at_enters_window_at_true_instant(client):
+    machine_id = create_machine(client)
+    insert_all_groups(client, machine_id, T1, 1)
+    insert_all_groups(client, machine_id, "not-a-timestamp", 2)
+    insert_all_groups(client, machine_id, T3, 3)
+
+    excluded = client.get(export_url(machine_id, T0, T5))
+    assert excluded.status_code == 200
+    assert group_ids(excluded.json())["events"] == [rid(1), rid(3)]
+
+    # Repairing the stamp to a valid in-window value places each row at its
+    # true instant position in its group.
+    for table, record_id in (
+        ("authorization_decision_events", rid(2)),
+        ("authorization_decision_evidence", rid(12)),
+        ("authorization_decision_incidents", rid(22)),
+        ("incident_status_events", rid(32)),
+        ("incident_responsibility_assignments", rid(42)),
+    ):
+        update_created_at(client, table, record_id, T2)
+    included = client.get(export_url(machine_id, T0, T5))
+    assert included.status_code == 200
+    assert group_ids(included.json()) == {
+        "events": [rid(1), rid(2), rid(3)],
+        "evidence": [rid(11), rid(12), rid(13)],
+        "incidents": [rid(21), rid(22), rid(23)],
+        "status_history": [rid(31), rid(32), rid(33)],
+        "responsibility_assignments": [rid(41), rid(42), rid(43)],
+    }
+
+    # Moving the stamp to a valid out-of-window value excludes the rows
+    # again, and the output is byte-identical to the original exclusion.
+    for table, record_id in (
+        ("authorization_decision_events", rid(2)),
+        ("authorization_decision_evidence", rid(12)),
+        ("authorization_decision_incidents", rid(22)),
+        ("incident_status_events", rid(32)),
+        ("incident_responsibility_assignments", rid(42)),
+    ):
+        update_created_at(client, table, record_id, "1999-01-01T00:00:00Z")
+    assert client.get(export_url(machine_id, T0, T5)).content == excluded.content
+
+
+def test_damaged_created_at_in_one_group_leaves_other_groups_untouched(client):
+    machine_id = create_machine(client)
+    insert_event_row(client, machine_id, rid(1), "garbage")
+    insert_evidence_row(client, machine_id, rid(11), rid(1), T1)
+    insert_incident_row(client, machine_id, rid(21), rid(1), T1)
+    insert_history_row(client, machine_id, rid(31), rid(1), rid(21), T1)
+    insert_assignment_row(client, machine_id, rid(41), rid(1), rid(21), T1)
+
+    body = client.get(export_url(machine_id, T0, T5)).json()
+    assert body["events"] == []
+    assert [r["id"] for r in body["evidence"]] == [rid(11)]
+    assert [r["id"] for r in body["incidents"]] == [rid(21)]
+    assert [r["id"] for r in body["status_history"]] == [rid(31)]
+    assert [r["id"] for r in body["responsibility_assignments"]] == [rid(41)]

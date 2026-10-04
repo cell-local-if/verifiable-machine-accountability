@@ -9278,6 +9278,117 @@ def get_machine_diagnostics(
 # --- read-only machine-level accountability compliance export --------------
 
 
+def validate_machine_accountability_export_params(
+    request: Request,
+) -> ComplianceExportParams:
+    """Validate the machine accountability compliance-export query string.
+
+    Exactly two parameters are accepted: ``from_created_at`` and
+    ``to_created_at``, both required UTC RFC 3339 date-times ending in ``Z``
+    (fractional seconds optional; offset forms, surrounding whitespace, and
+    non-``Z`` suffixes are rejected), with the lower bound not later than the
+    upper bound (equal bounds allowed). Any other parameter name, a repeated
+    parameter, or a carried request body is a 422 ``invalid_query``; a
+    missing, blank, malformed, calendar-invalid, or inverted bound is a 422
+    ``bad_time``. Validation runs entirely before the machine or any record
+    is read, so an invalid query against a non-existent machine still reports
+    422 rather than 404 and never touches stored data.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or accountability record is read. A present non-zero
+    # Content-Length, or a chunked request without one, means a body is
+    # being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"from_created_at", "to_created_at"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``from_created_at=...&from_created_at=...`` rather than silently taking
+    # one occurrence. A missing bound stays a ``bad_time`` below.
+    if (
+        len(request.query_params.getlist("from_created_at")) > 1
+        or len(request.query_params.getlist("to_created_at")) > 1
+    ):
+        raise QueryError("invalid_query")
+
+    raw_from = request.query_params.get("from_created_at")
+    raw_to = request.query_params.get("to_created_at")
+
+    def _valid(value: str | None) -> bool:
+        if not value or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+            return False
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            return False
+        return True
+
+    if not _valid(raw_from) or not _valid(raw_to):
+        raise QueryError("bad_time")
+
+    if parse_utc_z_datetime(raw_from) > parse_utc_z_datetime(raw_to):
+        raise QueryError("bad_time")
+
+    return ComplianceExportParams(
+        from_created_at=raw_from,  # type: ignore[arg-type]
+        to_created_at=raw_to,  # type: ignore[arg-type]
+    )
+
+
+def _accountability_window_instant(value: object) -> datetime | None:
+    """Parse a stored accountability ``created_at`` to its UTC instant.
+
+    Only a string that is exactly an RFC 3339 date-time in UTC ending in
+    ``Z`` with in-range calendar/time fields has an instant; a missing,
+    non-string, whitespace-padded, offset-form, non-``Z``, calendar-invalid,
+    or otherwise unparseable value has none, so the row deterministically
+    falls outside every finite window instead of failing the export.
+    """
+    if not isinstance(value, str) or not _RFC3339_Z_DATETIME_RE.fullmatch(
+        value
+    ):
+        return None
+    try:
+        return parse_utc_z_datetime(value)
+    except ValueError:
+        return None
+
+
+def _accountability_rows_in_window(
+    session, model, machine_id: str, window_start, window_end
+):
+    """Load one machine's rows of a table and apply the closed UTC window.
+
+    Membership is decided by the row's own ``created_at`` parsed to a UTC
+    instant and its ``machine_id`` only; a missing, foreign, or otherwise
+    damaged related-object reference never filters a row out (exports are
+    raw, never repaired). A row whose stored ``created_at`` has no valid
+    UTC ``Z`` instant is deterministically excluded from the finite window
+    without failing the export or affecting any other row. Included rows
+    are ordered by the actual UTC instant of ``created_at`` and then by
+    ``id``, so an exact-second record sorts before any fractional-second
+    record of the same second. Issues reads only.
+    """
+    rows = session.scalars(
+        select(model).where(model.machine_id == machine_id)
+    ).all()
+    in_window = []
+    for row in rows:
+        instant = _accountability_window_instant(row.created_at)
+        if instant is not None and window_start <= instant <= window_end:
+            in_window.append((instant, row.id, row))
+    in_window.sort(key=lambda item: (item[0], item[1]))
+    return [row for _, _, row in in_window]
+
+
 class AccountabilityComplianceExportOut(BaseModel):
     machine_id: str
     from_created_at: str
@@ -9317,7 +9428,8 @@ def _machine_rows_in_window(session, model, machine_id: str, window_start, windo
 def export_machine_accountability(
     machine_id: str,
     params: Annotated[
-        ComplianceExportParams, Depends(validate_accountability_export_params)
+        ComplianceExportParams,
+        Depends(validate_machine_accountability_export_params),
     ],
     session: SessionDep,
 ):
@@ -9347,12 +9459,18 @@ def export_machine_accountability(
 
     Records are exported exactly as stored: a missing or misowned related
     object never causes filtering, rewriting, or repair, and only the path
-    machine's records are returned. Event associations (causal links) require
-    both endpoints to be events of this export; the other three dependent
-    groups follow their existing machine/entity ownership alone. The query
-    issues no writes, repairs, deletions, recomputations, or normalizations,
-    produces byte-identical output for identical data and parameters on repeat
-    calls, and reads records persisted across application restarts.
+    machine's records are returned. A record whose stored ``created_at`` is
+    missing or damaged (not a valid UTC ``Z`` instant) deterministically
+    falls outside the finite window: it is excluded from its group without
+    failing the export, without removing any other row of the group, and
+    without changing the other groups; rewriting it to a valid in-window
+    stamp places it at its true instant position. Event associations (causal
+    links) require both endpoints to be events of this export; the other
+    three dependent groups follow their existing machine/entity ownership
+    alone. The query issues no writes, repairs, deletions, recomputations,
+    or normalizations, produces byte-identical output for identical data
+    and parameters on repeat calls, and reads records persisted across
+    application restarts.
     """
     machine = session.get(Machine, machine_id)
     if machine is None:
@@ -9361,27 +9479,27 @@ def export_machine_accountability(
     window_start = parse_utc_z_datetime(params.from_created_at)
     window_end = parse_utc_z_datetime(params.to_created_at)
 
-    events = _machine_rows_in_window(
+    events = _accountability_rows_in_window(
         session, AuthorizationDecisionEvent, machine_id, window_start, window_end
     )
-    evidence = _machine_rows_in_window(
+    evidence = _accountability_rows_in_window(
         session,
         AuthorizationDecisionEvidence,
         machine_id,
         window_start,
         window_end,
     )
-    incidents = _machine_rows_in_window(
+    incidents = _accountability_rows_in_window(
         session,
         AuthorizationDecisionIncident,
         machine_id,
         window_start,
         window_end,
     )
-    status_history = _machine_rows_in_window(
+    status_history = _accountability_rows_in_window(
         session, IncidentStatusEvent, machine_id, window_start, window_end
     )
-    assignments = _machine_rows_in_window(
+    assignments = _accountability_rows_in_window(
         session,
         IncidentResponsibilityAssignment,
         machine_id,
