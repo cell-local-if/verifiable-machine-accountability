@@ -44,6 +44,14 @@ result and to the per-machine tamper-evident receipt chain.
   interval, ordered by that instant and then by id, with every stored field
   emitted verbatim. A receipt whose stamp no longer parses is excluded, not
   repaired, and no reference, chain field, or hash is ever recomputed.
+* :func:`summary_report` is the strictly read-only execution-receipt
+  summary for one machine: it counts the machine's receipt rows, buckets
+  each receipt's stored ``outcome`` and ``result_digest`` verbatim —
+  ``succeeded``/``failed`` against every other value, and exactly 64
+  lowercase hexadecimal characters against every other value — and counts
+  the machine's consumed uses that no receipt of the machine names. Damaged
+  values are counted as invalid, never hidden, repaired, recomputed, or
+  folded into the success/failure buckets.
 
 Each machine's receipts form an ordered chain following the same rules as
 the other per-machine chains:
@@ -1042,3 +1050,77 @@ def export_receipt_window(
         {field: row._mapping[field] for field in _EXPORT_FIELDS}
         for _, row in in_window
     ]
+
+
+def summary_report(session, machine_id: str) -> dict[str, Any]:
+    """Read-only execution-receipt summary for one machine.
+
+    Reads only rows of ``execution_receipts`` and
+    ``authorization_grant_uses`` owned by ``machine_id`` (the ownership
+    column is the sole machine boundary) and returns a dict with, in this
+    fixed order: ``total_receipts`` (the machine's receipt row count),
+    ``succeeded_count``/``failed_count`` (receipts whose stored ``outcome``
+    is verbatim ``"succeeded"``/``"failed"``), ``invalid_outcome_count``
+    (every other stored outcome value — damaged, missing, or non-text
+    included), ``valid_result_digest_count``/``invalid_result_digest_count``
+    (receipts whose stored ``result_digest`` is exactly 64 lowercase
+    hexadecimal characters against every other value), and
+    ``missing_receipt_count`` (the machine's consumption records whose id
+    no receipt of the machine names on ``use_id`` — each consumption record
+    counted exactly once). Every count is a plain non-negative integer.
+
+    The stored values are bucketed exactly as stored: a damaged outcome or
+    digest is counted as invalid, never hidden, repaired, recomputed,
+    normalized, or folded into the success/failure buckets, and a missing
+    receipt is reported as a gap, never interpreted as an execution result.
+    Only the path machine's rows are read, so another machine's records —
+    damaged or not — never change the counts. The summary is strictly
+    read-only: it never creates, backfills, updates, deletes, repairs, or
+    recomputes a use, a receipt, or any chain field, so repeated reads of
+    unchanged data return identical results across restarts.
+    """
+    receipt_rows = list(
+        session.execute(
+            _TABLE.select().where(_TABLE.c.machine_id == machine_id)
+        )
+    )
+    use_rows = list(
+        session.execute(
+            _USE_TABLE.select().where(_USE_TABLE.c.machine_id == machine_id)
+        )
+    )
+
+    succeeded_count = 0
+    failed_count = 0
+    invalid_outcome_count = 0
+    valid_result_digest_count = 0
+    invalid_result_digest_count = 0
+    receipt_use_ids: set[Any] = set()
+    for row in receipt_rows:
+        mapping = row._mapping
+        outcome = mapping["outcome"]
+        if outcome == "succeeded":
+            succeeded_count += 1
+        elif outcome == "failed":
+            failed_count += 1
+        else:
+            invalid_outcome_count += 1
+        if _is_lower_hex_64(mapping["result_digest"]):
+            valid_result_digest_count += 1
+        else:
+            invalid_result_digest_count += 1
+        receipt_use_ids.add(mapping["use_id"])
+
+    missing_receipt_count = sum(
+        1 for row in use_rows if row._mapping["id"] not in receipt_use_ids
+    )
+
+    return {
+        "total_receipts": len(receipt_rows),
+        "succeeded_count": succeeded_count,
+        "failed_count": failed_count,
+        "invalid_outcome_count": invalid_outcome_count,
+        "valid_result_digest_count": valid_result_digest_count,
+        "invalid_result_digest_count": invalid_result_digest_count,
+        "missing_receipt_count": missing_receipt_count,
+    }
