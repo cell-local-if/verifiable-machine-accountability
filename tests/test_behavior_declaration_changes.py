@@ -1,0 +1,796 @@
+"""Tests for the stable, read-only incremental behavior-declaration query.
+
+Covers `GET /machines/{machine_id}/behavior-declarations/changes`:
+
+- validation before any machine or declaration is read: ``bad_limit`` for a
+  missing, blank, fractional, boolean, non-decimal, or out-of-range
+  ``limit``; ``invalid_cursor`` for an empty, non-string,
+  shape-mismatching, or unlocatable ``cursor``; ``invalid_query`` for
+  unknown parameters, repeated names, or a carried request body — all 422
+  and taking priority over the machine lookup;
+- GET-only ``405`` (including ``HEAD``) without reading declarations,
+  ``404 not_found`` for a missing machine carrying no records, and
+  ``500 internal_error`` with no partial page when the records cannot be
+  read;
+- the fixed ``{machine_id, limit, records, next_cursor, has_more}``
+  envelope, each record carrying exactly the seven list-view fields
+  ``{id, machine_id, action_type, resource_pattern, enabled, created_at,
+  updated_at}`` exactly as stored, and only the path machine's records;
+- keyset pagination in (actual UTC created_at instant, record id) order, an
+  exact-second record before a fractional-second record of the same second,
+  exclusive cursors, and ``next_cursor``/``has_more`` on full, partial,
+  empty, and past-the-end pages;
+- a declaration with an unparseable ``created_at`` kept verbatim, sorted
+  last, and still pageable (including a damaged stamp text containing
+  ``|``);
+- byte-identical repeat pages, no resurfacing after earlier inserts,
+  strict read-only behavior, compact newline-terminated JSON with no
+  non-finite tokens, persistence across a restart, and unchanged
+  declaration list semantics.
+"""
+import json
+from urllib.parse import quote
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+
+from accountability.app import app
+
+T0 = "2026-03-01T00:00:00Z"
+T1 = "2026-03-01T00:00:01Z"
+T2 = "2026-03-01T00:00:02Z"
+T3 = "2026-03-01T00:00:03Z"
+T4 = "2026-03-01T00:00:04Z"
+T5 = "2026-03-01T00:00:05Z"
+T0_FRAC = "2026-03-01T00:00:00.500000Z"
+
+RECORD_KEYS = [
+    "id",
+    "machine_id",
+    "action_type",
+    "resource_pattern",
+    "enabled",
+    "created_at",
+    "updated_at",
+]
+ENVELOPE_KEYS = ["machine_id", "limit", "records", "next_cursor", "has_more"]
+
+MISSING_MACHINE = "00000000-0000-0000-0000-000000000000"
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "ACCOUNTABILITY_DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}"
+    )
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def machine_id(client):
+    created = client.post(
+        "/machines",
+        json={
+            "external_id": "machine-1",
+            "display_name": "Machine One",
+            "public_key": "key-1",
+        },
+    ).json()
+    return created["id"]
+
+
+def rid(n):
+    return f"00000000-0000-0000-0000-{n:012d}"
+
+
+def changes_path(machine_id):
+    return f"/machines/{machine_id}/behavior-declarations/changes"
+
+
+def changes_url(machine_id, *, limit=100, cursor=None):
+    query = f"limit={limit}"
+    if cursor is not None:
+        query += "&cursor=" + quote(cursor, safe="")
+    return f"{changes_path(machine_id)}?{query}"
+
+
+def insert_declaration(
+    client,
+    machine_id,
+    n,
+    created_at,
+    *,
+    action_type=None,
+    resource_pattern=None,
+    enabled=True,
+    updated_at=None,
+):
+    """Insert a behavior-declaration row directly with a fixed id/stamp.
+
+    The action/resource default to per-row distinct values so the
+    ``(machine_id, action_type, resource_pattern)`` uniqueness constraint
+    holds; the changes query never recomputes or normalizes anything.
+    """
+    values = {
+        "id": rid(n),
+        "machine_id": machine_id,
+        "action_type": action_type if action_type is not None else f"action-{n}",
+        "resource_pattern": (
+            resource_pattern if resource_pattern is not None else f"res/{n}"
+        ),
+        "enabled": enabled,
+        "created_at": created_at,
+        "updated_at": updated_at if updated_at is not None else created_at,
+    }
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO behavior_declarations "
+                "(id, machine_id, action_type, resource_pattern, enabled, "
+                "created_at, updated_at) "
+                "VALUES "
+                "(:id, :machine_id, :action_type, :resource_pattern, :enabled, "
+                ":created_at, :updated_at)"
+            ),
+            values,
+        )
+    return values
+
+
+def fetch_all_pages(client, machine_id, limit):
+    """Walk the cursor chain from the start and return every record."""
+    seen = []
+    cursor = None
+    pages = 0
+    while True:
+        response = client.get(changes_url(machine_id, limit=limit, cursor=cursor))
+        assert response.status_code == 200
+        body = response.json()
+        seen.extend(body["records"])
+        pages += 1
+        if body["next_cursor"] is None:
+            assert body["has_more"] is False
+            break
+        assert body["has_more"] is True
+        cursor = body["next_cursor"]
+        assert pages < 1000
+    return seen, pages
+
+
+def create_declaration(client, machine_id, action_type="read", **extra):
+    payload = {"action_type": action_type, "resource_pattern": "res/*", "enabled": True}
+    payload.update(extra)
+    return client.post(
+        f"/machines/{machine_id}/behavior-declarations", json=payload
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Validation
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",                  # limit missing
+        "?limit=",           # blank
+        "?limit=0",          # below range
+        "?limit=101",        # above range
+        "?limit=-1",
+        "?limit=1.0",        # decimal forms
+        "?limit=1.5",
+        "?limit=true",       # booleans are not integers
+        "?limit=false",
+        "?limit=abc",
+        "?limit= 1",
+        "?limit=1 ",
+        "?limit=0x1",
+    ],
+)
+def test_bad_limit_is_422(client, machine_id, query):
+    response = client.get(f"{changes_path(machine_id)}{query}")
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "bad_limit"}}
+
+
+def test_boundary_limits_are_accepted(client, machine_id):
+    for value in (1, 100):
+        response = client.get(changes_url(machine_id, limit=value))
+        assert response.status_code == 200
+        assert response.json()["limit"] == value
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "",                # empty value
+        "not-a-cursor",    # no separator
+        "|",               # both segments empty
+        f"{T0}|",          # missing record id
+        f"|{rid(1)}",      # missing created-at text
+    ],
+)
+def test_malformed_cursor_is_422(client, machine_id, cursor):
+    response = client.get(changes_url(machine_id, limit=10, cursor=cursor))
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_cursor"}}
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        # Well-shaped positions that name no stored declaration; the
+        # timestamp segment is taken as original text, so a non-RFC text
+        # still passes the shape check and is rejected when it cannot be
+        # located.
+        f"{T0}|{rid(999)}",
+        "garbage-stamp|nonempty-id",
+        f"2026-13-01T00:00:00Z|{rid(999)}",
+    ],
+)
+def test_unlocatable_cursor_is_422(client, machine_id, cursor):
+    response = client.get(changes_url(machine_id, limit=10, cursor=cursor))
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_cursor"}}
+
+
+def test_cursor_pointing_at_an_actual_record_is_accepted(client, machine_id):
+    insert_declaration(client, machine_id, 1, T0)
+    response = client.get(changes_url(machine_id, limit=10, cursor=f"{T0}|{rid(1)}"))
+    assert response.status_code == 200
+    assert response.json()["records"] == []
+    assert response.json()["has_more"] is False
+
+
+def test_cursor_with_matching_timestamp_but_unknown_id_is_422(client, machine_id):
+    insert_declaration(client, machine_id, 1, T0)
+    response = client.get(changes_url(machine_id, limit=10, cursor=f"{T0}|{rid(2)}"))
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_cursor"}}
+
+
+def test_cursor_naming_another_machines_record_is_422(client, machine_id):
+    other = client.post(
+        "/machines",
+        json={
+            "external_id": "machine-2",
+            "display_name": "Machine Two",
+            "public_key": "key-9",
+        },
+    ).json()["id"]
+    insert_declaration(client, other, 1, T0)
+
+    response = client.get(changes_url(machine_id, limit=10, cursor=f"{T0}|{rid(1)}"))
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_cursor"}}
+
+
+def test_unknown_query_parameter_is_invalid_query(client, machine_id):
+    response = client.get(f"{changes_path(machine_id)}?limit=10&unexpected=1")
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
+def test_repeated_parameter_names_are_rejected(client, machine_id):
+    # A repeated name is an unknown-shape query, so regardless of which name
+    # is repeated it reports invalid_query (never silently one occurrence).
+    response = client.get(
+        changes_path(machine_id), params=[("limit", "1"), ("limit", "2")]
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+    response = client.get(
+        changes_path(machine_id),
+        params=[
+            ("limit", "1"),
+            ("cursor", f"{T0}|{rid(1)}"),
+            ("cursor", f"{T1}|{rid(2)}"),
+        ],
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
+def test_get_with_a_body_is_invalid_query_before_reads(client, machine_id):
+    response = client.request(
+        "GET", f"{changes_path(machine_id)}?limit=10",
+        content=b'{"unexpected": true}',
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
+def test_parameter_errors_take_priority_over_machine_lookup(client):
+    # No machine exists at all; every parameter error is still its 422.
+    assert client.get(changes_path(MISSING_MACHINE)).status_code == 422
+    assert client.get(f"{changes_path(MISSING_MACHINE)}?limit=0").json() == {
+        "error": {"code": "bad_limit"}
+    }
+    assert client.get(
+        f"{changes_path(MISSING_MACHINE)}?limit=1&cursor=garbage"
+    ).json() == {"error": {"code": "invalid_cursor"}}
+    assert client.get(f"{changes_path(MISSING_MACHINE)}?limit=1&x=1").json() == {
+        "error": {"code": "invalid_query"}
+    }
+    # A well-shaped cursor names no declaration of a missing machine, so it
+    # is an unlocatable-position 422 rather than a 404.
+    assert client.get(
+        changes_url(MISSING_MACHINE, limit=1, cursor=f"{T0}|{rid(1)}")
+    ).json() == {"error": {"code": "invalid_cursor"}}
+
+
+def test_validation_errors_do_not_read_records(client, machine_id):
+    # With the table dropped, a read would fail; validation-phase errors
+    # must still come back as their 422 codes, never a 500.
+    with client.app.state.engine.begin() as conn:
+        conn.execute(text("DROP TABLE behavior_declarations"))
+
+    assert client.get(changes_path(machine_id)).status_code == 422
+    assert client.get(f"{changes_path(machine_id)}?limit=0").json() == {
+        "error": {"code": "bad_limit"}
+    }
+    assert client.get(
+        f"{changes_path(machine_id)}?limit=1&cursor=garbage"
+    ).json() == {"error": {"code": "invalid_cursor"}}
+    assert client.get(f"{changes_path(machine_id)}?limit=1&x=1").json() == {
+        "error": {"code": "invalid_query"}
+    }
+
+
+@pytest.mark.parametrize("method", ["head", "post", "put", "patch", "delete"])
+def test_only_get_is_accepted_without_reading_declarations(
+    client, machine_id, method
+):
+    # Drop the table so any declaration read would 500; method routing must
+    # win.
+    with client.app.state.engine.begin() as conn:
+        conn.execute(text("DROP TABLE behavior_declarations"))
+    response = getattr(client, method)(f"{changes_path(machine_id)}?limit=10")
+    assert response.status_code == 405
+
+
+def test_missing_machine_is_404_with_no_records(client):
+    response = client.get(changes_url(MISSING_MACHINE, limit=10))
+    assert response.status_code == 404
+    assert response.json() == {"error": {"code": "not_found"}}
+    assert b"records" not in response.content
+    assert b"has_more" not in response.content
+
+
+def test_read_failure_is_500_with_no_partial_page(client, machine_id):
+    with client.app.state.engine.begin() as conn:
+        conn.execute(text("DROP TABLE behavior_declarations"))
+    response = client.get(changes_url(machine_id, limit=10))
+    assert response.status_code == 500
+    assert response.json() == {"error": {"code": "internal_error"}}
+    assert b"records" not in response.content
+
+
+def test_machine_lookup_failure_is_500_with_no_partial_page(client, machine_id):
+    # The machine lookup happens after the records are read; a failure there
+    # is still a read-layer fault with the internal_error envelope, never the
+    # framework default body and never a partial page.
+    insert_declaration(client, machine_id, 1, T0)
+    with client.app.state.engine.begin() as conn:
+        conn.execute(text("DROP TABLE machines"))
+    response = client.get(changes_url(machine_id, limit=10))
+    assert response.status_code == 500
+    assert response.json() == {"error": {"code": "internal_error"}}
+    assert b"records" not in response.content
+
+
+# --------------------------------------------------------------------------- #
+# Envelope shape, ordering, paging
+# --------------------------------------------------------------------------- #
+
+
+def test_empty_database_returns_full_empty_page(client, machine_id):
+    response = client.get(changes_url(machine_id, limit=25))
+    assert response.status_code == 200
+    assert list(response.json().keys()) == ENVELOPE_KEYS
+    assert response.json() == {
+        "machine_id": machine_id,
+        "limit": 25,
+        "records": [],
+        "next_cursor": None,
+        "has_more": False,
+    }
+
+
+def test_single_page_smaller_than_limit(client, machine_id):
+    insert_declaration(client, machine_id, 1, T1)
+    insert_declaration(client, machine_id, 2, T3)
+
+    body = client.get(changes_url(machine_id, limit=10)).json()
+    assert list(body.keys()) == ENVELOPE_KEYS
+    assert body["machine_id"] == machine_id
+    assert body["limit"] == 10
+    assert body["has_more"] is False
+    assert body["next_cursor"] is None
+    assert [record["id"] for record in body["records"]] == [rid(1), rid(2)]
+
+
+def test_records_carry_exactly_the_list_fields(client, machine_id):
+    insert_declaration(
+        client, machine_id, 7, "2026-03-01T00:00:00.250Z",
+        action_type="write", resource_pattern="s3://bucket/*", enabled=False,
+        updated_at="2026-03-02T00:00:00Z",
+    )
+    record = client.get(changes_url(machine_id, limit=10)).json()["records"][0]
+    assert list(record.keys()) == RECORD_KEYS
+    assert record == {
+        "id": rid(7),
+        "machine_id": machine_id,
+        "action_type": "write",
+        "resource_pattern": "s3://bucket/*",
+        "enabled": False,
+        "created_at": "2026-03-01T00:00:00.250Z",
+        "updated_at": "2026-03-02T00:00:00Z",
+    }
+
+
+def test_exact_page_size_has_no_more(client, machine_id):
+    insert_declaration(client, machine_id, 1, T0)
+    insert_declaration(client, machine_id, 2, T1)
+
+    body = client.get(changes_url(machine_id, limit=2)).json()
+    assert len(body["records"]) == 2
+    assert body["has_more"] is False
+    assert body["next_cursor"] is None
+
+
+def test_pagination_walks_every_record_in_order(client, machine_id):
+    for n, stamp in ((1, T4), (2, T0), (3, T2), (4, T1), (5, T3)):
+        insert_declaration(client, machine_id, n, stamp)
+
+    records, pages = fetch_all_pages(client, machine_id, limit=2)
+    assert pages == 3
+    assert [record["id"] for record in records] == [
+        rid(2),
+        rid(4),
+        rid(3),
+        rid(5),
+        rid(1),
+    ]
+    assert [record["created_at"] for record in records] == [T0, T1, T2, T3, T4]
+
+
+def test_page_cursors_are_exclusive(client, machine_id):
+    for n, stamp in ((1, T0), (2, T1), (3, T2), (4, T3)):
+        insert_declaration(client, machine_id, n, stamp)
+
+    first = client.get(changes_url(machine_id, limit=2)).json()
+    assert [record["id"] for record in first["records"]] == [rid(1), rid(2)]
+    assert first["has_more"] is True
+    # The cursor carries the stored created_at text verbatim, after the row.
+    assert first["next_cursor"] == f"{T1}|{rid(2)}"
+
+    second = client.get(
+        changes_url(machine_id, limit=2, cursor=first["next_cursor"])
+    ).json()
+    assert [record["id"] for record in second["records"]] == [rid(3), rid(4)]
+    assert second["has_more"] is False
+    assert second["next_cursor"] is None
+
+    # The same cursor returns exactly the same page; nothing is reread.
+    repeated = client.get(
+        changes_url(machine_id, limit=2, cursor=first["next_cursor"])
+    ).json()
+    assert repeated == second
+
+
+def test_cursor_past_the_end_is_unlocatable_422(client, machine_id):
+    insert_declaration(client, machine_id, 1, T0)
+
+    # A non-null cursor always names a page's last stored record, so a
+    # position beyond the table cannot be located and is invalid rather than
+    # an empty page.
+    response = client.get(changes_url(machine_id, limit=10, cursor=f"{T5}|{rid(999)}"))
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_cursor"}}
+
+
+def test_exact_second_sorts_before_fractional_same_second(client, machine_id):
+    # Insert so lexicographic text order would put the fractional row first.
+    insert_declaration(client, machine_id, 2, T0_FRAC)
+    insert_declaration(client, machine_id, 1, T0)
+
+    body = client.get(changes_url(machine_id, limit=10)).json()
+    assert [record["id"] for record in body["records"]] == [rid(1), rid(2)]
+    assert body["next_cursor"] is None
+
+
+def test_same_instant_tie_breaks_by_record_id_and_cursor(client, machine_id):
+    insert_declaration(client, machine_id, 30, T2)
+    insert_declaration(client, machine_id, 20, T2)
+    insert_declaration(client, machine_id, 10, T3)
+
+    first = client.get(changes_url(machine_id, limit=1)).json()
+    assert [record["id"] for record in first["records"]] == [rid(20)]
+    assert first["next_cursor"] == f"{T2}|{rid(20)}"
+
+    second = client.get(
+        changes_url(machine_id, limit=1, cursor=first["next_cursor"])
+    ).json()
+    assert [record["id"] for record in second["records"]] == [rid(30)]
+
+    third = client.get(
+        changes_url(machine_id, limit=1, cursor=second["next_cursor"])
+    ).json()
+    assert [record["id"] for record in third["records"]] == [rid(10)]
+    assert third["next_cursor"] is None
+
+
+def test_only_the_path_machines_records_are_returned(client, machine_id):
+    other = client.post(
+        "/machines",
+        json={
+            "external_id": "machine-2",
+            "display_name": "Machine Two",
+            "public_key": "key-9",
+        },
+    ).json()["id"]
+    insert_declaration(client, machine_id, 1, T0)
+    insert_declaration(client, other, 2, T1)
+    insert_declaration(client, machine_id, 3, T2)
+
+    body = client.get(changes_url(machine_id, limit=10)).json()
+    assert [record["id"] for record in body["records"]] == [rid(1), rid(3)]
+    assert all(record["machine_id"] == machine_id for record in body["records"])
+
+    other_body = client.get(changes_url(other, limit=10)).json()
+    assert [record["id"] for record in other_body["records"]] == [rid(2)]
+
+
+def test_real_declarations_are_pageable(client, machine_id):
+    assert create_declaration(client, machine_id, action_type="read").status_code == 201
+    assert create_declaration(client, machine_id, action_type="write").status_code == 201
+
+    records, pages = fetch_all_pages(client, machine_id, limit=1)
+    assert pages == 2
+    assert [record["action_type"] for record in records] == ["read", "write"]
+    assert all(record["machine_id"] == machine_id for record in records)
+
+
+def test_changes_records_match_the_declaration_list(client, machine_id):
+    create_declaration(client, machine_id, action_type="read")
+    create_declaration(client, machine_id, action_type="write")
+    listed = client.get(f"/machines/{machine_id}/behavior-declarations").json()
+
+    records, _ = fetch_all_pages(client, machine_id, limit=1)
+    assert records == listed
+
+
+# --------------------------------------------------------------------------- #
+# Damaged stored values are kept and stay pageable
+# --------------------------------------------------------------------------- #
+
+
+def test_unparseable_created_at_is_kept_and_sorts_last(client, machine_id):
+    insert_declaration(client, machine_id, 1, T1)
+    insert_declaration(client, machine_id, 2, "not-a-timestamp")
+    insert_declaration(client, machine_id, 3, T0)
+
+    rows = client.get(changes_url(machine_id, limit=10)).json()["records"]
+    assert [record["id"] for record in rows] == [rid(3), rid(1), rid(2)]
+    assert rows[-1]["created_at"] == "not-a-timestamp"
+
+
+def test_out_of_range_calendar_stamp_sorts_last_verbatim(client, machine_id):
+    insert_declaration(client, machine_id, 1, T0)
+    insert_declaration(client, machine_id, 2, "2026-13-40T99:99:99Z")
+
+    rows = client.get(changes_url(machine_id, limit=10)).json()["records"]
+    assert [record["id"] for record in rows] == [rid(1), rid(2)]
+    assert rows[1]["created_at"] == "2026-13-40T99:99:99Z"
+
+
+def test_multiple_unparseable_stamps_sort_by_id(client, machine_id):
+    insert_declaration(client, machine_id, 30, "zzz")
+    insert_declaration(client, machine_id, 10, "yyy")
+    insert_declaration(client, machine_id, 20, T0)
+
+    rows = client.get(changes_url(machine_id, limit=10)).json()["records"]
+    assert [record["id"] for record in rows] == [rid(20), rid(10), rid(30)]
+
+
+def test_damaged_declaration_fields_are_emitted_unmodified(client, machine_id):
+    insert_declaration(
+        client, machine_id, 1, T1,
+        action_type="", resource_pattern="  ",
+    )
+    record = client.get(changes_url(machine_id, limit=10)).json()["records"][0]
+    assert record["action_type"] == ""
+    assert record["resource_pattern"] == "  "
+
+
+def test_unparseable_stamp_row_is_pageable_with_its_original_cursor(
+    client, machine_id
+):
+    insert_declaration(client, machine_id, 1, T0)
+    insert_declaration(client, machine_id, 2, "not-a-timestamp|weird")
+
+    first = client.get(changes_url(machine_id, limit=1)).json()
+    assert [record["id"] for record in first["records"]] == [rid(1)]
+    cursor = first["next_cursor"]
+    assert cursor == f"{T0}|{rid(1)}"
+
+    second = client.get(changes_url(machine_id, limit=1, cursor=cursor))
+    assert second.status_code == 200
+    body = second.json()
+    assert [record["id"] for record in body["records"]] == [rid(2)]
+    assert body["records"][0]["created_at"] == "not-a-timestamp|weird"
+    assert body["next_cursor"] is None
+    assert body["has_more"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Stability, inserts, read-only, body format, restart
+# --------------------------------------------------------------------------- #
+
+
+def test_same_cursor_is_byte_stable_when_data_unchanged(client, machine_id):
+    for n, stamp in ((1, T0), (2, T1), (3, T2), (4, T3)):
+        insert_declaration(client, machine_id, n, stamp)
+
+    cursor = client.get(changes_url(machine_id, limit=2)).json()["next_cursor"]
+    page_one = client.get(
+        changes_url(machine_id, limit=2, cursor=cursor)
+    ).content
+    page_two = client.get(
+        changes_url(machine_id, limit=2, cursor=cursor)
+    ).content
+    assert page_one == page_two
+
+
+def test_new_earlier_inserts_do_not_revisit_returned_pages(client, machine_id):
+    insert_declaration(client, machine_id, 1, T2)
+    insert_declaration(client, machine_id, 2, T4)
+
+    first = client.get(changes_url(machine_id, limit=1)).json()
+    assert [record["id"] for record in first["records"]] == [rid(1)]
+    old_cursor = first["next_cursor"]
+
+    # Insert a record sorting before the cursor position and one between.
+    insert_declaration(client, machine_id, 3, T1)
+    insert_declaration(client, machine_id, 4, T3)
+
+    second = client.get(changes_url(machine_id, limit=10, cursor=old_cursor)).json()
+    assert [record["id"] for record in second["records"]] == [rid(4), rid(2)]
+    assert second["has_more"] is False
+
+    # A fresh walk from the start sees the complete new stable order.
+    records, _ = fetch_all_pages(client, machine_id, limit=10)
+    assert [record["id"] for record in records] == [
+        rid(3),
+        rid(1),
+        rid(4),
+        rid(2),
+    ]
+
+
+def test_has_more_reflects_records_after_position_only(client, machine_id):
+    insert_declaration(client, machine_id, 1, T0)
+    insert_declaration(client, machine_id, 2, T1)
+    insert_declaration(client, machine_id, 3, T2)
+
+    assert client.get(changes_url(machine_id, limit=2)).json()["has_more"] is True
+
+    body = client.get(changes_url(machine_id, limit=100)).json()
+    assert len(body["records"]) == 3
+    assert body["has_more"] is False
+    assert body["next_cursor"] is None
+
+    body = client.get(
+        changes_url(machine_id, limit=1, cursor=f"{T1}|{rid(2)}")
+    ).json()
+    assert [record["id"] for record in body["records"]] == [rid(3)]
+    assert body["has_more"] is False
+
+
+def test_query_is_read_only(client, machine_id):
+    insert_declaration(client, machine_id, 1, T1)
+
+    def table_state():
+        with client.app.state.engine.connect() as conn:
+            return list(conn.execute(text("SELECT * FROM behavior_declarations")))
+
+    before = table_state()
+    client.get(changes_url(machine_id, limit=1))
+    client.get(changes_url(machine_id, limit=1, cursor=f"{T5}|{rid(9)}"))
+    client.get(changes_url(machine_id, limit=1, cursor=f"{T1}|{rid(1)}"))
+    after = table_state()
+    assert before == after
+
+
+def _reject_non_finite(marker):
+    # parse_constant only fires for NaN/Infinity tokens; reaching it means a
+    # non-finite literal slipped into the body.
+    raise AssertionError(f"non-finite token in response: {marker}")
+
+
+def test_body_is_compact_newline_terminated_json_with_fixed_order(
+    client, machine_id
+):
+    insert_declaration(client, machine_id, 1, T1)
+    response = client.get(changes_url(machine_id, limit=10))
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    raw = response.content
+    assert raw.endswith(b"\n")
+    assert b"\n" not in raw[:-1]
+    assert b'": ' not in raw
+    assert b", " not in raw
+
+    expected = {
+        "machine_id": machine_id,
+        "limit": 10,
+        "records": [
+            {
+                "id": rid(1),
+                "machine_id": machine_id,
+                "action_type": "action-1",
+                "resource_pattern": "res/1",
+                "enabled": True,
+                "created_at": T1,
+                "updated_at": T1,
+            }
+        ],
+        "next_cursor": None,
+        "has_more": False,
+    }
+    assert raw == (
+        json.dumps(expected, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    # No NaN/Infinity/-0.0-style non-finite or float content.
+    json.loads(raw, parse_constant=_reject_non_finite)
+
+
+def test_changes_persist_across_restart(tmp_path, monkeypatch):
+    db_url = f"sqlite:///{tmp_path / 'persist.db'}"
+    monkeypatch.setenv("ACCOUNTABILITY_DATABASE_URL", db_url)
+
+    with TestClient(app) as first:
+        created = first.post(
+            "/machines",
+            json={
+                "external_id": "machine-1",
+                "display_name": "Machine One",
+                "public_key": "key-1",
+            },
+        ).json()
+        machine_id = created["id"]
+        for n, stamp in ((1, T0), (2, T1), (3, T2)):
+            insert_declaration(first, machine_id, n, stamp)
+        cursor = first.get(changes_url(machine_id, limit=2)).json()["next_cursor"]
+        expected_second = first.get(
+            changes_url(machine_id, limit=2, cursor=cursor)
+        ).content
+
+    with TestClient(app) as second:
+        response = second.get(changes_url(machine_id, limit=2, cursor=cursor))
+
+    assert response.status_code == 200
+    assert response.content == expected_second
+    assert [record["id"] for record in response.json()["records"]] == [rid(3)]
+
+
+# --------------------------------------------------------------------------- #
+# The existing declaration list and creation semantics are untouched
+# --------------------------------------------------------------------------- #
+
+
+def test_declaration_list_is_unchanged(client, machine_id):
+    create_declaration(client, machine_id, action_type="read")
+    create_declaration(client, machine_id, action_type="write")
+
+    listed = client.get(f"/machines/{machine_id}/behavior-declarations")
+    assert listed.status_code == 200
+    records = listed.json()
+    assert [list(record.keys()) for record in records] == [RECORD_KEYS, RECORD_KEYS]
+    assert [record["action_type"] for record in records] == ["read", "write"]
