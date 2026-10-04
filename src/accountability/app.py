@@ -9310,6 +9310,117 @@ def _machine_rows_in_window(session, model, machine_id: str, window_start, windo
     return order_by_created_at_instant(in_window)
 
 
+def validate_machine_accountability_export_params(
+    request: Request,
+) -> ComplianceExportParams:
+    """Validate the machine accountability export query before any lookup.
+
+    Exactly two parameters are accepted: ``from_created_at`` and
+    ``to_created_at``, both required UTC RFC 3339 date-times ending in ``Z``
+    (fractional seconds optional; offset forms, surrounding whitespace, and
+    non-``Z`` suffixes are rejected), with the lower bound not later than the
+    upper bound (equal bounds allowed). Any other parameter name, a repeated
+    ``from_created_at``/``to_created_at``, or a request that carries a body
+    is a 422 ``invalid_query``; a missing, blank, malformed, out-of-range, or
+    inverted bound is a 422 ``bad_time``. Every check here runs before the
+    machine or any accountability record is read and issues no database
+    access, so a parameter error against a non-existent machine still
+    reports 422 rather than 404.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or accountability record is read. A present non-zero
+    # Content-Length, or a chunked request without one, means a body is
+    # being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    allowed = {"from_created_at", "to_created_at"}
+    unknown = [name for name in request.query_params if name not in allowed]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``from_created_at=a&from_created_at=b`` rather than silently taking one
+    # occurrence, regardless of which bound was repeated.
+    if len(request.query_params.getlist("from_created_at")) > 1:
+        raise QueryError("invalid_query")
+    if len(request.query_params.getlist("to_created_at")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_from = request.query_params.get("from_created_at")
+    raw_to = request.query_params.get("to_created_at")
+
+    def _valid(value: str | None) -> bool:
+        if not value or not _RFC3339_Z_DATETIME_RE.fullmatch(value):
+            return False
+        try:
+            parse_utc_z_datetime(value)
+        except ValueError:
+            return False
+        return True
+
+    if not _valid(raw_from) or not _valid(raw_to):
+        raise QueryError("bad_time")
+
+    if parse_utc_z_datetime(raw_from) > parse_utc_z_datetime(raw_to):
+        raise QueryError("bad_time")
+
+    return ComplianceExportParams(
+        from_created_at=raw_from,  # type: ignore[arg-type]
+        to_created_at=raw_to,  # type: ignore[arg-type]
+    )
+
+
+def _accountability_export_instant(value: object) -> datetime | None:
+    """Parse a stored accountability ``created_at`` to its UTC instant.
+
+    Window membership is decided on parsed instants only: a missing,
+    non-string, whitespace-padded, offset, non-``Z``, calendar-invalid, or
+    otherwise unparseable value has no instant, so the row deterministically
+    never falls inside a finite window. The stored text is left untouched
+    and no other row or group is affected.
+    """
+    if isinstance(value, str) and _RFC3339_Z_DATETIME_RE.fullmatch(value):
+        try:
+            return parse_utc_z_datetime(value)
+        except ValueError:
+            pass
+    return None
+
+
+def _accountability_export_rows_in_window(
+    session, model, machine_id: str, window_start, window_end
+):
+    """Load one machine's rows of a table and apply the closed UTC window.
+
+    Membership is decided by the row's own ``created_at`` parsed to a UTC
+    instant and its ``machine_id`` only; a missing, foreign, or otherwise
+    damaged related-object reference never filters a row out (exports are
+    raw, never repaired). A row whose stored ``created_at`` cannot be parsed
+    as a valid UTC ``Z`` instant is deterministically excluded from the
+    finite window without failing the export or affecting any other row.
+    Rows are ordered by the actual UTC instant of ``created_at`` and then by
+    ``id``, so an exact-second record sorts before any fractional-second
+    record of the same second. Issues reads only.
+    """
+    rows = session.scalars(
+        select(model).where(model.machine_id == machine_id)
+    ).all()
+    in_window = [
+        (instant, row)
+        for row in rows
+        if (instant := _accountability_export_instant(row.created_at))
+        is not None
+        and window_start <= instant <= window_end
+    ]
+    in_window.sort(key=lambda pair: (pair[0], pair[1].id))
+    return [row for _, row in in_window]
+
+
 @app.get(
     "/machines/{machine_id}/accountability/compliance-export",
     response_model=AccountabilityComplianceExportOut,
@@ -9317,7 +9428,8 @@ def _machine_rows_in_window(session, model, machine_id: str, window_start, windo
 def export_machine_accountability(
     machine_id: str,
     params: Annotated[
-        ComplianceExportParams, Depends(validate_accountability_export_params)
+        ComplianceExportParams,
+        Depends(validate_machine_accountability_export_params),
     ],
     session: SessionDep,
 ):
@@ -9347,7 +9459,15 @@ def export_machine_accountability(
 
     Records are exported exactly as stored: a missing or misowned related
     object never causes filtering, rewriting, or repair, and only the path
-    machine's records are returned. Event associations (causal links) require
+    machine's records are returned. A record whose stored ``created_at`` is
+    missing, not a string, whitespace-padded, offset-formed, missing the
+    ``Z`` suffix, calendar-invalid, or otherwise unparseable has no UTC
+    instant, so it deterministically stays outside every finite window: the
+    export still answers 200, the damaged row is excluded, and every other
+    row and group is exactly as if that row were absent — the stored text is
+    never repaired, recomputed, normalized, or deleted, so once the stored
+    value again parses as a UTC ``Z`` instant the row takes its true
+    position. Event associations (causal links) require
     both endpoints to be events of this export; the other three dependent
     groups follow their existing machine/entity ownership alone. The query
     issues no writes, repairs, deletions, recomputations, or normalizations,
@@ -9361,27 +9481,27 @@ def export_machine_accountability(
     window_start = parse_utc_z_datetime(params.from_created_at)
     window_end = parse_utc_z_datetime(params.to_created_at)
 
-    events = _machine_rows_in_window(
+    events = _accountability_export_rows_in_window(
         session, AuthorizationDecisionEvent, machine_id, window_start, window_end
     )
-    evidence = _machine_rows_in_window(
+    evidence = _accountability_export_rows_in_window(
         session,
         AuthorizationDecisionEvidence,
         machine_id,
         window_start,
         window_end,
     )
-    incidents = _machine_rows_in_window(
+    incidents = _accountability_export_rows_in_window(
         session,
         AuthorizationDecisionIncident,
         machine_id,
         window_start,
         window_end,
     )
-    status_history = _machine_rows_in_window(
+    status_history = _accountability_export_rows_in_window(
         session, IncidentStatusEvent, machine_id, window_start, window_end
     )
-    assignments = _machine_rows_in_window(
+    assignments = _accountability_export_rows_in_window(
         session,
         IncidentResponsibilityAssignment,
         machine_id,
