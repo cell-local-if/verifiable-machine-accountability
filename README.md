@@ -2850,6 +2850,53 @@ events and their bases through the existing query entries observes the same
 stable results; the decision chain, decision bases, audits, diagnostics,
 compliance and privacy exports, and health-check semantics are unchanged.
 
+### Read-only single-grant execution trace
+
+`GET /machines/{machine_id}/authorization-grants/{grant_id}/grant-trace`
+returns the execution accountability trace of one grant credential in one
+response. It adds a new read-only query only; grant issue, the single
+consumption, emergency revocation, the grant-lifecycle chain, the execution
+receipts and their chain, the authorization decisions and their bases, and
+every other entry keep their behavior. The caller submits only the path
+machine id and the path grant id — no query parameters, no repeated
+parameters, no request body, and no business filter; any query string or
+carried body is `422 {"error":{"code":"invalid_query"}}` raised during
+validation before the machine, the grant, or any use, lifecycle, or receipt
+record is read, so a malformed request against a non-existent machine is
+still `422` rather than `404`. After validation, a missing machine, a
+missing grant, or a grant owned by another machine is
+`404 {"error":{"code":"not_found"}}`. Non-GET methods (including `HEAD`)
+answer `405` without reading records or assembling a trace, and a failure
+while reading is `500 {"error":{"code":"internal_error"}}` carrying no grant
+object and none of the arrays — never a partial trace.
+
+On success the body carries exactly four groups in this fixed order:
+`grant`, `grant_uses`, `lifecycle_events`, and `execution_receipts`.
+`grant` is a single object (never an array) with the same ten audit-list
+fields `{id, machine_id, event_id, issued_at, expires_at, status,
+consumed_at, revoked_at, use_id, use_at}` and the same derived-status
+semantics as the grant audit listing: the identifiers and the four
+lifecycle stamps are emitted exactly as stored, a consumed or revoked grant
+keeps its terminal status even past its TTL, a non-terminal grant at or
+past `expires_at` presents `expired` and one before it presents `active` —
+the derived `expired` status is never persisted — and `use_id`/`use_at`
+carry the grant's unique consumption record, both `null` when it was never
+consumed. The three arrays contain only records owned by the path machine
+whose stored `grant_id` equals the path grant id, each emitted with its
+complete stored fields exactly as stored — identifiers, event references,
+action scope, outcome, digest, moments, and hash-chain fields — with no
+repair, recomputation, normalization, filtering, or fabrication: a
+dangling, duplicated, damaged, or cross-machine reference value survives
+verbatim. Each array is ordered by the actual UTC instant of its own
+business timestamp — `consumed_at` for uses and `occurred_at` for lifecycle
+events and receipts — and then by record id ascending; a stored timestamp
+whose original text does not parse is kept verbatim and sorts after every
+parseable instant. Every array is present and empty when the grant has no
+record of that kind, and no historical record is ever fabricated. The query
+is strictly read-only and machine isolated, and repeated calls against
+unchanged data return the compact, single-newline-terminated JSON body
+byte-for-byte identically across restarts.
+
 ## Execution-completion receipts on consumed grant uses
 
 After a grant has been consumed exactly once, the action it authorized is

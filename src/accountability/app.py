@@ -10972,6 +10972,168 @@ def list_authorization_grants(
     return Response(content=body, media_type="application/json")
 
 
+# --- read-only single-grant execution accountability trace --------------------
+
+
+def validate_grant_trace_params(request: Request) -> None:
+    """Validate the single-grant trace request before any read.
+
+    The trace is keyed on the path machine and the path grant alone: it
+    accepts no query parameters, no repeated parameters, no business filter,
+    and no request body. Any query-string content or a carried body is a 422
+    ``invalid_query``. The check runs as a dependency before the handler
+    reads the machine, the grant, or any use, lifecycle, or receipt record,
+    so a malformed request against a non-existent machine still reports 422
+    rather than 404 and never touches a record.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+    # A body on a GET is an unknown-shape request rejected in the validation
+    # phase, before any machine, grant, or associated record is read. A
+    # present non-zero Content-Length, or a chunked request without one,
+    # means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/authorization-grants/{grant_id}/grant-trace")
+def get_authorization_grant_trace(
+    machine_id: str,
+    grant_id: str,
+    _: Annotated[None, Depends(validate_grant_trace_params)],
+    session: SessionDep,
+):
+    """Read-only single-grant execution accountability trace.
+
+    The real entry point is the ``grant-trace`` sub-entry under the machine
+    authorization grant path; only ``GET`` is routed, so ``HEAD`` and every
+    other method return ``405`` without reading records, assembling a trace,
+    or writing anything. The caller submits only the path machine id and the
+    path grant id — no query parameters, no repeated parameters, no request
+    body, and no business filter; any query string or carried body is a 422
+    ``invalid_query`` raised during validation before the machine, the grant,
+    or any use, lifecycle, or receipt record is read, so a malformed request
+    against a non-existent machine still reports 422 rather than 404. A
+    missing machine, a missing grant, or a grant owned by another machine is
+    a 404 ``not_found`` carrying no trace data.
+
+    On success the response carries exactly four groups in this fixed order:
+    ``grant`` (a single object, never an array) with the same ten audit
+    fields and derived-status semantics as the grant audit list — the
+    identifiers and the ``issued_at``/``expires_at``/``consumed_at``/
+    ``revoked_at`` stamps exactly as stored, ``status`` derived at read time
+    (terminal ``consumed``/``revoked`` kept from storage, a non-terminal
+    grant presenting ``expired`` once its TTL elapses and ``active`` before
+    it, never persisted back), and ``use_id``/``use_at`` from the grant's
+    unique consumption record — followed by the three arrays ``grant_uses``,
+    ``lifecycle_events``, and ``execution_receipts``. Each array contains
+    only records owned by the path machine whose stored ``grant_id`` equals
+    the path grant id, emitted with their complete stored fields exactly as
+    stored — identifiers, event references, action scope, outcome, digest,
+    moments, and hash-chain fields — with no repair, recomputation,
+    normalization, filtering, or fabrication: a dangling, duplicated,
+    damaged, or cross-machine reference value survives verbatim.
+
+    Each array is ordered by the actual UTC instant of its own business
+    timestamp — ``consumed_at`` for uses and ``occurred_at`` for lifecycle
+    events and receipts — and then by record id ascending; a stored
+    timestamp whose original text does not parse is kept verbatim and
+    deterministically sorts after every parseable instant instead of
+    crashing the query. Every array is present and empty when the grant has
+    no record of that kind: a grant that was never consumed, revoked, or
+    executed returns the corresponding empty arrays and no historical record
+    is ever fabricated. The query is strictly read-only and machine
+    isolated: it never creates, updates, deletes, repairs, recomputes, or
+    normalizes a record, another machine's records can never enter a group,
+    and repeated calls against unchanged data return the body byte-for-byte
+    identically across restarts. The body is compact UTF-8 JSON in a fixed
+    field order terminated by a single newline, free of any floating-point
+    or non-finite value. A failure while reading the machine, the grant, or
+    the associated records is a 500 ``internal_error`` carrying no grant
+    object and none of the three arrays — never a partial trace.
+    """
+    # A failure while *reading* — the machine, the grant, or any use,
+    # lifecycle, or receipt row — is an internal read-layer fault: answer
+    # 500 internal_error with no grant object and none of the three arrays.
+    # Damaged stored values are not a read failure: rows read successfully
+    # are filtered by their own stored ownership/grant columns and emitted
+    # verbatim, with an unparseable stamp sorting last, so only a true read
+    # fault reaches the except branch.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        # Scoped to the path machine: a grant owned by another machine is
+        # indistinguishable from a missing one.
+        grant = session.scalar(
+            select(AuthorizationGrant).where(
+                AuthorizationGrant.id == grant_id,
+                AuthorizationGrant.machine_id == machine_id,
+            )
+        )
+        if grant is None:
+            return error_response(404, "not_found")
+
+        use_rows = _order_execution_trace_rows(
+            session.scalars(
+                select(AuthorizationGrantUse).where(
+                    AuthorizationGrantUse.machine_id == machine_id,
+                    AuthorizationGrantUse.grant_id == grant_id,
+                )
+            ).all(),
+            "consumed_at",
+        )
+        lifecycle_rows = _order_execution_trace_rows(
+            session.scalars(
+                select(AuthorizationGrantLifecycleEvent).where(
+                    AuthorizationGrantLifecycleEvent.machine_id == machine_id,
+                    AuthorizationGrantLifecycleEvent.grant_id == grant_id,
+                )
+            ).all(),
+            "occurred_at",
+        )
+        receipt_rows = _order_execution_trace_rows(
+            session.scalars(
+                select(ExecutionReceipt).where(
+                    ExecutionReceipt.machine_id == machine_id,
+                    ExecutionReceipt.grant_id == grant_id,
+                )
+            ).all(),
+            "occurred_at",
+        )
+    except Exception:
+        return error_response(500, "internal_error")
+
+    use_by_grant = {use.grant_id: use for use in use_rows}
+    payload = {
+        "grant": authorization_grant_to_dict(
+            grant, use_by_grant, now=datetime.now(timezone.utc)
+        ),
+        "grant_uses": [
+            _execution_trace_grant_use_to_dict(row) for row in use_rows
+        ],
+        "lifecycle_events": [
+            _execution_trace_lifecycle_to_dict(row) for row in lifecycle_rows
+        ],
+        "execution_receipts": [
+            _execution_trace_receipt_to_dict(row) for row in receipt_rows
+        ],
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- authorization grant lifecycle audit chain --------------------------------
 
 
