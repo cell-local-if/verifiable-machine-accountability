@@ -198,6 +198,35 @@ def _recompute_rows(rows: list[Any]) -> list[dict[str, Any]]:
     return updates
 
 
+_UUID_MAX_INT = (1 << 128) - 1
+
+
+def _strictly_greater_id(candidate: str, tail_id: str) -> str:
+    """Return an event id that sorts strictly after ``tail_id``.
+
+    ``candidate`` — a fresh random uuid — almost always clears the tail
+    already. When it does not (same-instant bursts, where every draw is
+    conditioned above the running maximum and a redraw-until-larger loop's
+    expected cost doubles per appended event), the id is instead stepped a
+    random 64-bit distance above the tail's own 128-bit value, keeping the
+    uuid text shape. The redraw loop remains the fallback for a non-uuid
+    or near-overflow tail id.
+    """
+    if candidate > tail_id:
+        return candidate
+    try:
+        tail_int = uuid.UUID(tail_id).int
+    except (AttributeError, TypeError, ValueError):
+        tail_int = None
+    if tail_int is not None:
+        stepped = tail_int + 1 + (uuid.uuid4().int & ((1 << 64) - 1))
+        if stepped <= _UUID_MAX_INT:
+            return str(uuid.UUID(int=stepped))
+    while candidate <= tail_id:
+        candidate = str(uuid.uuid4())
+    return candidate
+
+
 def append_event(
     conn: Connection,
     *,
@@ -215,9 +244,9 @@ def append_event(
     successful response already carries and is never adjusted: the action's
     moment is minted inside this same locked transaction, so events commit in
     non-decreasing (``occurred_at``, ``id``) order. The event id is minted
-    here and is regenerated (rarely) until the new key sorts strictly after
-    the current tail, so the previous-event link always matches the order
-    used by verification even under same-instant actions.
+    here and always sorts strictly after the current tail (see
+    :func:`_strictly_greater_id`), so the previous-event link always matches
+    the order used by verification even under same-instant actions.
     """
     rows = _load_records(conn, machine_id)
     # Every row this feature writes carries its hashes. If any row is missing
@@ -243,8 +272,7 @@ def append_event(
         # the tail; the id is the only degree of freedom, since occurred_at
         # is fixed by the response contract.
         if occurred_at == tail._mapping["occurred_at"]:
-            while event_id <= tail_id:
-                event_id = str(uuid.uuid4())
+            event_id = _strictly_greater_id(event_id, tail_id)
 
     if tail is None:
         previous_event_id = None

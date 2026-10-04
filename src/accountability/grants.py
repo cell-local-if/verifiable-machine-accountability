@@ -26,6 +26,16 @@ a short-lived credential that can be consumed exactly once:
   the machine status change and the consumption take the same write lock, so
   whichever commits first decides, and the grant stays consumable again once
   the machine returns to ``active``.
+* :func:`consume_grants_batch` confirms the use of several grants in one
+  locked write transaction: every grant is checked in input order against
+  exactly the single-consume rules, the first failing grant decides the
+  whole batch's outcome and nothing is written, and a successful batch
+  flips every grant to ``consumed``, inserts exactly one use record per
+  grant, and appends one ``consumed`` lifecycle event per grant — all
+  stamped with one shared UTC consume moment. A concurrent single consume
+  or another batch racing for any of these grants has exactly one winner;
+  the loser observes the winner's committed state in its ordered checks and
+  rolls back entirely.
 * :func:`revoke_grant` performs the emergency revocation: it atomically flips
   one unused, unexpired, unrevoked grant to ``revoked`` and stamps
   ``revoked_at`` in the same kind of locked transaction, so a concurrent burst
@@ -440,6 +450,129 @@ def consume_grant(
     try:
         return _run_with_lock_retry(engine, _work)
     except IntegrityError:
+        return {"status": "grant_consumed"}
+
+
+def consume_grants_batch(
+    engine: Engine,
+    *,
+    machine_id: str,
+    grant_ids: list[str],
+) -> dict[str, Any]:
+    """Atomically consume several unused, unexpired grants, or none.
+
+    Every grant is checked in input order against exactly the eligibility
+    rules of :func:`consume_grant` — path-machine ownership, not consumed,
+    not revoked, not expired, machine not suspended — inside one locked
+    write transaction that also performs every state flip, use-record
+    insert, and lifecycle event. The first failing grant in input order
+    decides the whole batch's outcome; the status dict uses the same
+    status values as :func:`consume_grant` (``not_found``,
+    ``grant_consumed``, ``grant_revoked``, ``grant_expired``,
+    ``machine_suspended``, or ``ok`` with the ordered ``uses`` list of
+    ``{grant_id, use_id, consumed_at}`` dicts).
+
+    A rejected batch writes nothing: no partial consumption is ever
+    committed. A successful batch stamps every use record, every grant's
+    ``consumed_at``, and every lifecycle event with one shared UTC consume
+    moment. The lock is the same one the single consume, the revocation,
+    and the machine status change take, so a concurrent single consume or
+    another batch racing for any of these grants has exactly one winner
+    and the loser's whole transaction rolls back; the unique ``grant_id``
+    on the use table remains the cross-request backstop.
+    """
+
+    def _work(conn) -> dict[str, Any]:
+        machine = conn.execute(
+            Machine.__table__.select().where(Machine.__table__.c.id == machine_id)
+        ).first()
+        if machine is None:
+            return {"status": "not_found"}
+
+        now = datetime.now(timezone.utc)
+        # Eligibility is decided per grant in input order before anything
+        # is written: the first failing grant's outcome is the batch's
+        # outcome. The two terminal states keep their precedence over the
+        # derived expiry, and all three keep precedence over the suspended
+        # gate, exactly as in the single consume.
+        grant_rows = []
+        for grant_id in grant_ids:
+            grant_row = conn.execute(
+                _GRANT_TABLE.select().where(
+                    _GRANT_TABLE.c.id == grant_id,
+                    _GRANT_TABLE.c.machine_id == machine_id,
+                )
+            ).first()
+            if grant_row is None:
+                return {"status": "not_found"}
+
+            grant = grant_row._mapping
+            if grant["status"] == "consumed":
+                return {"status": "grant_consumed"}
+            if grant["status"] == "revoked":
+                return {"status": "grant_revoked"}
+            if now >= _parse_utc(grant["expires_at"]):
+                # Expiry is derived from the immutable expires_at; an
+                # expired grant is never updated, renewed, or rewritten.
+                return {"status": "grant_expired"}
+            if machine._mapping["status"] == "suspended":
+                # Only a still-usable grant reaches this gate: nothing is
+                # written and the grant is consumable again after
+                # reactivation.
+                return {"status": "machine_suspended"}
+            grant_rows.append(grant)
+
+        # Every grant qualified: one shared consume moment for the whole
+        # batch, one state flip, one use record, and one lifecycle event
+        # per grant, all committed together.
+        consumed_at = _utc_iso(now)
+        uses = []
+        for grant_id, grant in zip(grant_ids, grant_rows):
+            use_id = str(uuid.uuid4())
+            conn.execute(
+                _GRANT_TABLE.update()
+                .where(_GRANT_TABLE.c.id == grant_id)
+                .values(status="consumed", consumed_at=consumed_at)
+            )
+            # The unique grant_id makes a second use row impossible even
+            # if the state flip were ever raced; all statements of the
+            # batch commit together.
+            conn.execute(
+                _USE_TABLE.insert().values(
+                    id=use_id,
+                    grant_id=grant_id,
+                    machine_id=machine_id,
+                    event_id=grant["event_id"],
+                    consumed_at=consumed_at,
+                )
+            )
+            # The audit event commits in the same locked transaction as
+            # the state flip and the use record, reusing the response's
+            # consumed_at.
+            grant_lifecycle.append_event(
+                conn,
+                machine_id=machine_id,
+                grant_id=grant_id,
+                authorization_event_id=grant["event_id"],
+                type="consumed",
+                occurred_at=consumed_at,
+            )
+            uses.append(
+                {
+                    "grant_id": grant_id,
+                    "use_id": use_id,
+                    "consumed_at": consumed_at,
+                }
+            )
+        return {"status": "ok", "uses": uses}
+
+    try:
+        return _run_with_lock_retry(engine, _work)
+    except IntegrityError:
+        # The unique grant_id constraint is the cross-backstop race guard:
+        # a concurrent transaction that consumed any of these grants first
+        # wins, and this batch's partial writes roll back with the failed
+        # transaction.
         return {"status": "grant_consumed"}
 
 
