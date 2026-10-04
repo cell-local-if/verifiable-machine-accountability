@@ -11931,6 +11931,98 @@ def check_execution_receipts_coverage(
     return Response(content=body, media_type="application/json")
 
 
+def validate_execution_receipt_summary_params(request: Request) -> None:
+    """Validate the receipt-summary query before any machine lookup.
+
+    The summary is keyed on the path machine alone and accepts no query
+    parameters or request body; either is a 422 ``invalid_query`` raised
+    before the machine is looked up and before any consumption or receipt is
+    read, so the same malformed request against a non-existent machine is
+    still 422.
+    """
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/execution-receipts/summary")
+def get_execution_receipts_summary(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_execution_receipt_summary_params)],
+    session: SessionDep,
+):
+    """Read-only execution-receipt roll-up for one machine.
+
+    The caller submits only the path machine id — no query parameters and
+    no request body; any query parameter (including a repeated name) or a
+    carried body is ``422 invalid_query`` during validation, before either
+    the machine or any consumption or receipt record is read, so the same
+    malformed request against a non-existent machine is still 422. After
+    validation a missing machine is a 404 ``not_found`` carrying no summary.
+    Only ``GET`` is routed; ``HEAD`` and every other method return ``405``
+    without reading consumption or receipt records or writing anything. A
+    real failure while reading the machine, the consumptions, or the
+    receipts is a 500 ``internal_error`` with no partial summary.
+
+    On success the body carries exactly ``{machine_id, total_receipts,
+    succeeded_count, failed_count, invalid_outcome_count,
+    valid_result_digest_count, invalid_result_digest_count,
+    missing_receipt_count}`` in this fixed order: ``machine_id`` echoes the
+    path value, ``total_receipts`` is the total number of the machine's
+    receipt rows, ``succeeded_count``/``failed_count`` count receipts whose
+    stored ``outcome`` is verbatim ``succeeded``/``failed``, and
+    ``invalid_outcome_count`` counts every other stored outcome (damaged
+    values included, never hidden, repaired, recomputed, or folded into
+    success or failure). ``valid_result_digest_count`` counts receipts whose
+    stored ``result_digest`` is exactly 64 lowercase hexadecimal characters
+    and ``invalid_result_digest_count`` every other value.
+    ``missing_receipt_count`` is the number of the machine's distinct
+    consumed authorizations with no receipt; a gap is reported, not filled,
+    and never interpreted as an execution result. Only the path machine's
+    consumptions and receipts are read, another machine's records or a
+    damaged value never change these counts, and the summary never rebuilds,
+    backfills, updates, deletes, repairs, recomputes, or normalizes a use, a
+    receipt, or any chain. The body is compact UTF-8 JSON terminated by a
+    single newline; every count is a non-negative JSON integer with no
+    floating-point, ``-0.0``, or non-finite value, and repeated reads of
+    unchanged data (including across restarts) are byte-identical.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        summary = execution_receipts.execution_receipt_summary(
+            session, machine_id
+        )
+    except SQLAlchemyError:
+        # Never emit a partial summary when the records cannot be read.
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": machine_id,
+        "total_receipts": summary["total_receipts"],
+        "succeeded_count": summary["succeeded_count"],
+        "failed_count": summary["failed_count"],
+        "invalid_outcome_count": summary["invalid_outcome_count"],
+        "valid_result_digest_count": summary["valid_result_digest_count"],
+        "invalid_result_digest_count": summary[
+            "invalid_result_digest_count"
+        ],
+        "missing_receipt_count": summary["missing_receipt_count"],
+    }
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- read-only fixed-window execution-receipt compliance export --------------
 
 
