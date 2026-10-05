@@ -37,6 +37,7 @@ from . import (
     diagnostics,
     evidence_chain,
     execution_receipts,
+    execution_reconciliation,
     grant_lifecycle,
     grant_reconciliation,
     grants,
@@ -12727,6 +12728,114 @@ def get_authorization_grant_reconciliation(
         if machine is None:
             return error_response(404, "not_found")
         conclusion = grant_reconciliation.reconcile(session, machine_id)
+    except Exception:
+        return error_response(500, "internal_error")
+
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            conclusion, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
+# --- read-only grant/lifecycle/use/receipt execution reconciliation ---------
+
+
+def validate_execution_reconciliation_params(request: Request) -> None:
+    """Validate the execution reconciliation query before any lookup.
+
+    The reconciliation is keyed on the path machine alone and accepts no
+    query parameters — a single, repeated, or unknown parameter name alike —
+    and no request body; any query-string content or a carried body is a 422
+    ``invalid_query``. The check runs as a dependency before the machine or
+    any grant, lifecycle, use, or receipt record is read, so a malformed
+    request against a non-existent machine still reports 422 rather than
+    404 and never touches a record.
+    """
+    # A present non-zero Content-Length, or a chunked request without one,
+    # means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/authorization-grants/execution-reconciliation")
+def get_authorization_grant_execution_reconciliation(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_execution_reconciliation_params)],
+    session: SessionDep,
+):
+    """Read-only reconciliation of grants, events, uses, and receipts.
+
+    Only ``GET`` is routed, so ``HEAD`` and every other method return 405
+    without reading records, computing a conclusion, or writing anything.
+    The caller submits only the path machine id — no query parameters, no
+    repeated parameters, and no request body; any query string or carried
+    body is a 422 ``invalid_query`` raised during validation before the
+    machine or any grant, lifecycle, use, or receipt record is read, so a
+    malformed request against a non-existent machine still reports 422
+    rather than 404. A missing machine is a 404 ``not_found`` carrying no
+    conclusion. A failure while reading the records is a 500
+    ``internal_error`` with no partial conclusion.
+
+    On success the response carries exactly ``{valid,
+    checked_grant_count, historical_grant_count, completed_count,
+    broken_grant_id, broken_record_id, anomaly}`` in this fixed field
+    order. ``checked_grant_count`` is the path machine's total grant count
+    and ``historical_grant_count`` the number of grants that have no
+    lifecycle event at all — historical grants from databases that predate
+    the lifecycle feature, which are counted for compatibility, never
+    judged, and never given fabricated events, uses, or receipts.
+    ``completed_count`` tallies only the consumed grants that reconcile
+    without any anomaly. Every checked grant must begin with a unique,
+    first ``issued`` event; an ``active`` grant must have no terminal
+    event, no use, and no receipt; a ``consumed`` grant exactly one
+    ``consumed`` event, exactly one use of the same ownership and moment,
+    and exactly one receipt bound to the same use, grant, and source allow
+    decision with the source event's verbatim action and resource and a
+    sound ``outcome``, ``result_digest``, and ``content_hash``; and a
+    ``revoked`` grant exactly one ``revoked`` event and neither a use nor
+    a receipt. The first problem grant — ordered by the actual UTC instant
+    of ``issued_at`` and then by grant id, with a grant whose ``issued_at``
+    no longer parses reported first — is named in ``broken_grant_id``, the
+    stored record evidencing the problem in ``broken_record_id``, and
+    ``anomaly`` is one of ``timestamp_unparseable``,
+    ``grant_binding_mismatch``, ``grant_state_mismatch``, ``use_mismatch``,
+    ``receipt_missing``, ``receipt_mismatch``, or
+    ``receipt_content_invalid``; an orphan lifecycle event, use, or receipt
+    whose ``grant_id`` names no grant of the machine is located by that
+    stored ``grant_id``. When everything reconciles, ``valid`` is ``true``
+    and ``broken_grant_id``, ``broken_record_id``, and ``anomaly`` are all
+    ``null``.
+
+    The query is strictly read-only and machine isolated: it never creates,
+    updates, deletes, repairs, recomputes, or normalizes a grant, use,
+    lifecycle event, receipt, or chain record, only rows owned by the path
+    machine are examined, and repeated calls against unchanged data return
+    the body byte-for-byte identically across restarts. The body is compact
+    UTF-8 JSON in a fixed field order terminated by a single newline, free
+    of any floating-point or non-finite value.
+    """
+    # A failure while *reading* — the machine, the grants, the events, the
+    # uses, the receipts, or the decision events — is an internal
+    # read-layer fault: answer 500 internal_error with no conclusion.
+    # Damaged stored values are not a read failure: rows read successfully
+    # are reconciled tolerantly, so only a true read fault reaches the
+    # except branch.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        conclusion = execution_reconciliation.reconcile(session, machine_id)
     except Exception:
         return error_response(500, "internal_error")
 

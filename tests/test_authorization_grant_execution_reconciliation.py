@@ -1,0 +1,894 @@
+"""Tests for the read-only grant/lifecycle/use/receipt reconciliation.
+
+    GET /machines/{machine_id}/authorization-grants/execution-reconciliation
+
+The endpoint cross-checks, strictly read-only and only for the path
+machine, the full life of every grant: the grant row, its immutable
+lifecycle events, its single use record, and the execution-completion
+receipt that must close a consumed grant. A consumed grant carries exactly
+one ``consumed`` event, exactly one use of the same ownership and moment,
+and exactly one receipt bound to the same use, grant, and source allow
+decision with a sound outcome, result digest, and content hash; an active
+or revoked grant carries neither a use nor a receipt. Grants without any
+lifecycle event are historical (old-database compatibility): counted,
+never judged, never given fabricated records.
+
+These tests cover the sound flows (active, completed, revoked, historical,
+empty), every anomaly category (timestamp, event binding, sequence or
+state, use, receipt missing, receipt binding, receipt content), the
+completed-count rule, the first-broken-grant ordering, orphan records,
+machine isolation, request-shape validation (422 before 404), 404, 405,
+and the read-only guarantee across repeated calls and restarts.
+"""
+import sqlite3
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+
+from accountability.app import app
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "ACCOUNTABILITY_DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}"
+    )
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+def create_machine(client, external_id="machine-1"):
+    response = client.post(
+        "/machines",
+        json={
+            "external_id": external_id,
+            "display_name": "Machine One",
+            "public_key": "key-1",
+        },
+    )
+    assert response.status_code == 201
+    return response.json()["id"]
+
+
+def create_rule(client, action_type="read", resource_pattern="res/*",
+                effect="allow", priority=0):
+    response = client.post(
+        "/policy-rules",
+        json={
+            "action_type": action_type,
+            "resource_pattern": resource_pattern,
+            "effect": effect,
+            "priority": priority,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+def declare(client, machine_id, action_type="read", resource_pattern="res/*",
+            enabled=True):
+    response = client.post(
+        f"/machines/{machine_id}/behavior-declarations",
+        json={
+            "action_type": action_type,
+            "resource_pattern": resource_pattern,
+            "enabled": enabled,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+def record_event(client, machine_id, action_type="read", resource="res/x"):
+    return client.post(
+        f"/machines/{machine_id}/authorization-decision-events",
+        json={"action_type": action_type, "resource": resource},
+    )
+
+
+def issue(client, machine_id, event_id, ttl_seconds=300):
+    response = client.post(
+        f"/machines/{machine_id}/authorization-grants",
+        json={"event_id": event_id, "ttl_seconds": ttl_seconds},
+    )
+    assert response.status_code == 201
+    return response
+
+
+def consume(client, machine_id, grant_id):
+    response = client.post(
+        f"/machines/{machine_id}/authorization-grants/{grant_id}/consume"
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def create_receipt(client, machine_id, use_id, action_type="read",
+                   resource="res/x", outcome="succeeded",
+                   result_digest="a" * 64):
+    response = client.post(
+        f"/machines/{machine_id}/execution-receipts",
+        json={
+            "use_id": use_id,
+            "action_type": action_type,
+            "resource": resource,
+            "outcome": outcome,
+            "result_digest": result_digest,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+def reconciliation_url(machine_id):
+    return (
+        f"/machines/{machine_id}/authorization-grants/"
+        "execution-reconciliation"
+    )
+
+
+@pytest.fixture
+def allowed_event(client):
+    """A machine + enabled declaration + allow rule + allowed event."""
+    machine_id = create_machine(client)
+    declare(client, machine_id)
+    create_rule(client)
+    event = record_event(client, machine_id).json()
+    assert event["allowed"] is True
+    assert event["reason"] == "allowed_by_policy"
+    return machine_id, event
+
+
+@pytest.fixture
+def issued_grant(allowed_event, client):
+    """A machine with one freshly issued (active) grant."""
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    return machine_id, event, grant
+
+
+@pytest.fixture
+def completed_grant(issued_grant, client):
+    """A machine with one consumed grant closed by a sound receipt."""
+    machine_id, event, grant = issued_grant
+    use = consume(client, machine_id, grant["id"])
+    receipt = create_receipt(client, machine_id, use["use_id"])
+    return machine_id, event, grant, use, receipt
+
+
+def reconcile(client, machine_id):
+    response = client.get(reconciliation_url(machine_id))
+    assert response.status_code == 200
+    return response.json()
+
+
+def db_execute(client, statement, **params):
+    with client.app.state.engine.begin() as conn:
+        conn.execute(text(statement).bindparams(**params))
+
+
+def insert_historical_grant(client, machine_id, event_id,
+                            issued_at="2026-01-01T00:00:00Z",
+                            status="active"):
+    """A grant row with no lifecycle event, as old databases carry them."""
+    grant_id = str(uuid.uuid4())
+    db_execute(
+        client,
+        "INSERT INTO authorization_grants "
+        "(id, machine_id, event_id, issued_at, expires_at, status, "
+        " consumed_at, revoked_at) "
+        "VALUES (:id, :machine_id, :event_id, :issued_at, :expires_at, "
+        "        :status, NULL, NULL)",
+        id=grant_id,
+        machine_id=machine_id,
+        event_id=event_id,
+        issued_at=issued_at,
+        expires_at="2026-01-02T00:00:00Z",
+        status=status,
+    )
+    return grant_id
+
+
+def grant_row(client, grant_id):
+    with client.app.state.engine.connect() as conn:
+        return conn.execute(
+            text(
+                "SELECT id, machine_id, event_id, issued_at, expires_at, "
+                "status, consumed_at, revoked_at "
+                "FROM authorization_grants WHERE id = :id"
+            ).bindparams(id=grant_id)
+        ).mappings().one()
+
+
+def lifecycle_events(client, grant_id):
+    with client.app.state.engine.connect() as conn:
+        return conn.execute(
+            text(
+                "SELECT id, type, occurred_at "
+                "FROM authorization_grant_lifecycle_events "
+                "WHERE grant_id = :grant_id ORDER BY occurred_at, id"
+            ).bindparams(grant_id=grant_id)
+        ).mappings().all()
+
+
+# --------------------------------------------------------------------------- #
+# Sound flows reconcile clean
+# --------------------------------------------------------------------------- #
+
+
+def test_empty_machine_is_valid(client):
+    machine_id = create_machine(client)
+    assert reconcile(client, machine_id) == {
+        "valid": True,
+        "checked_grant_count": 0,
+        "historical_grant_count": 0,
+        "completed_count": 0,
+        "broken_grant_id": None,
+        "broken_record_id": None,
+        "anomaly": None,
+    }
+
+
+def test_issued_grant_is_valid(issued_grant, client):
+    machine_id, _, _ = issued_grant
+    assert reconcile(client, machine_id) == {
+        "valid": True,
+        "checked_grant_count": 1,
+        "historical_grant_count": 0,
+        "completed_count": 0,
+        "broken_grant_id": None,
+        "broken_record_id": None,
+        "anomaly": None,
+    }
+
+
+def test_completed_grant_is_valid(completed_grant, client):
+    machine_id, _, _, _, _ = completed_grant
+    assert reconcile(client, machine_id) == {
+        "valid": True,
+        "checked_grant_count": 1,
+        "historical_grant_count": 0,
+        "completed_count": 1,
+        "broken_grant_id": None,
+        "broken_record_id": None,
+        "anomaly": None,
+    }
+
+
+def test_two_completed_grants_count(completed_grant, client):
+    machine_id, _, _, _, _ = completed_grant
+    second_event = record_event(client, machine_id).json()
+    second_grant = issue(client, machine_id, second_event["id"]).json()
+    second_use = consume(client, machine_id, second_grant["id"])
+    create_receipt(client, machine_id, second_use["use_id"])
+    body = reconcile(client, machine_id)
+    assert body["valid"] is True
+    assert body["checked_grant_count"] == 2
+    assert body["completed_count"] == 2
+
+
+def test_revoked_grant_is_valid(issued_grant, client):
+    machine_id, _, grant = issued_grant
+    response = client.post(
+        f"/machines/{machine_id}/authorization-grants/{grant['id']}/revoke"
+    )
+    assert response.status_code == 200
+    body = reconcile(client, machine_id)
+    assert body["valid"] is True
+    assert body["completed_count"] == 0
+
+
+def test_historical_grant_is_counted_not_judged(allowed_event, client):
+    machine_id, event = allowed_event
+    # A consumed grant row without any lifecycle event, use, or receipt, as
+    # databases that predate the features carry it: counted as historical,
+    # never judged, and never completed.
+    insert_historical_grant(client, machine_id, event["id"], status="consumed")
+    body = reconcile(client, machine_id)
+    assert body == {
+        "valid": True,
+        "checked_grant_count": 1,
+        "historical_grant_count": 1,
+        "completed_count": 0,
+        "broken_grant_id": None,
+        "broken_record_id": None,
+        "anomaly": None,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Request shape, machine lookup, and method validation
+# --------------------------------------------------------------------------- #
+
+
+def test_query_string_is_rejected_before_lookup(client):
+    response = client.get(reconciliation_url("missing"), params={"x": "1"})
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
+def test_repeated_query_param_is_rejected(issued_grant, client):
+    machine_id, _, _ = issued_grant
+    response = client.get(reconciliation_url(machine_id) + "?a=1&a=2")
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
+def test_body_is_rejected_before_lookup(client):
+    response = client.request(
+        "GET", reconciliation_url("missing"), content=b"{}"
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_query"}}
+
+
+def test_missing_machine_is_404(client):
+    response = client.get(reconciliation_url("missing-machine"))
+    assert response.status_code == 404
+    assert response.json() == {"error": {"code": "not_found"}}
+
+
+def test_non_get_methods_are_405(issued_grant, client):
+    machine_id, _, _ = issued_grant
+    for method in ("post", "put", "patch", "delete", "head"):
+        response = getattr(client, method)(reconciliation_url(machine_id))
+        assert response.status_code == 405
+
+
+# --------------------------------------------------------------------------- #
+# Anomaly: timestamps
+# --------------------------------------------------------------------------- #
+
+
+def test_unparseable_issued_at_is_timestamp_anomaly(issued_grant, client):
+    machine_id, _, grant = issued_grant
+    db_execute(
+        client,
+        "UPDATE authorization_grants SET issued_at = 'not-a-time' "
+        "WHERE id = :id",
+        id=grant["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == grant["id"]
+    assert body["anomaly"] == "timestamp_unparseable"
+
+
+def test_unparseable_event_moment_names_the_event(issued_grant, client):
+    machine_id, _, grant = issued_grant
+    event_id = lifecycle_events(client, grant["id"])[0]["id"]
+    db_execute(
+        client,
+        "UPDATE authorization_grant_lifecycle_events "
+        "SET occurred_at = 'garbage' WHERE id = :id",
+        id=event_id,
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == event_id
+    assert body["anomaly"] == "timestamp_unparseable"
+
+
+def test_unparseable_receipt_moment_names_the_receipt(completed_grant,
+                                                      client):
+    machine_id, _, grant, _, receipt = completed_grant
+    db_execute(
+        client,
+        "UPDATE execution_receipts SET occurred_at = 'garbage' "
+        "WHERE id = :id",
+        id=receipt["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == receipt["id"]
+    assert body["anomaly"] == "timestamp_unparseable"
+
+
+def test_unparseable_time_is_reported_first(allowed_event, client):
+    machine_id, event = allowed_event
+    grant_a = issue(client, machine_id, event["id"]).json()
+    second = record_event(client, machine_id).json()
+    grant_b = issue(client, machine_id, second["id"]).json()
+    consume(client, machine_id, grant_b["id"])
+    # Grant B (issued later) is missing its receipt; grant A's issued_at is
+    # unparseable. The unparseable time is reported first.
+    db_execute(
+        client,
+        "UPDATE authorization_grants SET issued_at = 'garbage' "
+        "WHERE id = :id",
+        id=grant_a["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["broken_grant_id"] == grant_a["id"]
+    assert body["anomaly"] == "timestamp_unparseable"
+
+
+# --------------------------------------------------------------------------- #
+# Anomaly: lifecycle event binding
+# --------------------------------------------------------------------------- #
+
+
+def test_event_decision_reference_mismatch(issued_grant, client):
+    machine_id, _, grant = issued_grant
+    event_id = lifecycle_events(client, grant["id"])[0]["id"]
+    db_execute(
+        client,
+        "UPDATE authorization_grant_lifecycle_events "
+        "SET authorization_event_id = 'other-event' "
+        "WHERE grant_id = :grant_id",
+        grant_id=grant["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == event_id
+    assert body["anomaly"] == "grant_binding_mismatch"
+
+
+def test_event_terminal_moment_mismatch(completed_grant, client):
+    machine_id, _, grant, _, _ = completed_grant
+    consumed_event_id = lifecycle_events(client, grant["id"])[1]["id"]
+    db_execute(
+        client,
+        "UPDATE authorization_grant_lifecycle_events "
+        "SET occurred_at = '2030-01-01T00:00:00Z' "
+        "WHERE grant_id = :grant_id AND type = 'consumed'",
+        grant_id=grant["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == consumed_event_id
+    assert body["anomaly"] == "grant_binding_mismatch"
+
+
+def test_orphan_event_is_located_by_grant_id(issued_grant, client):
+    machine_id, event, _ = issued_grant
+    orphan_grant_id = str(uuid.uuid4())
+    orphan_event_id = str(uuid.uuid4())
+    db_execute(
+        client,
+        "INSERT INTO authorization_grant_lifecycle_events "
+        "(id, machine_id, grant_id, authorization_event_id, type, "
+        " occurred_at, previous_event_id, content_hash, chain_hash) "
+        "VALUES (:id, :machine_id, :grant_id, :event_id, 'issued', "
+        "        :occurred_at, NULL, NULL, NULL)",
+        id=orphan_event_id,
+        machine_id=machine_id,
+        grant_id=orphan_grant_id,
+        event_id=event["id"],
+        occurred_at="2026-01-01T00:00:00Z",
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == orphan_grant_id
+    assert body["broken_record_id"] == orphan_event_id
+    assert body["anomaly"] == "grant_binding_mismatch"
+
+
+# --------------------------------------------------------------------------- #
+# Anomaly: event sequence or state
+# --------------------------------------------------------------------------- #
+
+
+def test_missing_terminal_event_is_state_mismatch(completed_grant, client):
+    machine_id, _, grant, _, _ = completed_grant
+    db_execute(
+        client,
+        "DELETE FROM authorization_grant_lifecycle_events "
+        "WHERE grant_id = :grant_id AND type = 'consumed'",
+        grant_id=grant["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    # The missing event has no record to name; the grant itself is named.
+    assert body["broken_record_id"] == grant["id"]
+    assert body["anomaly"] == "grant_state_mismatch"
+
+
+def test_terminal_event_on_active_grant_is_state_mismatch(issued_grant,
+                                                          client):
+    machine_id, _, grant = issued_grant
+    row = grant_row(client, grant["id"])
+    stray_event_id = str(uuid.uuid4())
+    db_execute(
+        client,
+        "INSERT INTO authorization_grant_lifecycle_events "
+        "(id, machine_id, grant_id, authorization_event_id, type, "
+        " occurred_at, previous_event_id, content_hash, chain_hash) "
+        "VALUES (:id, :machine_id, :grant_id, :event_id, 'revoked', "
+        "        :occurred_at, NULL, NULL, NULL)",
+        id=stray_event_id,
+        machine_id=machine_id,
+        grant_id=grant["id"],
+        event_id=row["event_id"],
+        occurred_at=row["issued_at"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == stray_event_id
+    assert body["anomaly"] == "grant_state_mismatch"
+
+
+def test_flipped_status_is_state_mismatch(issued_grant, client):
+    machine_id, _, grant = issued_grant
+    client.post(
+        f"/machines/{machine_id}/authorization-grants/{grant['id']}/revoke"
+    )
+    db_execute(
+        client,
+        "UPDATE authorization_grants SET status = 'active' WHERE id = :id",
+        id=grant["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["anomaly"] == "grant_state_mismatch"
+
+
+# --------------------------------------------------------------------------- #
+# Anomaly: use record
+# --------------------------------------------------------------------------- #
+
+
+def test_consumed_grant_without_use_is_use_mismatch(completed_grant, client):
+    machine_id, _, grant, _, _ = completed_grant
+    db_execute(
+        client,
+        "DELETE FROM authorization_grant_uses WHERE grant_id = :grant_id",
+        grant_id=grant["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    # The missing use has no record to name; the grant itself is named.
+    assert body["broken_record_id"] == grant["id"]
+    assert body["anomaly"] == "use_mismatch"
+
+
+def test_use_moment_mismatch(completed_grant, client):
+    machine_id, _, grant, use, _ = completed_grant
+    db_execute(
+        client,
+        "UPDATE authorization_grant_uses "
+        "SET consumed_at = '2030-01-01T00:00:00Z' "
+        "WHERE grant_id = :grant_id",
+        grant_id=grant["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == use["use_id"]
+    assert body["anomaly"] == "use_mismatch"
+
+
+def test_use_on_active_grant_is_use_mismatch(issued_grant, client):
+    machine_id, event, grant = issued_grant
+    use_id = str(uuid.uuid4())
+    db_execute(
+        client,
+        "INSERT INTO authorization_grant_uses "
+        "(id, grant_id, machine_id, event_id, consumed_at) "
+        "VALUES (:id, :grant_id, :machine_id, :event_id, :consumed_at)",
+        id=use_id,
+        grant_id=grant["id"],
+        machine_id=machine_id,
+        event_id=event["id"],
+        consumed_at="2026-01-01T00:00:00Z",
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == use_id
+    assert body["anomaly"] == "use_mismatch"
+
+
+# --------------------------------------------------------------------------- #
+# Anomaly: receipt missing
+# --------------------------------------------------------------------------- #
+
+
+def test_consumed_grant_without_receipt_is_receipt_missing(issued_grant,
+                                                           client):
+    machine_id, _, grant = issued_grant
+    use = consume(client, machine_id, grant["id"])
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["checked_grant_count"] == 1
+    assert body["completed_count"] == 0
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == use["use_id"]
+    assert body["anomaly"] == "receipt_missing"
+
+
+def test_completed_count_skips_broken_consumed_grants(completed_grant,
+                                                      client):
+    machine_id, _, _, _, _ = completed_grant
+    second_event = record_event(client, machine_id).json()
+    second_grant = issue(client, machine_id, second_event["id"]).json()
+    consume(client, machine_id, second_grant["id"])
+    # One sound completed grant, one consumed grant missing its receipt.
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["checked_grant_count"] == 2
+    assert body["completed_count"] == 1
+    assert body["broken_grant_id"] == second_grant["id"]
+    assert body["anomaly"] == "receipt_missing"
+
+
+# --------------------------------------------------------------------------- #
+# Anomaly: receipt binding
+# --------------------------------------------------------------------------- #
+
+
+def test_receipt_action_mismatch(completed_grant, client):
+    machine_id, _, grant, _, receipt = completed_grant
+    db_execute(
+        client,
+        "UPDATE execution_receipts SET action_type = 'write' WHERE id = :id",
+        id=receipt["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == receipt["id"]
+    assert body["anomaly"] == "receipt_mismatch"
+
+
+def test_receipt_grant_reference_mismatch(completed_grant, client):
+    machine_id, _, grant, _, receipt = completed_grant
+    db_execute(
+        client,
+        "UPDATE execution_receipts SET grant_id = :other WHERE id = :id",
+        other=str(uuid.uuid4()),
+        id=receipt["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == receipt["id"]
+    assert body["anomaly"] == "receipt_mismatch"
+
+
+def test_receipt_decision_reference_mismatch(completed_grant, client):
+    machine_id, _, grant, _, receipt = completed_grant
+    db_execute(
+        client,
+        "UPDATE execution_receipts SET authorization_event_id = 'other' "
+        "WHERE id = :id",
+        id=receipt["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_record_id"] == receipt["id"]
+    assert body["anomaly"] == "receipt_mismatch"
+
+
+def test_receipt_source_no_longer_allowed(completed_grant, client):
+    machine_id, event, grant, _, receipt = completed_grant
+    db_execute(
+        client,
+        "UPDATE authorization_decision_events SET allowed = 0 "
+        "WHERE id = :id",
+        id=event["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == receipt["id"]
+    assert body["anomaly"] == "receipt_mismatch"
+
+
+def test_receipt_on_active_grant_is_receipt_mismatch(issued_grant, client):
+    machine_id, event, grant = issued_grant
+    receipt_id = str(uuid.uuid4())
+    db_execute(
+        client,
+        "INSERT INTO execution_receipts "
+        "(id, machine_id, use_id, grant_id, authorization_event_id, "
+        " action_type, resource, outcome, result_digest, occurred_at, "
+        " previous_receipt_id, content_hash, chain_hash) "
+        "VALUES (:id, :machine_id, :use_id, :grant_id, :event_id, 'read', "
+        "        'res/x', 'succeeded', :digest, :occurred_at, "
+        "        NULL, NULL, NULL)",
+        id=receipt_id,
+        machine_id=machine_id,
+        use_id=str(uuid.uuid4()),
+        grant_id=grant["id"],
+        event_id=event["id"],
+        digest="b" * 64,
+        occurred_at="2026-01-01T00:00:00Z",
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == receipt_id
+    assert body["anomaly"] == "receipt_mismatch"
+
+
+def test_orphan_receipt_is_located_by_grant_id(issued_grant, client):
+    machine_id, event, _ = issued_grant
+    orphan_grant_id = str(uuid.uuid4())
+    receipt_id = str(uuid.uuid4())
+    db_execute(
+        client,
+        "INSERT INTO execution_receipts "
+        "(id, machine_id, use_id, grant_id, authorization_event_id, "
+        " action_type, resource, outcome, result_digest, occurred_at, "
+        " previous_receipt_id, content_hash, chain_hash) "
+        "VALUES (:id, :machine_id, :use_id, :grant_id, :event_id, 'read', "
+        "        'res/x', 'succeeded', :digest, :occurred_at, "
+        "        NULL, NULL, NULL)",
+        id=receipt_id,
+        machine_id=machine_id,
+        use_id=str(uuid.uuid4()),
+        grant_id=orphan_grant_id,
+        event_id=event["id"],
+        digest="b" * 64,
+        occurred_at="2026-01-01T00:00:00Z",
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == orphan_grant_id
+    assert body["broken_record_id"] == receipt_id
+    assert body["anomaly"] == "receipt_mismatch"
+
+
+# --------------------------------------------------------------------------- #
+# Anomaly: receipt content format
+# --------------------------------------------------------------------------- #
+
+
+def test_receipt_outcome_invalid(completed_grant, client):
+    machine_id, _, grant, _, receipt = completed_grant
+    db_execute(
+        client,
+        "UPDATE execution_receipts SET outcome = 'exploded' WHERE id = :id",
+        id=receipt["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == receipt["id"]
+    assert body["anomaly"] == "receipt_content_invalid"
+
+
+def test_receipt_result_digest_invalid(completed_grant, client):
+    machine_id, _, grant, _, receipt = completed_grant
+    db_execute(
+        client,
+        "UPDATE execution_receipts SET result_digest = 'xyz' WHERE id = :id",
+        id=receipt["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_record_id"] == receipt["id"]
+    assert body["anomaly"] == "receipt_content_invalid"
+
+
+def test_receipt_content_hash_invalid(completed_grant, client):
+    machine_id, _, grant, _, receipt = completed_grant
+    db_execute(
+        client,
+        "UPDATE execution_receipts SET content_hash = :hash WHERE id = :id",
+        hash="f" * 64,
+        id=receipt["id"],
+    )
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["broken_record_id"] == receipt["id"]
+    assert body["anomaly"] == "receipt_content_invalid"
+
+
+# --------------------------------------------------------------------------- #
+# First-broken ordering, isolation, and the read-only guarantee
+# --------------------------------------------------------------------------- #
+
+
+def test_first_problem_grant_by_issued_at(allowed_event, client):
+    machine_id, event = allowed_event
+    first_grant = issue(client, machine_id, event["id"]).json()
+    second_event = record_event(client, machine_id).json()
+    second_grant = issue(client, machine_id, second_event["id"]).json()
+    # Both grants are consumed without a receipt; the earlier-issued one is
+    # reported.
+    consume(client, machine_id, first_grant["id"])
+    consume(client, machine_id, second_grant["id"])
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["checked_grant_count"] == 2
+    assert body["completed_count"] == 0
+    assert body["broken_grant_id"] == first_grant["id"]
+    assert body["anomaly"] == "receipt_missing"
+
+
+def test_other_machine_damage_does_not_leak(issued_grant, client):
+    machine_id, _, grant = issued_grant
+    other_id = create_machine(client, external_id="machine-2")
+    db_execute(
+        client,
+        "UPDATE authorization_grants SET issued_at = 'garbage' "
+        "WHERE id = :id",
+        id=grant["id"],
+    )
+    assert reconcile(client, other_id) == {
+        "valid": True,
+        "checked_grant_count": 0,
+        "historical_grant_count": 0,
+        "completed_count": 0,
+        "broken_grant_id": None,
+        "broken_record_id": None,
+        "anomaly": None,
+    }
+    assert reconcile(client, machine_id)["valid"] is False
+
+
+def test_reconciliation_is_read_only_and_stable(completed_grant, client):
+    machine_id, _, grant, _, _ = completed_grant
+    first = client.get(reconciliation_url(machine_id))
+    second = client.get(reconciliation_url(machine_id))
+    assert first.status_code == 200
+    assert first.content == second.content
+    # Nothing was created, repaired, recomputed, or rewritten.
+    row = grant_row(client, grant["id"])
+    assert row["status"] == "consumed"
+    with client.app.state.engine.connect() as conn:
+        event_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM authorization_grant_lifecycle_events "
+                "WHERE machine_id = :machine_id"
+            ).bindparams(machine_id=machine_id)
+        ).scalar_one()
+        receipt_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM execution_receipts "
+                "WHERE machine_id = :machine_id"
+            ).bindparams(machine_id=machine_id)
+        ).scalar_one()
+    assert event_count == 2
+    assert receipt_count == 1
+
+
+def test_conclusion_survives_restart(completed_grant, client, tmp_path,
+                                     monkeypatch):
+    machine_id, _, grant, _, _ = completed_grant
+    db_execute(
+        client,
+        "UPDATE execution_receipts SET outcome = 'exploded' "
+        "WHERE grant_id = :grant_id",
+        grant_id=grant["id"],
+    )
+    before = reconcile(client, machine_id)
+    assert before["valid"] is False
+    assert before["anomaly"] == "receipt_content_invalid"
+
+    # A fresh app instance over the same database file reaches the same
+    # conclusion; the read-only query never rewrote anything.
+    monkeypatch.setenv(
+        "ACCOUNTABILITY_DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}"
+    )
+    with TestClient(app) as second_client:
+        assert reconcile(second_client, machine_id) == before
+
+
+def test_broken_conclusion_keeps_counts(allowed_event, client):
+    machine_id, event = allowed_event
+    grant = issue(client, machine_id, event["id"]).json()
+    use = consume(client, machine_id, grant["id"])
+    second_event = record_event(client, machine_id).json()
+    insert_historical_grant(client, machine_id, second_event["id"])
+    body = reconcile(client, machine_id)
+    assert body["valid"] is False
+    assert body["checked_grant_count"] == 2
+    assert body["historical_grant_count"] == 1
+    assert body["completed_count"] == 0
+    assert body["broken_grant_id"] == grant["id"]
+    assert body["broken_record_id"] == use["use_id"]
+    assert body["anomaly"] == "receipt_missing"
