@@ -9,7 +9,12 @@ a short-lived credential that can be consumed exactly once:
   its basis, and the audit are read inside one locked write transaction, which
   also inserts the grant, so a concurrent burst signing for the same event has
   exactly one winner — a database-level unique constraint on ``event_id`` is
-  the final backstop. Grants never modify the event, the basis, or any chain.
+  the final backstop. Once every historical check has passed, the machine's
+  current status is read inside the same locked transaction before the
+  insert: a suspended machine is rejected with ``machine_suspended`` and no
+  grant is created, so a status change and an issue racing each other have
+  one definite serial order. Grants never modify the event, the basis, or
+  any chain.
 * :func:`issue_grants_batch` signs several qualified allow events into
   independent grants in one locked write transaction: every item is checked
   in input order against exactly the single-issue eligibility rules, the
@@ -130,6 +135,10 @@ def issue_grant(
     * ``decision_basis_invalid`` — the snapshot exists but the read-only
       consistency audit rejects it;
     * ``grant_already_exists`` — the event already has a grant;
+    * ``machine_suspended`` — every historical check passed but the
+      machine's current status is suspended; the not-found, event, basis,
+      and existing-grant outcomes above keep their precedence and are
+      answered even while the machine is suspended;
     * ``ok`` — with the new ``grant`` dict.
 
     Nothing is written on any non-ok outcome.
@@ -174,6 +183,14 @@ def issue_grant(
         ).first()
         if existing is not None:
             return {"status": "grant_already_exists"}
+
+        if machine._mapping["status"] == "suspended":
+            # The current-state gate runs last, after every historical
+            # check, inside the same locked transaction the status change
+            # takes: a suspension that committed first is already visible
+            # here and no grant is created, while an issue that commits
+            # first keeps its success. Nothing is written on this outcome.
+            return {"status": "machine_suspended"}
 
         issued = datetime.now(timezone.utc)
         issued_at = _utc_iso(issued)
@@ -231,12 +248,13 @@ def issue_grants_batch(
     Every item is checked in input order against exactly the eligibility
     rules of :func:`issue_grant` — path-machine ownership, committed policy
     allow, historical basis snapshot present, read-only consistency audit
-    passing, no existing grant — inside one locked write transaction that
-    also inserts every grant. The first failing item in input order decides
-    the whole batch's outcome; the status dict uses the same status values
-    as :func:`issue_grant` (``not_found``, ``event_not_allowed``,
-    ``decision_basis_unavailable``, ``decision_basis_invalid``,
-    ``grant_already_exists``, or ``ok`` with the ordered ``grants`` list).
+    passing, no existing grant, machine not currently suspended — inside one
+    locked write transaction that also inserts every grant. The first failing
+    item in input order decides the whole batch's outcome; the status dict
+    uses the same status values as :func:`issue_grant` (``not_found``,
+    ``event_not_allowed``, ``decision_basis_unavailable``,
+    ``decision_basis_invalid``, ``grant_already_exists``,
+    ``machine_suspended``, or ``ok`` with the ordered ``grants`` list).
 
     A rejected batch writes nothing: no partial issue is ever committed. A
     successful batch stamps every grant with one shared UTC issue moment and
@@ -291,6 +309,13 @@ def issue_grants_batch(
             ).first()
             if existing is not None:
                 return {"status": "grant_already_exists"}
+
+            if machine._mapping["status"] == "suspended":
+                # The current-state gate runs last for every item, after
+                # that item's historical checks, inside the same locked
+                # transaction the status change takes: a suspended machine
+                # rejects the whole batch here and nothing is written.
+                return {"status": "machine_suspended"}
 
         # Every item qualified: one shared issue moment for the whole batch,
         # each grant expiring that moment plus its own TTL.

@@ -767,3 +767,259 @@ def test_non_post_methods_are_not_routed_for_batch(allowed_events, client):
         [{"event_id": event["id"], "ttl_seconds": 60} for event in events],
     )
     assert response.status_code == 201
+
+
+# --------------------------------------------------------------------------- #
+# Suspended-machine gate on batch issue
+# --------------------------------------------------------------------------- #
+
+
+def set_machine_status(client, machine_id, status):
+    response = client.post(
+        f"/machines/{machine_id}/status", json={"status": status}
+    )
+    assert response.status_code == 200
+    return response
+
+
+def _lifecycle_record_count(client, machine_id):
+    response = client.get(
+        f"/machines/{machine_id}"
+        "/authorization-grant-lifecycle-events/changes",
+        params={"limit": 100},
+    )
+    assert response.status_code == 200
+    return len(response.json()["records"])
+
+
+def test_suspended_machine_batch_is_machine_suspended(allowed_events, client):
+    machine_id, events = allowed_events
+    set_machine_status(client, machine_id, "suspended")
+
+    response = issue_batch(
+        client,
+        machine_id,
+        [{"event_id": event["id"], "ttl_seconds": 60} for event in events],
+    )
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": "machine_suspended"}}
+
+
+def test_suspended_batch_leaves_no_partial_issue(allowed_events, client):
+    machine_id, events = allowed_events
+    set_machine_status(client, machine_id, "suspended")
+
+    response = issue_batch(
+        client,
+        machine_id,
+        [{"event_id": event["id"], "ttl_seconds": 60} for event in events],
+    )
+    assert response.status_code == 409
+
+    assert grant_count(client) == 0
+    assert _lifecycle_record_count(client, machine_id) == 0
+    with client.app.state.engine.connect() as conn:
+        machine_status = conn.execute(
+            text("SELECT status FROM machines WHERE id = :id")
+            .bindparams(id=machine_id)
+        ).scalar_one()
+    assert machine_status == "suspended"
+
+
+def test_suspended_batch_keeps_earlier_outcome_precedence(
+    allowed_events, client
+):
+    machine_id, events = allowed_events
+    # The first item's event already has a grant: with the machine
+    # suspended, the existing-grant outcome still decides the batch.
+    first = issue_batch(
+        client, machine_id, [{"event_id": events[0]["id"], "ttl_seconds": 60}]
+    )
+    assert first.status_code == 201
+    set_machine_status(client, machine_id, "suspended")
+
+    response = issue_batch(
+        client,
+        machine_id,
+        [
+            {"event_id": events[0]["id"], "ttl_seconds": 60},
+            {"event_id": events[1]["id"], "ttl_seconds": 60},
+            {"event_id": events[2]["id"], "ttl_seconds": 60},
+        ],
+    )
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": "grant_already_exists"}}
+
+    # A fully qualified earlier item fails at its own suspended gate before
+    # a later item's existing-grant outcome is ever reached.
+    gated = issue_batch(
+        client,
+        machine_id,
+        [
+            {"event_id": events[1]["id"], "ttl_seconds": 60},
+            {"event_id": events[0]["id"], "ttl_seconds": 60},
+        ],
+    )
+    assert gated.status_code == 409
+    assert gated.json() == {"error": {"code": "machine_suspended"}}
+
+    missing = issue_batch(
+        client,
+        machine_id,
+        [
+            {"event_id": "no-such-event", "ttl_seconds": 60},
+            {"event_id": events[1]["id"], "ttl_seconds": 60},
+        ],
+    )
+    assert missing.status_code == 404
+    assert missing.json() == {"error": {"code": "not_found"}}
+
+    # Neither rejection added anything: only the first single-item batch's
+    # grant exists.
+    assert grant_count(client) == 1
+
+
+def test_suspended_batch_first_item_failure_decides(allowed_events, client):
+    machine_id, events = allowed_events
+    set_machine_status(client, machine_id, "suspended")
+
+    # A missing event earlier in input order still decides over the
+    # suspended gate of a later item.
+    response = issue_batch(
+        client,
+        machine_id,
+        [
+            {"event_id": "no-such-event", "ttl_seconds": 60},
+            {"event_id": events[0]["id"], "ttl_seconds": 60},
+        ],
+    )
+    assert response.status_code == 404
+    assert response.json() == {"error": {"code": "not_found"}}
+
+    # With every earlier item qualified, the suspended gate decides.
+    gated = issue_batch(
+        client,
+        machine_id,
+        [{"event_id": event["id"], "ttl_seconds": 60} for event in events],
+    )
+    assert gated.status_code == 409
+    assert gated.json() == {"error": {"code": "machine_suspended"}}
+    assert grant_count(client) == 0
+
+
+def test_batch_issue_resumes_after_reactivation(allowed_events, client):
+    machine_id, events = allowed_events
+    set_machine_status(client, machine_id, "suspended")
+    rejected = issue_batch(
+        client,
+        machine_id,
+        [{"event_id": event["id"], "ttl_seconds": 90} for event in events],
+    )
+    assert rejected.status_code == 409
+    assert rejected.json() == {"error": {"code": "machine_suspended"}}
+
+    set_machine_status(client, machine_id, "active")
+    response = issue_batch(
+        client,
+        machine_id,
+        [{"event_id": event["id"], "ttl_seconds": 90} for event in events],
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert len(body) == 3
+    assert [grant["event_id"] for grant in body] == [
+        event["id"] for event in events
+    ]
+    assert {grant["status"] for grant in body} == {"active"}
+    # One shared issue moment across the whole batch.
+    assert len({grant["issued_at"] for grant in body}) == 1
+    for grant in body:
+        assert _parse_z(grant["expires_at"]) - _parse_z(
+            grant["issued_at"]
+        ) == timedelta(seconds=90)
+    assert grant_count(client) == 3
+    assert _lifecycle_record_count(client, machine_id) == 3
+
+
+def test_suspend_racing_batch_issue_has_one_definite_serial_outcome(
+    allowed_events, client
+):
+    machine_id, events = allowed_events
+    gate = threading.Event()
+
+    def suspend_hit():
+        gate.wait()
+        return client.post(
+            f"/machines/{machine_id}/status", json={"status": "suspended"}
+        )
+
+    def batch_hit():
+        gate.wait()
+        return issue_batch(
+            client,
+            machine_id,
+            [
+                {"event_id": event["id"], "ttl_seconds": 60}
+                for event in events
+            ],
+        )
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(suspend_hit)] + [
+            pool.submit(batch_hit) for _ in range(5)
+        ]
+        gate.set()
+        responses = [f.result() for f in futures]
+
+    batch_responses = [
+        r for r in responses if "authorization-grants" in str(r.request.url.path)
+    ]
+    suspend_responses = [r for r in responses if r not in batch_responses]
+    assert len(suspend_responses) == 1
+    assert suspend_responses[0].status_code == 200
+    assert len(batch_responses) == 5
+
+    # The batch that serialized before the suspension committed all three
+    # grants; every batch that serialized after saw the suspended machine
+    # and wrote nothing. grant_already_exists is the loser's outcome once
+    # one batch has committed.
+    outcomes = {}
+    for response in batch_responses:
+        if response.status_code == 201:
+            outcomes.setdefault("ok", 0)
+            outcomes["ok"] += 1
+        else:
+            code = response.json()["error"]["code"]
+            assert code in ("machine_suspended", "grant_already_exists")
+            outcomes.setdefault(code, 0)
+            outcomes[code] += 1
+    assert outcomes.get("ok", 0) <= 1
+
+    with client.app.state.engine.connect() as conn:
+        final_grants = conn.execute(
+            text("SELECT COUNT(*) FROM authorization_grants")
+        ).scalar_one()
+        machine_status = conn.execute(
+            text("SELECT status FROM machines WHERE id = :id")
+            .bindparams(id=machine_id)
+        ).scalar_one()
+    assert machine_status == "suspended"
+    assert final_grants == (3 if outcomes.get("ok") else 0)
+
+    # After the suspension committed, no new batch ever lands: the same
+    # items are rejected again (machine_suspended for unsigned events,
+    # grant_already_exists for signed ones) and the count never moves.
+    response = issue_batch(
+        client,
+        machine_id,
+        [{"event_id": event["id"], "ttl_seconds": 60} for event in events],
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] in (
+        "machine_suspended",
+        "grant_already_exists",
+    )
+    with client.app.state.engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM authorization_grants")
+        ).scalar_one() == final_grants
