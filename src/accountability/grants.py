@@ -9,7 +9,11 @@ a short-lived credential that can be consumed exactly once:
   its basis, and the audit are read inside one locked write transaction, which
   also inserts the grant, so a concurrent burst signing for the same event has
   exactly one winner — a database-level unique constraint on ``event_id`` is
-  the final backstop. Grants never modify the event, the basis, or any chain.
+  the final backstop. Once every historical check passes, the machine's
+  current status is read inside the same locked transaction before the
+  insert: a suspended machine is rejected with ``machine_suspended`` and no
+  grant is created, so a status change and an issue commit in one definite
+  serial order. Grants never modify the event, the basis, or any chain.
 * :func:`issue_grants_batch` signs several qualified allow events into
   independent grants in one locked write transaction: every item is checked
   in input order against exactly the single-issue eligibility rules, the
@@ -130,9 +134,17 @@ def issue_grant(
     * ``decision_basis_invalid`` — the snapshot exists but the read-only
       consistency audit rejects it;
     * ``grant_already_exists`` — the event already has a grant;
+    * ``machine_suspended`` — every historical check passed but the machine
+      is currently suspended; the terminal and historical outcomes above
+      keep their precedence and are answered even while the machine is
+      suspended;
     * ``ok`` — with the new ``grant`` dict.
 
-    Nothing is written on any non-ok outcome.
+    Nothing is written on any non-ok outcome. The machine status is read
+    inside this same locked transaction — the lock status changes take — so
+    a suspension that commits first makes the issue answer
+    ``machine_suspended`` while an issue that commits first keeps its grant;
+    no new grant is ever created after the suspension commits.
     """
 
     def _work(conn) -> dict[str, Any]:
@@ -174,6 +186,14 @@ def issue_grant(
         ).first()
         if existing is not None:
             return {"status": "grant_already_exists"}
+
+        if machine._mapping["status"] == "suspended":
+            # The current-state gate runs last, after every historical
+            # check, inside the same locked transaction the status change
+            # takes: a suspension that committed first is already visible
+            # here and blocks the new grant; an issue that commits first
+            # keeps its grant. Nothing is written on this outcome.
+            return {"status": "machine_suspended"}
 
         issued = datetime.now(timezone.utc)
         issued_at = _utc_iso(issued)
@@ -237,6 +257,9 @@ def issue_grants_batch(
     as :func:`issue_grant` (``not_found``, ``event_not_allowed``,
     ``decision_basis_unavailable``, ``decision_basis_invalid``,
     ``grant_already_exists``, or ``ok`` with the ordered ``grants`` list).
+    Once every item has passed those historical checks, the machine's
+    current status is read inside the same locked transaction: a suspended
+    machine rejects the whole batch with ``machine_suspended``.
 
     A rejected batch writes nothing: no partial issue is ever committed. A
     successful batch stamps every grant with one shared UTC issue moment and
@@ -291,6 +314,15 @@ def issue_grants_batch(
             ).first()
             if existing is not None:
                 return {"status": "grant_already_exists"}
+
+        if machine._mapping["status"] == "suspended":
+            # The current-state gate runs after every item passed the
+            # historical checks, inside the same locked transaction the
+            # status change takes: a suspension that committed first is
+            # already visible here and rejects the whole batch; an issue
+            # that commits first keeps its grants. Nothing is written on
+            # this outcome.
+            return {"status": "machine_suspended"}
 
         # Every item qualified: one shared issue moment for the whole batch,
         # each grant expiring that moment plus its own TTL.

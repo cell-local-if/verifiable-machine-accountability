@@ -10598,7 +10598,13 @@ async def create_authorization_grant(machine_id: str, request: Request):
     can be signed at most once: concurrent requests for the same event have
     exactly one ``201`` success and every other one
     ``409 grant_already_exists``, enforced inside one locked write
-    transaction backed by a database-level unique constraint. The success
+    transaction backed by a database-level unique constraint. Once every
+    historical check passes, the machine's current status is read inside
+    the same locked transaction before the grant is inserted: a suspended
+    machine is ``409 {"error":{"code":"machine_suspended"}}`` and no grant
+    is created, so a status change and an issue commit in one definite
+    serial order — a suspension that commits first blocks the issue, and an
+    issue that commits first keeps its grant. The success
     body is ``{id, machine_id, event_id, issued_at, expires_at, status}`` with
     ``status "active"`` and ``expires_at`` the issue instant plus
     ``ttl_seconds`` as a UTC ``Z`` timestamp. Grant issue never modifies the
@@ -10655,6 +10661,8 @@ async def create_authorization_grant(machine_id: str, request: Request):
         return error_response(409, "decision_basis_invalid")
     if status == "grant_already_exists":
         return error_response(409, "grant_already_exists")
+    if status == "machine_suspended":
+        return error_response(409, "machine_suspended")
     return AuthorizationGrantOut(**result["grant"])
 
 
@@ -10693,7 +10701,12 @@ async def create_authorization_grants_batch(machine_id: str, request: Request):
     event without a historical decision-basis snapshot is
     ``409 decision_basis_unavailable``; one whose snapshot fails the
     read-only consistency audit is ``409 decision_basis_invalid``; an event
-    that already has a grant is ``409 grant_already_exists``. A rejected
+    that already has a grant is ``409 grant_already_exists``. Once every
+    item has passed those historical checks, the machine's current status
+    is read inside the same locked transaction before any grant is
+    inserted: a suspended machine rejects the whole batch with
+    ``409 {"error":{"code":"machine_suspended"}}``, so a status change and
+    a batch issue commit in one definite serial order. A rejected
     batch writes nothing — no partial issue is ever committed — and every
     other record is untouched. Each event can still be signed at most once:
     a concurrent single or batch issue racing for any of these events has
@@ -10766,6 +10779,8 @@ async def create_authorization_grants_batch(machine_id: str, request: Request):
         return error_response(409, "decision_basis_invalid")
     if status == "grant_already_exists":
         return error_response(409, "grant_already_exists")
+    if status == "machine_suspended":
+        return error_response(409, "machine_suspended")
     return [AuthorizationGrantOut(**grant) for grant in result["grants"]]
 
 
