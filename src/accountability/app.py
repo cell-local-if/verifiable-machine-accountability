@@ -12277,18 +12277,29 @@ def check_execution_receipts_integrity(
     otherwise ``false``, the total count, the first receipt — in
     (occurred-at actual UTC instant, id) order, with an unparseable stamp
     sorted last — that fails, and the stable first-anomaly category:
-    ``timestamp_unparseable``, ``chain_break`` (a wrong predecessor link or
-    a chain hash that does not continue the predecessor's chain over the
-    stored content hash), ``ownership_mismatch`` (a referenced use, grant,
-    or event missing under the path machine), ``use_mismatch`` (the receipt
+    ``timestamp_unparseable`` (a stored receipt ``occurred_at`` or a bound
+    use ``consumed_at`` or grant ``issued_at``/``expires_at`` that is
+    missing, non-text, carries an offset, lacks ``Z``, is malformed, or is
+    out of range), ``chain_break`` (a wrong predecessor link or a chain
+    hash that does not continue the predecessor's chain over the stored
+    content hash), ``ownership_mismatch`` (a referenced use, grant, or
+    event missing under the path machine), ``use_mismatch`` (the receipt
     does not agree with its consumed use's grant/source-event binding),
-    ``scope_mismatch`` (the source is not a committed policy allow or the
-    action/resource does not match verbatim), or ``digest_mismatch`` (an
-    illegal outcome or result fingerprint, or the content hash does not
-    cover the stored fields). Only the path machine's receipts are
-    examined, the audit never writes, repairs, recomputes, or deletes, so
-    repeated reads and restarts return byte-identical conclusions. The body
-    is compact UTF-8 JSON terminated by a single newline and contains no
+    ``chronology_mismatch`` (the execution precedes its consumption, the
+    consumption precedes the grant's issue, or the consumption is at or
+    past the grant's expiry; a same-instant consumption, a same-instant
+    receipt, and a receipt registered after expiry for an in-window
+    consumption are all sound), ``scope_mismatch`` (the source is not a
+    committed policy allow or the action/resource does not match
+    verbatim), or ``digest_mismatch`` (an illegal outcome or result
+    fingerprint, or the content hash does not cover the stored fields).
+    Within one receipt the categories are examined in the order
+    ``chain_break``, ``ownership_mismatch``, ``use_mismatch``,
+    ``timestamp_unparseable``, ``chronology_mismatch``, ``scope_mismatch``,
+    ``digest_mismatch``. Only the path machine's receipts are examined,
+    the audit never writes, repairs, recomputes, or deletes, so repeated
+    reads and restarts return byte-identical conclusions. The body is
+    compact UTF-8 JSON terminated by a single newline and contains no
     floating-point or non-finite value.
     """
     try:

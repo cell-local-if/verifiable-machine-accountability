@@ -28,9 +28,16 @@ result and to the per-machine tamper-evident receipt chain.
   longer parses sorts its row deterministically last. The first anomaly
   found is reported with one stable category — ``timestamp_unparseable``,
   ``chain_break``, ``ownership_mismatch``, ``use_mismatch``,
-  ``scope_mismatch``, or ``digest_mismatch`` — and damaged stored values are
-  reported, never crashed on, repaired, rewritten, or recomputed for
-  storage.
+  ``chronology_mismatch``, ``scope_mismatch``, or ``digest_mismatch`` — and
+  damaged stored values are reported, never crashed on, repaired, rewritten,
+  or recomputed for storage. Beyond the receipt's own stamp, the binding
+  timestamps — the consumed use's ``consumed_at`` and the bound grant's
+  ``issued_at``/``expires_at`` — must each satisfy the same RFC 3339 ``Z``
+  contract and order as issued, consumed, and registered: a consumption
+  before issue, an execution before its consumption, or a consumption at or
+  past the grant's expiry is a chronology mismatch, while a receipt
+  registered after expiry for a consumption inside the validity window is
+  sound.
 * :func:`coverage_report` is a strictly read-only use-to-receipt coverage
   report for one machine: every consumed use is matched against the
   machine's receipts by ``use_id`` alone, reporting both the consumed uses
@@ -116,6 +123,33 @@ _OUTCOMES = ("succeeded", "failed")
 _FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
 
 _UUID_MAX_INT = (1 << 128) - 1
+
+# Strict shape of a moment written by this feature: an RFC 3339 date-time in
+# UTC with a literal ``Z`` suffix and optional fractional seconds. Both the
+# chain audit's related-moment consistency check and the window export admit
+# a stored stamp only when it has this shape and range-checks; offset forms,
+# a missing ``Z``, and damaged text are reported or excluded rather than
+# admitted or repaired.
+_UTC_Z_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
+def _parse_utc_z_stamp(value: object) -> datetime | None:
+    """Parse a stored UTC ``Z`` stamp to its instant, or ``None``.
+
+    Returns the actual UTC instant only for text that satisfies the RFC 3339
+    ``Z`` contract — a literal ``Z`` suffix (an offset form or a missing
+    ``Z`` is rejected), calendar-valid fields, and optional fractional
+    seconds; a missing, non-text, malformed, or out-of-range value returns
+    ``None`` so the read-only audit can report it (and the window export can
+    exclude it) without crashing, deleting, rewriting, or normalizing the
+    stored text.
+    """
+    if isinstance(value, str) and _UTC_Z_STAMP_RE.fullmatch(value):
+        try:
+            return datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            return None
+    return None
 
 
 def compute_content_hash(
@@ -705,11 +739,28 @@ def verify_machine_receipts(
     when reached, is the first anomaly (``timestamp_unparseable``) rather
     than crashing the scan. The first anomaly found — in scan order, and for
     one receipt in the fixed category order ``chain_break``,
-    ``ownership_mismatch``, ``use_mismatch``, ``scope_mismatch``,
-    ``digest_mismatch`` — sets ``broken_receipt_id`` and ``anomaly``; later
-    receipts cannot change it. ``checked_count`` is always the machine's
-    total receipt count, damaged rows included, and ``anomaly`` is ``None``
-    on a fully sound (including empty) chain.
+    ``ownership_mismatch``, ``use_mismatch``, ``timestamp_unparseable`` (for
+    a related use/grant moment), ``chronology_mismatch``,
+    ``scope_mismatch``, ``digest_mismatch`` — sets ``broken_receipt_id`` and
+    ``anomaly``; later receipts cannot change it. ``checked_count`` is
+    always the machine's total receipt count, damaged rows included, and
+    ``anomaly`` is ``None`` on a fully sound (including empty) chain.
+
+    Beyond the receipt's own ``occurred_at``, the time-consistency step
+    reads the bound consumption's ``consumed_at`` and the bound grant's
+    ``issued_at``/``expires_at``. Each of the four related moments must be
+    text satisfying the RFC 3339 ``Z`` contract — a missing, non-text,
+    offset-form, ``Z``-less, malformed, or out-of-range value is
+    ``timestamp_unparseable`` at that receipt, never a chronology verdict.
+    When all four parse, the order must be
+    ``issued_at <= consumed_at < expires_at`` and
+    ``consumed_at <= occurred_at``: a consumption before issue, an
+    execution registered before its consumption, or a consumption at or
+    past the grant's expiry is ``chronology_mismatch``. Equality at the
+    lower bounds is sound (a same-instant consumption and a same-instant
+    receipt are legal), and a receipt registered after ``expires_at`` for a
+    consumption inside the validity window is also sound — only the
+    consumption instant is checked against the window.
 
     Only the path machine's receipts are examined, so another machine's
     damaged records never change this result. The audit is strictly
@@ -725,10 +776,16 @@ def verify_machine_receipts(
     )
     checked_count = len(rows)
 
-    # A corrupted stamp sorts its record after every parseable one, so the
-    # record's chain successor would otherwise be blamed for the broken
-    # link; pre-scan and report the corrupted record itself first, matching
-    # the other per-machine chain audits.
+    # A stamp that no longer yields an ordering instant sorts its record
+    # after every parseable one, so the record's chain successor would
+    # otherwise be blamed for the broken link; pre-scan and report the
+    # corrupted record itself first, matching the other per-machine chain
+    # audits. This pre-scan uses the ordering-tolerant parse on purpose:
+    # only stamps that sort out of line are elevated above the link scan,
+    # so a rare strict-``Z``-invalid stamp that still orders (e.g. a
+    # damaged space separator) is reached at its real chain position and
+    # reported there by the strict step inside the scan, never ahead of an
+    # earlier receipt's own fault.
     for row in rows:
         if occurred_at_instant(row._mapping["occurred_at"]) == _FAR_FUTURE:
             return _anomaly(
@@ -796,7 +853,42 @@ def verify_machine_receipts(
         ):
             return _anomaly(checked_count, receipt_id, "use_mismatch")
 
-        # 4. The source must still be a committed policy allow for the
+        # 4. Time consistency across issue, consumption, and registration.
+        #    All four moments must satisfy the strict RFC 3339 ``Z``
+        #    contract; one that does not is reported as unparseable rather
+        #    than as a chronology verdict. The pre-scan has already handled
+        #    (and ordered last) a receipt stamp that yields no instant at
+        #    all; a rare stamp that orders tolerantly yet violates the
+        #    strict ``Z`` shape is caught right here at its chain position.
+        occurred_instant = _parse_utc_z_stamp(mapping["occurred_at"])
+        consumed_instant = _parse_utc_z_stamp(use["consumed_at"])
+        issued_instant = _parse_utc_z_stamp(grant["issued_at"])
+        expires_instant = _parse_utc_z_stamp(grant["expires_at"])
+        if (
+            occurred_instant is None
+            or consumed_instant is None
+            or issued_instant is None
+            or expires_instant is None
+        ):
+            return _anomaly(
+                checked_count, receipt_id, "timestamp_unparseable"
+            )
+        # ``issued_at <= consumed_at`` and ``consumed_at <= occurred_at``
+        # both allow equality; the consumption must sit strictly inside the
+        # validity window, so ``consumed_at == expires_at`` is already too
+        # late. The receipt's own registration may follow expiry without
+        # fault: only the consumption instant is measured against the
+        # window.
+        if (
+            occurred_instant < consumed_instant
+            or consumed_instant < issued_instant
+            or consumed_instant >= expires_instant
+        ):
+            return _anomaly(
+                checked_count, receipt_id, "chronology_mismatch"
+            )
+
+        # 5. The source must still be a committed policy allow for the
         #    receipt's verbatim action and resource.
         if (
             not event["allowed"]
@@ -806,7 +898,7 @@ def verify_machine_receipts(
         ):
             return _anomaly(checked_count, receipt_id, "scope_mismatch")
 
-        # 5. The result fields and the content digest must be sound: a legal
+        # 6. The result fields and the content digest must be sound: a legal
         #    outcome, a 64 lowercase-hex result fingerprint, and a stored
         #    content hash equal to the digest of the ten covered fields as
         #    stored — nothing is recomputed for storage when they disagree.
@@ -1044,9 +1136,6 @@ def execution_receipt_summary(session, machine_id: str) -> dict[str, Any]:
 # this shape and range-checks, unlike the chain audit whose tolerant parser
 # only needs a total ordering; offset forms and damaged text are excluded
 # from the window rather than admitted or repaired.
-_UTC_Z_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
-
-
 def _parse_occurred_at_utc(value: object) -> datetime | None:
     """Parse a stored ``occurred_at`` to its UTC instant, or ``None``.
 
@@ -1056,12 +1145,7 @@ def _parse_occurred_at_utc(value: object) -> datetime | None:
     exclude the row without crashing, deleting, or rewriting its stored
     text.
     """
-    if isinstance(value, str) and _UTC_Z_STAMP_RE.fullmatch(value):
-        try:
-            return datetime.fromisoformat(value[:-1] + "+00:00")
-        except ValueError:
-            return None
-    return None
+    return _parse_utc_z_stamp(value)
 
 
 _EXPORT_FIELDS = (
