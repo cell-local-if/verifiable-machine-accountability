@@ -8420,6 +8420,207 @@ def get_authorization_decision_event_causal_trace(
     )
 
 
+# --- read-only shortest causal path between two decision events --------------
+
+
+def validate_causal_path_params(request: Request) -> None:
+    """Validate the causal-path request before any machine or event lookup.
+
+    The path query is keyed on the path machine, the path source event, and
+    the path target event alone: it accepts no query parameters, no repeated
+    parameters, no business filter, and no request body. Any query-string
+    content (a present parameter, a repeated name, a bare ``?``) or a carried
+    body is a 422 ``invalid_query``. The check runs as a dependency before the
+    handler reads the machine, either event, or any causal link, so a
+    malformed request against a non-existent machine still reports 422 rather
+    than 404 and never touches a causal record.
+    """
+    if request.query_params:
+        raise QueryError("invalid_query")
+    # A body on a GET is an unknown-shape request rejected in the validation
+    # phase, before any machine, event, or causal link is read. A present
+    # non-zero Content-Length, or a chunked request without one, means a body
+    # is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+
+class CausalPathNodeOut(BaseModel):
+    event_id: str
+    causal_link_id: str | None
+
+
+class CausalPathOut(BaseModel):
+    source_event_id: str
+    target_event_id: str
+    found: bool
+    depth: int | None
+    path: list[CausalPathNodeOut]
+
+
+def find_shortest_causal_path(
+    session: Session,
+    machine_id: str,
+    source_event_id: str,
+    target_event_id: str,
+) -> list[tuple[str, str | None]] | None:
+    """Shortest directed chain of causal links from source to target.
+
+    Returns a path of ``(event_id, incoming_link_id)`` pairs in travel order —
+    the source carries a ``None`` incoming link and every later pair carries
+    the id of the link used to enter its event — or ``None`` when no directed
+    path exists. Only links owned by the path machine are loaded, and an edge
+    is followed only when both endpoints resolve to events of that machine, so
+    a dangling endpoint or a cross-machine link can never be a path edge.
+
+    A breadth-first walk reaches every reachable event at its minimum depth
+    and terminates even when links form a ring. When several paths share the
+    minimum depth, the edges leaving each depth layer are expanded in causal
+    link-id order and each node keeps the first edge that reaches it, so the
+    chosen path minimizes the sequence of link ids from the first edge onward
+    lexicographically; the result therefore depends only on stored data.
+    """
+    links = session.scalars(
+        select(AuthorizationDecisionCausalLink).where(
+            AuthorizationDecisionCausalLink.machine_id == machine_id
+        )
+    ).all()
+
+    existing_event_ids = set(
+        session.scalars(
+            select(AuthorizationDecisionEvent.id).where(
+                AuthorizationDecisionEvent.machine_id == machine_id
+            )
+        ).all()
+    )
+
+    adjacency: dict[str, list[tuple[str, str]]] = {}
+    for link in links:
+        # Defend on both endpoints: a dangling or cross-machine endpoint
+        # cannot be a path edge.
+        if (
+            link.cause_event_id not in existing_event_ids
+            or link.effect_event_id not in existing_event_ids
+        ):
+            continue
+        adjacency.setdefault(link.cause_event_id, []).append(
+            (link.effect_event_id, link.id)
+        )
+    for edges in adjacency.values():
+        edges.sort(key=lambda edge: edge[1])
+
+    # The zero-edge path from an event to itself is found without walking.
+    if source_event_id == target_event_id:
+        return [(source_event_id, None)]
+
+    # incoming[node] is the (previous node, link id) first used to reach it;
+    # expanding each layer's edges in link-id order makes the first discovery
+    # of a node the lexicographically smallest shortest way to reach it.
+    incoming: dict[str, tuple[str, str]] = {}
+    frontier = [source_event_id]
+    while frontier and target_event_id not in incoming:
+        next_frontier: list[str] = []
+        for current in frontier:
+            for neighbor, link_id in adjacency.get(current, []):
+                if neighbor == source_event_id or neighbor in incoming:
+                    continue
+                incoming[neighbor] = (current, link_id)
+                if neighbor == target_event_id:
+                    break
+                next_frontier.append(neighbor)
+        frontier = next_frontier
+
+    if target_event_id not in incoming:
+        return None
+
+    # Walk the predecessor chain back from the target, then reverse: each
+    # pair keeps the link id that entered its event, and the source's is null.
+    reversed_path: list[tuple[str, str | None]] = []
+    current = target_event_id
+    while current != source_event_id:
+        previous, link_id = incoming[current]
+        reversed_path.append((current, link_id))
+        current = previous
+    reversed_path.append((source_event_id, None))
+    return list(reversed(reversed_path))
+
+
+@app.get(
+    "/machines/{machine_id}/authorization-decision-events/{event_id}/"
+    "causal-path/{target_event_id}",
+    response_model=CausalPathOut,
+)
+def get_authorization_decision_event_causal_path(
+    machine_id: str,
+    event_id: str,
+    target_event_id: str,
+    _: Annotated[None, Depends(validate_causal_path_params)],
+    session: SessionDep,
+):
+    """Read-only shortest directed causal path between two decision events.
+
+    The caller submits only the path machine, the path source event
+    (``event_id``), and the path target event (``target_event_id``) — no query
+    parameters, repeated parameters, or request body; any is a 422
+    ``invalid_query`` raised during validation before the machine or either
+    event is looked up and before any causal link is read. The machine and
+    both events must exist and both events must belong to the path machine,
+    otherwise the response is 404 ``not_found`` with no partial path. Only
+    ``GET`` is routed; ``HEAD`` and every other method return 405 without
+    reading a causal record.
+
+    On success the response carries exactly ``{source_event_id,
+    target_event_id, found, depth, path}`` in this fixed field order. ``path``
+    lists the source and the target in travel order; each item is exactly
+    ``{event_id, causal_link_id}``, with the source's ``causal_link_id`` null
+    and every later item carrying the id of the causal link used to enter its
+    event. ``depth`` is the number of links used: zero for the one-item path
+    returned when the source equals the target. When no directed path exists
+    ``found`` is false, ``depth`` is null and ``path`` is empty — this is not
+    an error. The walk follows only directed cause-to-effect edges owned by
+    the machine whose endpoints both resolve to the machine's events, so
+    dangling and cross-machine links are never path edges, and it terminates
+    even when links form a ring. Among paths of equal depth it returns the one
+    whose link-id sequence from the first edge is lexicographically smallest,
+    so the answer depends only on stored data. The query only issues reads —
+    it never creates, updates, deletes, or repairs an event or link — returns
+    identical results on repeat calls against unchanged data, and reads links
+    persisted across application restarts.
+    """
+    machine = session.get(Machine, machine_id)
+    if machine is None:
+        return error_response(404, "not_found")
+    source_event = get_machine_event(session, machine_id, event_id)
+    target_event = get_machine_event(session, machine_id, target_event_id)
+    if source_event is None or target_event is None:
+        return error_response(404, "not_found")
+
+    path = find_shortest_causal_path(
+        session, machine_id, event_id, target_event_id
+    )
+    if path is None:
+        return CausalPathOut(
+            source_event_id=event_id,
+            target_event_id=target_event_id,
+            found=False,
+            depth=None,
+            path=[],
+        )
+    return CausalPathOut(
+        source_event_id=event_id,
+        target_event_id=target_event_id,
+        found=True,
+        depth=len(path) - 1,
+        path=[
+            CausalPathNodeOut(event_id=node_event_id, causal_link_id=link_id)
+            for node_event_id, link_id in path
+        ],
+    )
+
+
 # --- read-only single-event closed-loop accountability trace ----------------
 
 

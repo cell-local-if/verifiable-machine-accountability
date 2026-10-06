@@ -1195,6 +1195,40 @@ machine, ignores links whose target event no longer exists, terminates even
 when links form a cycle, and returns an empty array when nothing is
 reachable. The query never writes or modifies any record.
 
+## Shortest causal path between two events
+
+`GET /machines/{machine_id}/authorization-decision-events/{event_id}/causal-path/{target_event_id}`
+answers a single read-only reachability question: can the cause event
+`event_id` reach the result event `target_event_id` along directed
+`cause_event_id` to `effect_event_id` links, and if so by which shortest
+chain.
+
+The request is keyed on the path machine and the two path events alone. It
+accepts no query parameters, repeated parameters, or request body: any is
+`422 {"error":{"code":"invalid_query"}}`, rejected in the validation phase
+before the machine or either event is looked up. The path accepts `GET`
+only; `HEAD` and every other method return `405` without reading a causal
+record. After validation, the machine must exist and both events must exist
+and belong to it, otherwise the response is
+`404 {"error":{"code":"not_found"}}` with no partial path.
+
+The success response has exactly `{source_event_id, target_event_id, found,
+depth, path}`. `path` lists the source and target in travel order; each item
+is `{event_id, causal_link_id}`, the source's `causal_link_id` is `null`,
+and every later item carries the id of the link used to enter its event.
+`depth` is the number of links used — zero for the one-item path returned
+when the two events are the same (`found: true`, `depth: 0`). When no
+directed path exists, `found` is `false`, `depth` is `null`, and `path` is
+`[]`; that is a normal answer, not an error. Only links owned by the machine
+whose two endpoints both resolve to the machine's events can be path edges,
+so dangling and cross-machine links are never used, and the search
+terminates even when links form a ring. When several paths have the same
+minimum depth, the one whose `causal_link_id` sequence from the first edge
+is lexicographically smallest is returned, so the answer depends only on
+stored data. The query never creates, modifies, deletes, or repairs an event
+or link: identical data gives identical answers on repeat calls and across
+application restarts.
+
 ## Read-only global policy rule listing
 
 `GET /policy-rules` returns every global policy rule, or `[]` when none exist.
