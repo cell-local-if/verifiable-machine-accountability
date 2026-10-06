@@ -12277,19 +12277,30 @@ def check_execution_receipts_integrity(
     otherwise ``false``, the total count, the first receipt — in
     (occurred-at actual UTC instant, id) order, with an unparseable stamp
     sorted last — that fails, and the stable first-anomaly category:
-    ``timestamp_unparseable``, ``chain_break`` (a wrong predecessor link or
-    a chain hash that does not continue the predecessor's chain over the
-    stored content hash), ``ownership_mismatch`` (a referenced use, grant,
-    or event missing under the path machine), ``use_mismatch`` (the receipt
-    does not agree with its consumed use's grant/source-event binding),
+    ``timestamp_unparseable`` (a related moment — the receipt's
+    ``occurred_at``, its consumed use's ``consumed_at``, or the named
+    grant's ``issued_at``/``expires_at`` — missing, non-text, carrying an
+    offset, missing its ``Z`` suffix, malformed, or out of range),
+    ``chain_break`` (a wrong predecessor link or a chain hash that does not
+    continue the predecessor's chain over the stored content hash),
+    ``ownership_mismatch`` (a referenced use, grant, or event missing under
+    the path machine), ``use_mismatch`` (the receipt does not agree with
+    its consumed use's grant/source-event binding),
+    ``chronology_mismatch`` (``occurred_at`` precedes ``consumed_at``,
+    ``consumed_at`` precedes ``issued_at``, or ``consumed_at`` is at or
+    after ``expires_at``; the lower equalities are legal and a receipt
+    registered after ``expires_at`` for a timely consumption is legal),
     ``scope_mismatch`` (the source is not a committed policy allow or the
     action/resource does not match verbatim), or ``digest_mismatch`` (an
     illegal outcome or result fingerprint, or the content hash does not
-    cover the stored fields). Only the path machine's receipts are
-    examined, the audit never writes, repairs, recomputes, or deletes, so
-    repeated reads and restarts return byte-identical conclusions. The body
-    is compact UTF-8 JSON terminated by a single newline and contains no
-    floating-point or non-finite value.
+    cover the stored fields). The per-receipt precedence is ``chain_break``,
+    ``ownership_mismatch``, ``use_mismatch``, ``chronology_mismatch``,
+    ``scope_mismatch``, then ``digest_mismatch``, with an unparseable
+    ``occurred_at`` pre-scanned before all of them. Only the path
+    machine's receipts are examined, the audit never writes, repairs,
+    recomputes, or deletes, so repeated reads and restarts return
+    byte-identical conclusions. The body is compact UTF-8 JSON terminated
+    by a single newline and contains no floating-point or non-finite value.
     """
     try:
         machine = session.get(Machine, machine_id)

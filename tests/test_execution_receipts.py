@@ -1099,3 +1099,597 @@ def test_receipts_never_modify_grant_use_or_event(consumed_use, client):
         == lifecycle_before
     )
     assert event["id"]  # event fixture still resolves
+
+
+# --------------------------------------------------------------------------- #
+# Read-only integrity: time consistency (chronology)
+# --------------------------------------------------------------------------- #
+#
+# These tests drive the audit through stored rows only: after creating a
+# genuinely sound receipt through the public API, a moment is rewritten
+# directly in the database (the way post-hoc damage would appear) and the
+# receipt hashes are recomputed coherently where the moment is a covered
+# content field, so the verdict isolates the time-consistency category.
+
+
+def _rechain(engine, machine_id):
+    """Rebuild one machine's receipt hashes in chain order over stored text.
+
+    Mirrors the production chain recomputation so a test that rewrites a
+    covered content field (``occurred_at``, ``resource``, ...) leaves the
+    links and digests sound and only the intended anomaly is adjudicated.
+    """
+    from accountability.execution_receipts import (
+        compute_chain_hash,
+        compute_content_hash,
+    )
+
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT id, machine_id, use_id, grant_id, "
+                "authorization_event_id, action_type, resource, outcome, "
+                "result_digest, occurred_at FROM execution_receipts "
+                "WHERE machine_id = :m ORDER BY occurred_at, id"
+            ).bindparams(m=machine_id)
+        ).mappings().all()
+        previous_receipt_id = None
+        previous_chain_hash = ""
+        for row in rows:
+            content_hash = compute_content_hash(
+                id=row["id"],
+                machine_id=row["machine_id"],
+                use_id=row["use_id"],
+                grant_id=row["grant_id"],
+                authorization_event_id=row["authorization_event_id"],
+                action_type=row["action_type"],
+                resource=row["resource"],
+                outcome=row["outcome"],
+                result_digest=row["result_digest"],
+                occurred_at=row["occurred_at"],
+            )
+            chain_hash = compute_chain_hash(previous_chain_hash, content_hash)
+            conn.execute(
+                text(
+                    "UPDATE execution_receipts SET "
+                    "previous_receipt_id = :p, content_hash = :c, "
+                    "chain_hash = :h WHERE id = :id"
+                ).bindparams(
+                    p=previous_receipt_id,
+                    c=content_hash,
+                    h=chain_hash,
+                    id=row["id"],
+                )
+            )
+            previous_receipt_id = row["id"]
+            previous_chain_hash = chain_hash
+
+
+def _set_receipt_moment(engine, machine_id, receipt_id, occurred_at):
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE execution_receipts SET occurred_at = :t WHERE id = :id"
+            ).bindparams(t=occurred_at, id=receipt_id)
+        )
+    _rechain(engine, machine_id)
+
+
+def _set_use_consumed_at(engine, use_id, consumed_at):
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE authorization_grant_uses SET consumed_at = :t "
+                "WHERE id = :id"
+            ).bindparams(t=consumed_at, id=use_id)
+        )
+
+
+def _set_grant_moment(engine, grant_id, column, value):
+    assert column in {"issued_at", "expires_at"}
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"UPDATE authorization_grants SET {column} = :t WHERE id = :id"
+            ).bindparams(t=value, id=grant_id)
+        )
+
+
+def _set_moments(engine, grant_id, use_id, *, issued, consumed, expires):
+    _set_grant_moment(engine, grant_id, "issued_at", issued)
+    _set_grant_moment(engine, grant_id, "expires_at", expires)
+    _set_use_consumed_at(engine, use_id, consumed)
+
+
+def _one_receipt(consumed_use, client, **payload_overrides):
+    machine_id, _, _, use = consumed_use
+    response = client.post(
+        receipts_url(machine_id),
+        json=receipt_payload(use, **payload_overrides),
+    )
+    assert response.status_code == 201
+    return machine_id, use, response.json()["id"]
+
+
+def test_chronology_equal_lower_boundaries_with_fraction_are_legal(
+    consumed_use, client
+):
+    machine_id, event, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    # issued == consumed and occurred == consumed, with fractional seconds,
+    # is inside the validity window and must be sound.
+    moment = "2026-01-01T00:00:00.500000Z"
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued=moment,
+        consumed=moment,
+        expires="2026-01-01T00:05:00Z",
+    )
+    _set_receipt_moment(
+        client.app.state.engine, machine_id, receipt_id, moment
+    )
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit == {
+        "valid": True,
+        "checked_count": 1,
+        "broken_receipt_id": None,
+        "anomaly": None,
+    }
+
+
+def test_chronology_receipt_registered_after_expiry_is_legal(
+    consumed_use, client
+):
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    # Consumption happens well inside the window; the receipt is registered
+    # after the grant expired. That is legal: only the consumption instant
+    # must be inside [issued_at, expires_at).
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued="2026-01-01T00:00:00Z",
+        consumed="2026-01-01T00:01:00Z",
+        expires="2026-01-01T00:05:00Z",
+    )
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        receipt_id,
+        "2026-01-01T00:10:00Z",
+    )
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["valid"] is True
+    assert audit["anomaly"] is None
+
+
+def test_chronology_occurred_before_consumed_is_mismatch(consumed_use, client):
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued="2026-01-01T00:00:00Z",
+        consumed="2026-01-01T00:01:00Z",
+        expires="2026-01-01T00:05:00Z",
+    )
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        receipt_id,
+        "2026-01-01T00:00:30Z",
+    )
+    response = client.get(integrity_url(machine_id))
+    assert response.status_code == 200
+    audit = response.json()
+    assert audit["valid"] is False
+    assert audit["checked_count"] == 1
+    assert audit["broken_receipt_id"] == receipt_id
+    assert audit["anomaly"] == "chronology_mismatch"
+
+
+def test_chronology_consumed_before_issued_is_mismatch(consumed_use, client):
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued="2026-01-01T00:02:00Z",
+        consumed="2026-01-01T00:01:00Z",
+        expires="2026-01-01T00:05:00Z",
+    )
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        receipt_id,
+        "2026-01-01T00:03:00Z",
+    )
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "chronology_mismatch"
+    assert audit["broken_receipt_id"] == receipt_id
+
+
+def test_chronology_consumed_equal_to_expires_is_mismatch(consumed_use, client):
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    # The validity window ends strictly before expires_at: consuming at the
+    # expiry instant is already too late.
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued="2026-01-01T00:00:00Z",
+        consumed="2026-01-01T00:05:00Z",
+        expires="2026-01-01T00:05:00Z",
+    )
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        receipt_id,
+        "2026-01-01T00:06:00Z",
+    )
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "chronology_mismatch"
+
+
+def test_chronology_consumed_after_expires_is_mismatch(consumed_use, client):
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued="2026-01-01T00:00:00Z",
+        consumed="2026-01-01T00:06:00Z",
+        expires="2026-01-01T00:05:00Z",
+    )
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        receipt_id,
+        "2026-01-01T00:07:00Z",
+    )
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "chronology_mismatch"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "broken-time",
+        "2026-01-01T00:01:00+00:00",
+        "2026-01-01T00:01:00",
+        "2026-02-30T00:01:00Z",
+        "2026-01-01T00:01:00+05:00",
+    ],
+)
+@pytest.mark.parametrize(
+    "target",
+    ["use.consumed_at", "grant.issued_at", "grant.expires_at"],
+)
+def test_chronology_unparseable_related_moment_is_timestamp_anomaly(
+    consumed_use, client, target, bad_value
+):
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    # Keep all moments sound except the one damaged value.
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued="2026-01-01T00:00:00Z",
+        consumed="2026-01-01T00:01:00Z",
+        expires="2026-01-01T00:05:00Z",
+    )
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        receipt_id,
+        "2026-01-01T00:02:00Z",
+    )
+    engine = client.app.state.engine
+    if target == "use.consumed_at":
+        _set_use_consumed_at(engine, use["use_id"], bad_value)
+    else:
+        column = target.split(".")[1]
+        _set_grant_moment(engine, grant["id"], column, bad_value)
+
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["valid"] is False
+    assert audit["broken_receipt_id"] == receipt_id
+    assert audit["checked_count"] == 1
+    assert audit["anomaly"] == "timestamp_unparseable"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "20260101T000000Z",      # basic ISO: tolerant ordering parser accepts
+        "2026-01-01t00:00:00Z",  # lowercase separator
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:00",
+        "2026-01-01T24:00:00Z",
+        "2026-13-01T00:00:00Z",
+        "garbage",
+    ],
+)
+def test_chronology_non_extended_occurred_at_is_timestamp_anomaly(
+    consumed_use, client, bad_value
+):
+    # A stamp the tolerant ordering parser accepts (basic ISO, lowercase
+    # separator) must still fail the strict RFC 3339 ``Z`` verdict contract.
+    machine_id, _, _, _ = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    _set_receipt_moment(
+        client.app.state.engine, machine_id, receipt_id, bad_value
+    )
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "timestamp_unparseable"
+    assert audit["broken_receipt_id"] == receipt_id
+
+
+def _two_sound_receipts(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client, resource_pattern="res/*")
+    created = []
+    for index in range(2):
+        seconds = index * 60
+        event = record_event(
+            client, machine_id, resource=f"res/{index}"
+        ).json()
+        grant, use = issue_and_consume(client, machine_id, event)
+        receipt = client.post(
+            receipts_url(machine_id),
+            json=receipt_payload(use, resource=f"res/{index}"),
+        ).json()
+        _set_moments(
+            client.app.state.engine,
+            grant["id"],
+            use["use_id"],
+            issued=f"2026-01-01T00:{index:02d}:00Z",
+            consumed=f"2026-01-01T00:{index:02d}:10Z",
+            expires=f"2026-01-01T00:{index:02d}:50Z",
+        )
+        _set_receipt_moment(
+            client.app.state.engine,
+            machine_id,
+            receipt["id"],
+            f"2026-01-01T00:{index:02d}:20Z",
+        )
+        created.append((grant, use, receipt["id"]))
+    return machine_id, created
+
+
+def test_chronology_first_broken_receipt_in_chain_order_is_named(client):
+    machine_id, created = _two_sound_receipts(client)
+    first_id = created[0][2]
+    # Damage only the chronologically first receipt (occurred before
+    # consumed); the later sound receipt must not mask it.
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        first_id,
+        "2026-01-01T00:00:05Z",
+    )
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["valid"] is False
+    assert audit["checked_count"] == 2
+    assert audit["broken_receipt_id"] == first_id
+    assert audit["anomaly"] == "chronology_mismatch"
+
+
+def test_chronology_later_broken_receipt_is_named_when_earlier_sound(client):
+    machine_id, created = _two_sound_receipts(client)
+    second_grant, second_use, second_id = created[1]
+    # A sound first receipt; only the second consumed after expiry.
+    _set_use_consumed_at(
+        client.app.state.engine,
+        second_use["use_id"],
+        "2026-01-01T00:01:55Z",
+    )
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["checked_count"] == 2
+    assert audit["broken_receipt_id"] == second_id
+    assert audit["anomaly"] == "chronology_mismatch"
+
+
+def test_chronology_chain_break_takes_precedence(consumed_use, client):
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued="2026-01-01T00:00:00Z",
+        consumed="2026-01-01T00:01:00Z",
+        expires="2026-01-01T00:05:00Z",
+    )
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        receipt_id,
+        "2026-01-01T00:00:30Z",
+    )
+    # Break the chain after the coherent recomputation: chain_break must
+    # outrank the chronology violation on the same receipt.
+    _tamper(client.app.state.engine, receipt_id, "chain_hash", "f" * 64)
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "chain_break"
+
+
+def test_chronology_use_mismatch_takes_precedence(client):
+    machine_id = create_machine(client)
+    declare(client, machine_id, resource_pattern="res/*")
+    create_rule(client, resource_pattern="res/*")
+    event_one = record_event(client, machine_id, resource="res/1").json()
+    grant_one, use_one = issue_and_consume(client, machine_id, event_one)
+    event_two = record_event(client, machine_id, resource="res/2").json()
+    _, use_two = issue_and_consume(client, machine_id, event_two)
+
+    receipt = client.post(
+        receipts_url(machine_id),
+        json=receipt_payload(use_one, resource="res/1"),
+    ).json()
+    # Point the receipt at the other (same-machine) use: the binding
+    # disagrees while ownership still resolves, and the chronology is made
+    # invalid against that use's moment too.
+    _set_use_consumed_at(
+        client.app.state.engine,
+        use_two["use_id"],
+        "2026-01-01T00:01:00Z",
+    )
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE execution_receipts SET use_id = :u WHERE id = :id"
+            ).bindparams(u=use_two["use_id"], id=receipt["id"])
+        )
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        receipt["id"],
+        "2026-01-01T00:00:30Z",
+    )
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "use_mismatch"
+    assert audit["broken_receipt_id"] == receipt["id"]
+
+
+def test_chronology_outranks_scope_and_digest_mismatch(consumed_use, client):
+    # Same receipt carries a chronology violation plus a scope violation.
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued="2026-01-01T00:00:00Z",
+        consumed="2026-01-01T00:01:00Z",
+        expires="2026-01-01T00:05:00Z",
+    )
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE execution_receipts SET resource = :r, "
+                "occurred_at = :t WHERE id = :id"
+            ).bindparams(
+                r="res/tampered",
+                t="2026-01-01T00:00:30Z",
+                id=receipt_id,
+            )
+        )
+    _rechain(client.app.state.engine, machine_id)
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "chronology_mismatch"
+
+    # Adding a digest problem on the same receipt does not change it.
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE execution_receipts SET result_digest = :d "
+                "WHERE id = :id"
+            ).bindparams(d="z" * 64, id=receipt_id)
+        )
+    _rechain(client.app.state.engine, machine_id)
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "chronology_mismatch"
+
+
+def test_chronology_chain_break_outranks_unparseable_moment(
+    consumed_use, client
+):
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    _set_use_consumed_at(
+        client.app.state.engine, use["use_id"], "not-a-timestamp"
+    )
+    _tamper(client.app.state.engine, receipt_id, "chain_hash", "f" * 64)
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "chain_break"
+
+
+def test_chronology_unparseable_moment_outranks_scope_mismatch(
+    consumed_use, client
+):
+    machine_id, _, _, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    _set_use_consumed_at(
+        client.app.state.engine, use["use_id"], "2026-01-01T00:01:00"
+    )
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE execution_receipts SET resource = :r WHERE id = :id"
+            ).bindparams(r="res/tampered", id=receipt_id)
+        )
+    _rechain(client.app.state.engine, machine_id)
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "timestamp_unparseable"
+
+
+def test_chronology_anomaly_is_stable_and_read_only(consumed_use, client):
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued="2026-01-01T00:00:00Z",
+        consumed="2026-01-01T00:01:00Z",
+        expires="2026-01-01T00:05:00Z",
+    )
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        receipt_id,
+        "2026-01-01T00:00:30Z",
+    )
+    before = client.get(integrity_url(machine_id)).content
+    after = client.get(integrity_url(machine_id)).content
+    assert before == after
+    with client.app.state.engine.connect() as conn:
+        stored_occurred = conn.execute(
+            text("SELECT occurred_at FROM execution_receipts")
+        ).scalar_one()
+        stored_consumed = conn.execute(
+            text("SELECT consumed_at FROM authorization_grant_uses")
+        ).scalar_one()
+    assert stored_occurred == "2026-01-01T00:00:30Z"
+    assert stored_consumed == "2026-01-01T00:01:00Z"
+
+
+def test_chronology_anomaly_is_isolated_per_machine(consumed_use, client):
+    machine_id, _, grant, use = consumed_use
+    _, _, receipt_id = _one_receipt(consumed_use, client)
+    _set_moments(
+        client.app.state.engine,
+        grant["id"],
+        use["use_id"],
+        issued="2026-01-01T00:00:00Z",
+        consumed="2026-01-01T00:01:00Z",
+        expires="2026-01-01T00:05:00Z",
+    )
+    _set_receipt_moment(
+        client.app.state.engine,
+        machine_id,
+        receipt_id,
+        "2026-01-01T00:00:30Z",
+    )
+
+    other = create_machine(client, external_id="machine-2")
+    other_audit = client.get(integrity_url(other)).json()
+    assert other_audit == {
+        "valid": True,
+        "checked_count": 0,
+        "broken_receipt_id": None,
+        "anomaly": None,
+    }
+    audit = client.get(integrity_url(machine_id)).json()
+    assert audit["anomaly"] == "chronology_mismatch"
+    assert audit["broken_receipt_id"] == receipt_id

@@ -3040,8 +3040,13 @@ parses sorts deterministically last and is reported first (before the
 link scan) as its own category. The anomaly categories, in the order a
 single receipt is examined, are:
 
-- `timestamp_unparseable` — a stored `occurred_at` that is not text or no
-  longer parses to a UTC instant;
+- `timestamp_unparseable` — a related moment that is missing, not text,
+  or does not satisfy the strict RFC 3339 UTC contract (a literal `Z`
+  suffix with optional fractional seconds; an offset, missing `Z`,
+  malformed, or out-of-range value fails): the receipt's `occurred_at`
+  (pre-scanned before the link scan) or, after the chain/ownership/
+  binding checks, its consumed use's `consumed_at` or the named grant's
+  `issued_at`/`expires_at`;
 - `chain_break` — a `previous_receipt_id` that is not the immediately
   preceding receipt in chain order (empty for the first), a chain hash
   that is not 64 lowercase hex characters, or one that does not equal
@@ -3052,6 +3057,14 @@ single receipt is examined, are:
 - `use_mismatch` — the receipt does not agree with its consumed use: the
   named grant is not the use's grant, the named event is not the use's
   source event, or the grant does not bind that same event;
+- `chronology_mismatch` — once all related moments parse, the receipt's
+  `occurred_at` strictly precedes its use's `consumed_at`, that
+  `consumed_at` strictly precedes the grant's `issued_at`, or the
+  `consumed_at` is at or after the grant's `expires_at`. Equality at the
+  lower boundaries is legal (`occurred_at == consumed_at` and
+  `consumed_at == issued_at`), and a receipt registered after
+  `expires_at` for a consumption that happened inside the validity
+  window is legal;
 - `scope_mismatch` — the source event is not a committed
   `allowed_by_policy` allow, or the receipt's `action_type`/`resource`
   does not match it verbatim;
