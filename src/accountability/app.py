@@ -49,6 +49,7 @@ from . import (
     policy_rule_chain,
     privacy_chain,
     rotation_chain,
+    rotation_reconciliation,
     status_event_chain,
 )
 from .db import (
@@ -4810,6 +4811,108 @@ def get_key_rotation_event_changes(
     body = (
         json.dumps(
             payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
+# --- read-only key-rotation history/current-state reconciliation ------------
+
+
+def validate_key_rotation_reconciliation_params(request: Request) -> None:
+    """Validate the rotation reconciliation query before any lookup.
+
+    The reconciliation is keyed on the path machine alone and accepts no
+    query parameters — a single, repeated, or unknown parameter name alike —
+    and no request body; any query-string content or a carried body is a 422
+    ``invalid_query``. The check runs as a dependency before the machine or
+    any rotation record is read, so a malformed request against a
+    non-existent machine still reports 422 rather than 404 and never touches
+    a record.
+    """
+    # A present non-zero Content-Length, or a chunked request without one,
+    # means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+    if request.query_params:
+        raise QueryError("invalid_query")
+
+
+@app.get("/machines/{machine_id}/key-rotation-events/reconciliation")
+def get_key_rotation_event_reconciliation(
+    machine_id: str,
+    _: Annotated[None, Depends(validate_key_rotation_reconciliation_params)],
+    session: SessionDep,
+):
+    """Read-only reconciliation of one machine's key rotation history
+    against its current key and version.
+
+    Only ``GET`` is routed, so ``HEAD`` and every other method return 405
+    without reading records, computing a conclusion, or writing anything.
+    The caller submits only the path machine id — no query parameters, no
+    repeated parameters, and no request body; any query string or carried
+    body is a 422 ``invalid_query`` raised during validation before the
+    machine or any rotation record is read, so a malformed request against
+    a non-existent machine still reports 422 rather than 404. A missing
+    machine is a 404 ``not_found`` carrying no conclusion. A failure while
+    reading the records is a 500 ``internal_error`` with no partial
+    conclusion.
+
+    On success the response carries exactly ``{machine_id, valid,
+    checked_count, latest_rotation_id, broken_rotation_id, anomaly}`` in
+    this fixed field order. ``checked_count`` is the path machine's total
+    rotation count and ``latest_rotation_id`` the chain tail — ``0`` and
+    ``null`` for an empty history. Records are checked in (created-at UTC
+    instant, id) order, so an exact-second record sorts before any
+    fractional-second record of the same second and a ``created_at`` that
+    no longer parses sorts last. Each record must carry a parseable
+    moment, a previous-rotation link and content/chain hashes matching the
+    recomputed chain, the next version of the 2-then-plus-one sequence,
+    and — after the first record — an ``old_public_key`` equal to its
+    predecessor's ``new_public_key``; the chain tail must then line up
+    with the machine's current ``public_key`` and ``version``, and an
+    empty history explains only a machine still at ``version`` ``1``. When
+    everything reconciles, ``valid`` is ``true`` and
+    ``broken_rotation_id`` and ``anomaly`` are both ``null``; otherwise
+    the first anomaly in check order is reported, with ``anomaly`` one of
+    ``timestamp_unparseable``, ``chain_mismatch``,
+    ``version_transition_mismatch``, ``key_transition_mismatch``, or
+    ``current_state_mismatch``. A current-state break is a drift of the
+    machine row rather than of any one rotation record, so
+    ``broken_rotation_id`` is ``null`` for it. Damaged stored values are
+    reported, never repaired or normalized.
+
+    The query is strictly read-only and machine isolated: it never
+    creates, updates, deletes, repairs, recomputes, or normalizes a
+    machine or rotation record, only rows owned by the path machine are
+    examined, and repeated calls against unchanged data return the body
+    byte-for-byte identically across restarts. The body is compact UTF-8
+    JSON in a fixed field order terminated by a single newline, free of
+    any floating-point or non-finite value.
+    """
+    # A failure while *reading* — the machine or the rotation records — is
+    # an internal read-layer fault: answer 500 internal_error with no
+    # conclusion. Damaged stored values are not a read failure: rows read
+    # successfully are reconciled tolerantly, so only a true read fault
+    # reaches the except branch.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+        conclusion = rotation_reconciliation.reconcile(session, machine)
+    except Exception:
+        return error_response(500, "internal_error")
+
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            conclusion, ensure_ascii=False, allow_nan=False, separators=(",", ":")
         )
         + "\n"
     )
