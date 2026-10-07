@@ -48,6 +48,14 @@ a short-lived credential that can be consumed exactly once:
   has one definite terminal winner — consume first makes the revocation answer
   ``grant_consumed``; revoke first makes the consumption answer
   ``grant_revoked``.
+* :func:`revoke_grants_batch` emergency-revokes several grants of one machine
+  in one locked write transaction: every grant is checked in input order
+  against exactly the single-revoke rules, the first failing grant decides
+  the whole batch's outcome and nothing is written, and a successful batch
+  flips every grant to ``revoked``, stamps every ``revoked_at`` with one
+  shared UTC revoke moment, and appends one ``revoked`` lifecycle event per
+  grant. Like the single revocation, the batch adds no ``machine_suspended``
+  gate: emergency revocation stays available while the machine is suspended.
 
 Grants and use records live in their own tables and are never renewed,
 transferred, or deleted. Revocation never touches the decision event, its
@@ -682,5 +690,107 @@ def revoke_grant(
                 "status": "revoked",
             },
         }
+
+    return _run_with_lock_retry(engine, _work)
+
+
+def revoke_grants_batch(
+    engine: Engine,
+    *,
+    machine_id: str,
+    grant_ids: list[str],
+) -> dict[str, Any]:
+    """Emergency-revoke several unconsumed, unrevoked, unexpired grants, or none.
+
+    Every grant is checked in input order against exactly the eligibility
+    rules of :func:`revoke_grant` — path-machine ownership, not consumed,
+    not revoked, not expired — inside one locked write transaction that
+    also performs every state flip and lifecycle event. The first failing
+    grant in input order decides the whole batch's outcome; the status dict
+    uses the same status values as :func:`revoke_grant` (``not_found``,
+    ``grant_consumed``, ``grant_revoked``, ``grant_expired``, or ``ok``
+    with the ordered ``revocations`` list of ``{grant_id, revoked_at,
+    status}`` dicts). Like the single revocation, the batch adds no
+    ``machine_suspended`` gate: emergency revocation stays available while
+    the machine is suspended.
+
+    A rejected batch writes nothing: no partial revocation, no partial
+    ``revoked_at``, no partial lifecycle event is ever committed. A
+    successful batch stamps every grant's ``revoked_at`` and every
+    lifecycle event with one shared UTC revoke moment. The lock is the
+    same one the single consume, the batch consume, the single revoke,
+    and the machine status change take, so a concurrent single or batch
+    consume or revoke racing for any of these grants has exactly one
+    terminal winner and the loser's whole transaction rolls back,
+    reporting the first raced grant's conflict in its own input order.
+    """
+
+    def _work(conn) -> dict[str, Any]:
+        machine = conn.execute(
+            Machine.__table__.select().where(Machine.__table__.c.id == machine_id)
+        ).first()
+        if machine is None:
+            return {"status": "not_found"}
+
+        now = datetime.now(timezone.utc)
+        # Eligibility is decided per grant in input order before anything
+        # is written: the first failing grant's outcome is the batch's
+        # outcome. The two terminal states keep their precedence over the
+        # derived expiry, exactly as in the single revoke.
+        grant_rows = []
+        for grant_id in grant_ids:
+            grant_row = conn.execute(
+                _GRANT_TABLE.select().where(
+                    _GRANT_TABLE.c.id == grant_id,
+                    _GRANT_TABLE.c.machine_id == machine_id,
+                )
+            ).first()
+            if grant_row is None:
+                return {"status": "not_found"}
+
+            grant = grant_row._mapping
+            if grant["status"] == "consumed":
+                return {"status": "grant_consumed"}
+            if grant["status"] == "revoked":
+                return {"status": "grant_revoked"}
+            if now >= _parse_utc(grant["expires_at"]):
+                # Expiry is derived from the immutable expires_at; an
+                # expired grant is never updated, renewed, or rewritten.
+                return {"status": "grant_expired"}
+            grant_rows.append(grant)
+
+        # Every grant qualified: one shared revoke moment for the whole
+        # batch, one state flip and one lifecycle event per grant, all
+        # committed together.
+        revoked_at = _utc_iso(now)
+        revocations = []
+        for grant_id, grant in zip(grant_ids, grant_rows):
+            # The lock is the same one consume takes: a concurrent
+            # consumption or revocation that committed first is already
+            # visible in the status checks above and cannot interleave
+            # with these flips.
+            conn.execute(
+                _GRANT_TABLE.update()
+                .where(_GRANT_TABLE.c.id == grant_id)
+                .values(status="revoked", revoked_at=revoked_at)
+            )
+            # The audit event commits in the same locked transaction as
+            # the state flip, reusing the response's revoked_at.
+            grant_lifecycle.append_event(
+                conn,
+                machine_id=machine_id,
+                grant_id=grant_id,
+                authorization_event_id=grant["event_id"],
+                type="revoked",
+                occurred_at=revoked_at,
+            )
+            revocations.append(
+                {
+                    "grant_id": grant_id,
+                    "revoked_at": revoked_at,
+                    "status": "revoked",
+                }
+            )
+        return {"status": "ok", "revocations": revocations}
 
     return _run_with_lock_retry(engine, _work)
