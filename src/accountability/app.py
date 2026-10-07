@@ -1116,6 +1116,153 @@ def list_behavior_declarations(machine_id: str, session: SessionDep):
     return [declaration_to_out(d) for d in declarations]
 
 
+_DECLARATION_TABLE = BehaviorDeclaration.__table__
+
+
+def _set_declaration_enabled(
+    engine, *, machine_id: str, declaration_id: str, enabled: bool
+) -> dict:
+    """Flip one declaration's ``enabled`` flag in the locked write transaction.
+
+    The machine lookup, the path-machine-scoped declaration lookup, the
+    no-change check, and the update run inside one locked write transaction
+    (the same lock every other writer takes), so concurrent requests
+    serialize: a same-target burst has exactly one ``ok`` and every other
+    request observes the committed value and answers
+    ``declaration_state_unchanged``, while different-target requests commit
+    in lock order and never lose an update. Returns a status dict:
+
+    * ``not_found`` — the path machine is missing, or the declaration does
+      not exist under it (a declaration owned by another machine is
+      indistinguishable from a missing one);
+    * ``declaration_state_unchanged`` — the stored ``enabled`` already
+      equals the target; nothing is written and ``updated_at`` is kept;
+    * ``ok`` — with the updated ``declaration`` dict.
+
+    Only the declaration's own ``enabled`` and ``updated_at`` change:
+    ``action_type``, ``resource_pattern``, and ``created_at`` are never
+    rewritten, and no decision event, evidence, incident, grant, receipt,
+    diagnostic, machine, policy rule, other declaration, or hash-chain row
+    is touched.
+    """
+
+    def _work(conn) -> dict:
+        machine = conn.execute(
+            Machine.__table__.select().where(Machine.__table__.c.id == machine_id)
+        ).first()
+        if machine is None:
+            return {"status": "not_found"}
+        row = conn.execute(
+            _DECLARATION_TABLE.select().where(
+                _DECLARATION_TABLE.c.id == declaration_id,
+                _DECLARATION_TABLE.c.machine_id == machine_id,
+            )
+        ).first()
+        if row is None:
+            return {"status": "not_found"}
+
+        declaration = row._mapping
+        if declaration["enabled"] == enabled:
+            # Already at the target state: a no-change rejection writes
+            # nothing, so created_at/updated_at and every conclusion drawn
+            # from the record stay exactly as committed.
+            return {"status": "declaration_state_unchanged"}
+
+        updated_at = utc_now_iso()
+        conn.execute(
+            _DECLARATION_TABLE.update()
+            .where(_DECLARATION_TABLE.c.id == declaration_id)
+            .values(enabled=enabled, updated_at=updated_at)
+        )
+        return {
+            "status": "ok",
+            "declaration": {
+                "id": declaration["id"],
+                "machine_id": declaration["machine_id"],
+                "action_type": declaration["action_type"],
+                "resource_pattern": declaration["resource_pattern"],
+                "enabled": enabled,
+                "created_at": declaration["created_at"],
+                "updated_at": updated_at,
+            },
+        }
+
+    return chain._run_with_lock_retry(engine, _work)
+
+
+@app.post(
+    "/machines/{machine_id}/behavior-declarations/{declaration_id}/enabled",
+    response_model=BehaviorDeclarationOut,
+)
+async def set_behavior_declaration_enabled(
+    machine_id: str, declaration_id: str, request: Request
+):
+    """Disable or re-enable one existing behavior declaration.
+
+    The request carries no query string and a JSON object body with exactly
+    one field: ``enabled``, a strict JSON boolean. Validation runs before
+    any machine or declaration is read:
+
+    - any query parameter (or repeated parameter) is
+      ``422 {"error":{"code":"invalid_query"}}``;
+    - a missing or unparseable body, a body that is not a JSON object, a
+      missing or extra field, or an ``enabled`` value that is not a strict
+      boolean is ``422 {"error":{"code":"invalid_declaration_state_request"}}``
+      — even against a non-existent machine the query check still wins, and
+      every body check still precedes the lookups.
+
+    After validation a missing machine, a missing declaration, or a
+    declaration owned by another machine is
+    ``404 {"error":{"code":"not_found"}}``. A declaration whose ``enabled``
+    already equals the target is ``409 declaration_state_unchanged`` and the
+    record is left untouched — only an actual change is committed. The
+    read-check-update runs inside one locked write transaction, so a
+    concurrent burst for the same target has exactly one success and every
+    other request ``declaration_state_unchanged``, and concurrent requests
+    for different targets commit in lock order with no lost update.
+
+    The success body is ``{id, machine_id, action_type, resource_pattern,
+    enabled, created_at, updated_at}`` in this fixed field order:
+    ``created_at`` is preserved verbatim and ``updated_at`` is this
+    request's UTC instant ending in ``Z``. The update writes only the
+    declaration row: it never appends decision events, evidence, incidents,
+    grants, receipts, or diagnostics, never changes the machine, the policy
+    rules, another declaration, or any hash chain, and never rewrites or
+    recomputes a saved decision basis, authorization event, grant, receipt,
+    or historical conclusion. New authorization decisions read the updated
+    ``enabled`` state; the result persists across restarts.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_declaration_state_request")
+    if not isinstance(payload, dict) or set(payload) != {"enabled"}:
+        return error_response(422, "invalid_declaration_state_request")
+    enabled = payload["enabled"]
+    # Only a strict JSON boolean is a legal target state; integers, strings,
+    # null, and every other type are the same single invalid body outcome.
+    if not isinstance(enabled, bool):
+        return error_response(422, "invalid_declaration_state_request")
+
+    engine = request.app.state.engine
+    result = _set_declaration_enabled(
+        engine,
+        machine_id=machine_id,
+        declaration_id=declaration_id,
+        enabled=enabled,
+    )
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "declaration_state_unchanged":
+        return error_response(409, "declaration_state_unchanged")
+    return BehaviorDeclarationOut(**result["declaration"])
+
+
 def validate_behavior_declaration_integrity_params(request: Request) -> None:
     """Validate the behavior-declaration integrity query string.
 
