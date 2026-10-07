@@ -11064,6 +11064,102 @@ async def revoke_authorization_grant(
     return AuthorizationGrantRevocationOut(**result["revocation"])
 
 
+@app.post(
+    "/machines/{machine_id}/authorization-grants/batch-revoke",
+    response_model=list[AuthorizationGrantRevocationOut],
+)
+async def revoke_authorization_grants_batch(machine_id: str, request: Request):
+    """Emergency-revoke several unconsumed, unrevoked, unexpired grants, or none.
+
+    The request carries no query string and a JSON object body with exactly
+    one field: ``grant_ids``, an array of 1 to 100 distinct, non-empty
+    strings naming grants of the path machine, in the order they are to be
+    revoked. Validation runs before any machine or grant is read:
+
+    - any query parameter (or repeated parameter) is
+      ``422 {"error":{"code":"invalid_query"}}`` — even against a
+      non-existent machine the query check still wins;
+    - a missing body, a body that is not a JSON object, a missing or extra
+      top-level field, a ``grant_ids`` value that is not an array of 1 to
+      100 elements, an element that is not a string or is blank after
+      trimming, or a repeated grant id is
+      ``422 {"error":{"code":"invalid_grant_request"}}``.
+
+    After validation a missing machine, a missing grant, or a grant owned
+    by another machine is ``404 {"error":{"code":"not_found"}}``. Every
+    grant is then checked in input order against exactly the
+    single-revocation rules, and the first failing grant decides the whole
+    batch: an already-consumed grant answers ``409 grant_consumed``, an
+    already-revoked grant answers ``409 grant_revoked``, and a grant at or
+    past its ``expires_at`` answers ``409 grant_expired`` — the terminal
+    outcomes keep their precedence over the derived expiry. Batch
+    revocation adds no ``machine_suspended`` gate: the single emergency
+    revocation remains executable while the machine is suspended and the
+    batch keeps that semantics. A rejected batch writes nothing: no state
+    flip, no ``revoked_at``, no lifecycle event, no partial revocation. On
+    success every grant flips to ``revoked`` in one locked write
+    transaction — the same lock the single revocation, the single consume,
+    and the other batch operations take — so a concurrent single
+    revocation or consumption, another revocation batch, or a consumption
+    batch racing for any of these grants has exactly one terminal winner:
+    a committed consumption makes this batch answer ``grant_consumed``; a
+    committed revocation makes the racing consumption answer
+    ``grant_revoked``, and the loser rolls back entirely. The success
+    body is the array of ``{grant_id, revoked_at, status}`` objects in
+    input order, one per grant, every ``status`` ``"revoked"`` and every
+    ``revoked_at`` the same UTC ``Z`` commit moment of the batch.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_grant_request")
+    if not isinstance(payload, dict) or set(payload) != {"grant_ids"}:
+        return error_response(422, "invalid_grant_request")
+
+    raw_grant_ids = payload["grant_ids"]
+    if not isinstance(raw_grant_ids, list) or not 1 <= len(raw_grant_ids) <= 100:
+        return error_response(422, "invalid_grant_request")
+
+    grant_ids: list[str] = []
+    seen_grant_ids: set[str] = set()
+    for element in raw_grant_ids:
+        # The elements follow the other path-scoped identifiers: a
+        # non-string or blank-after-trim value is an illegal body, not a
+        # looked-up object, and a repeated id within one batch is the same
+        # single invalid_grant_request outcome.
+        if isinstance(element, bool) or not isinstance(element, str):
+            return error_response(422, "invalid_grant_request")
+        grant_id = element.strip()
+        if not grant_id:
+            return error_response(422, "invalid_grant_request")
+        if grant_id in seen_grant_ids:
+            return error_response(422, "invalid_grant_request")
+        seen_grant_ids.add(grant_id)
+        grant_ids.append(grant_id)
+
+    engine = request.app.state.engine
+    result = grants.revoke_grants_batch(
+        engine, machine_id=machine_id, grant_ids=grant_ids
+    )
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "grant_consumed":
+        return error_response(409, "grant_consumed")
+    if status == "grant_revoked":
+        return error_response(409, "grant_revoked")
+    if status == "grant_expired":
+        return error_response(409, "grant_expired")
+    return [
+        AuthorizationGrantRevocationOut(**revocation)
+        for revocation in result["revocations"]
+    ]
+
+
 # --- read-only authorization grant audit listing ------------------------------
 
 
