@@ -4991,6 +4991,216 @@ def get_key_rotation_event_reconciliation(
     return Response(content=body, media_type="application/json")
 
 
+# --- read-only effective-key query over the key rotation timeline ------------
+
+
+class EffectiveKeyParams(BaseModel):
+    at: str
+
+
+def validate_effective_key_params(request: Request) -> EffectiveKeyParams:
+    """Validate the effective-key query string before any lookup.
+
+    Exactly one parameter is accepted: the required ``at``, a UTC RFC 3339
+    date-time ending in ``Z`` (fractional seconds optional; offset forms,
+    surrounding whitespace, and non-``Z`` suffixes are rejected). Any other
+    parameter name, a repeated ``at``, or a request that carries a body is a
+    422 ``invalid_query`` and takes priority; a missing, blank, malformed,
+    or out-of-range ``at`` is a 422 ``bad_time``. Every check runs before
+    the machine or any rotation record is read and issues no database
+    access, so a parameter error against a non-existent machine still
+    reports 422 rather than 404.
+    """
+    # The entry point accepts only the query string: a body on a GET is an
+    # unknown-shape request rejected in the validation phase, before any
+    # machine or rotation record is read. A present non-zero Content-Length,
+    # or a chunked request without one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    unknown = [name for name in request.query_params if name != "at"]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated parameter name is itself an unknown-shape query: reject
+    # ``at=a&at=b`` rather than silently taking one occurrence.
+    if len(request.query_params.getlist("at")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_at = request.query_params.get("at")
+    if not raw_at or not _RFC3339_Z_DATETIME_RE.fullmatch(raw_at):
+        raise QueryError("bad_time")
+    try:
+        parse_utc_z_datetime(raw_at)
+    except ValueError:
+        # Regex passed but the calendar/time values are out of range
+        # (e.g. month 13, day 30 in February, hour 24).
+        raise QueryError("bad_time") from None
+    return EffectiveKeyParams(at=raw_at)
+
+
+@app.get("/machines/{machine_id}/key-rotation-events/effective-key")
+def get_key_rotation_effective_key(
+    machine_id: str,
+    params: Annotated[EffectiveKeyParams, Depends(validate_effective_key_params)],
+    session: SessionDep,
+):
+    """Read-only query of one machine's effective public key at a moment.
+
+    Only ``GET`` is routed, so ``HEAD`` and every other method return 405
+    without reading records, computing a result, or writing anything. The
+    caller submits the path machine id and the single required ``at``
+    parameter — a UTC RFC 3339 date-time ending in ``Z`` (fractional
+    seconds optional) — and no request body. Query validation
+    (``invalid_query`` for an unknown or repeated parameter or a carried
+    body; ``bad_time`` for a missing, blank, offset, whitespace-padded,
+    malformed, or out-of-range ``at``) completes before the machine or any
+    rotation record is read, so a parameter error takes priority even
+    against a missing machine; a valid query against a missing machine is
+    a 404 ``not_found`` carrying no timeline data.
+
+    On success the response carries exactly ``{machine_id, at,
+    effective_key, key_version, effective_from, rotation_id}`` in this
+    fixed key order: the path machine id and the ``at`` text echoed
+    verbatim, then the key in effect at that moment, its version, the
+    moment it took effect, and the rotation that installed it. A moment
+    before the machine's own ``created_at`` reports ``null`` key, effect
+    moment, and rotation id with ``key_version`` ``0``. A machine that
+    never rotated reports its current ``public_key``, ``version``, and
+    ``created_at`` with a ``null`` rotation id. With rotations, the
+    machine's records segment the timeline in (created-at UTC instant,
+    id) order and a record's own moment already uses its new key: before
+    the first rotation the answer is that record's ``old_public_key``
+    with ``effective_from`` the machine's ``created_at`` and a ``null``
+    rotation id; from a rotation's moment on it is that record's
+    ``new_public_key``, ``version``, ``created_at``, and ``id``.
+
+    The timeline is only answered from a fully consistent history: a
+    record whose moment no longer parses, a broken chain link or hash, a
+    version that breaks the 2-then-plus-one sequence, an
+    ``old_public_key`` that does not continue its predecessor's new key,
+    or a chain tail that does not line up with the machine's current
+    ``public_key`` and ``version`` is a 500 ``internal_error`` — no
+    partial timeline is returned and nothing is repaired. A failure while
+    reading the machine or the records is likewise a 500
+    ``internal_error``.
+
+    The query is strictly read-only and machine isolated: it never
+    creates, updates, deletes, repairs, recomputes, or normalizes a
+    machine or rotation record, only rows owned by the path machine are
+    examined, and repeated calls against unchanged data return the body
+    byte-for-byte identically across restarts. The body is compact UTF-8
+    JSON in a fixed field order terminated by a single newline, free of
+    any floating-point or non-finite value.
+    """
+    # Any failure while *reading* — the machine lookup, the rotation rows,
+    # or the ordering over them — is an internal read-layer fault: answer
+    # 500 internal_error with no partial timeline. Damaged stored values
+    # are not a read failure — they are detected by the reconciliation
+    # invariants below and reported as the same 500, never repaired.
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+
+        # The timeline is only derived from a history that reconciles with
+        # the machine's current row: a damaged moment or chain field, a
+        # non-contiguous version or key chain, or a tail that disagrees
+        # with the current public key or version makes the whole timeline
+        # unanswerable — 500 with no partial result, and nothing repaired.
+        if not rotation_reconciliation.reconcile(session, machine)["valid"]:
+            return error_response(500, "internal_error")
+
+        machine_created = (
+            parse_utc_z_datetime(machine.created_at)
+            if isinstance(machine.created_at, str)
+            and _RFC3339_Z_DATETIME_RE.fullmatch(machine.created_at)
+            else None
+        )
+        if machine_created is None:
+            return error_response(500, "internal_error")
+
+        at_instant = parse_utc_z_datetime(params.at)
+
+        effective_key: str | None
+        key_version: int
+        effective_from: str | None
+        rotation_id: str | None
+
+        if at_instant < machine_created:
+            # Before the machine existed there is no effective key.
+            effective_key = None
+            key_version = 0
+            effective_from = None
+            rotation_id = None
+        else:
+            rows = session.scalars(
+                select(KeyRotationEvent).where(
+                    KeyRotationEvent.machine_id == machine_id
+                )
+            ).all()
+            # The reconciliation above proved every stored moment parses,
+            # so the (instant, id) order here is the exact chain order.
+            ordered = sorted(
+                rows,
+                key=lambda record: (
+                    _rotation_created_instant(record.created_at),
+                    record.id,
+                ),
+            )
+            if not ordered:
+                # No rotation ever: the machine's current key has been in
+                # effect since its creation.
+                effective_key = machine.public_key
+                key_version = machine.version
+                effective_from = machine.created_at
+                rotation_id = None
+            else:
+                current = None
+                for record in ordered:
+                    if _rotation_created_instant(record.created_at) <= at_instant:
+                        current = record
+                    else:
+                        break
+                if current is None:
+                    # Before the first rotation: the initial key the first
+                    # record replaced, in effect since machine creation.
+                    first = ordered[0]
+                    effective_key = first.old_public_key
+                    key_version = first.version - 1
+                    effective_from = machine.created_at
+                    rotation_id = None
+                else:
+                    effective_key = current.new_public_key
+                    key_version = current.version
+                    effective_from = current.created_at
+                    rotation_id = current.id
+    except Exception:
+        return error_response(500, "internal_error")
+
+    payload = {
+        "machine_id": machine_id,
+        "at": params.at,
+        "effective_key": effective_key,
+        "key_version": key_version,
+        "effective_from": effective_from,
+        "rotation_id": rotation_id,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 # --- read-only desensitized privacy authorization-decision-event export ------
 
 
