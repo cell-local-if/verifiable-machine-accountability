@@ -1067,6 +1067,182 @@ def check_key_rotation_event_integrity(machine_id: str, session: SessionDep):
     )
 
 
+def validate_effective_key_params(request: Request) -> str:
+    """Validate the effective-key query string before any machine lookup.
+
+    The only accepted parameter is the required ``at``: a UTC RFC 3339
+    date-time ending in ``Z`` (fractional seconds optional; offset forms,
+    surrounding whitespace, and non-``Z`` suffixes are rejected). Any other
+    parameter name, a repeated ``at``, or a request that carries a body is a
+    422 ``invalid_query`` and takes priority; a missing, blank, or malformed
+    ``at`` is a 422 ``bad_time``. Every check runs before the machine or any
+    rotation event is read and issues no database access, so a parameter
+    error against a non-existent machine still reports 422 rather than 404.
+    """
+    # A body on a GET is an unknown-shape request rejected in the validation
+    # phase: a present non-zero Content-Length, or a chunked request without
+    # one, means a body is being carried.
+    content_length = request.headers.get("content-length")
+    if (content_length is not None and content_length != "0") or (
+        content_length is None and "transfer-encoding" in request.headers
+    ):
+        raise QueryError("invalid_query")
+
+    unknown = [name for name in request.query_params if name != "at"]
+    if unknown:
+        raise QueryError("invalid_query")
+
+    # A repeated ``at`` is itself an unknown-shape query: reject ``at=a&at=b``
+    # rather than silently taking one occurrence.
+    if len(request.query_params.getlist("at")) > 1:
+        raise QueryError("invalid_query")
+
+    raw_at = request.query_params.get("at")
+    if not raw_at or not _RFC3339_Z_DATETIME_RE.fullmatch(raw_at):
+        raise QueryError("bad_time")
+    try:
+        parse_utc_z_datetime(raw_at)
+    except ValueError:
+        raise QueryError("bad_time")
+    return raw_at
+
+
+@app.get("/machines/{machine_id}/key-rotation-events/effective-key")
+def get_effective_key(
+    machine_id: str,
+    at: Annotated[str, Depends(validate_effective_key_params)],
+    session: SessionDep,
+):
+    """Read-only effective key of one machine at a past UTC instant.
+
+    The caller submits only the path machine id and the required ``at``
+    query parameter — a UTC RFC 3339 date-time ending in ``Z`` (fractional
+    seconds optional). Query validation (``invalid_query`` for an unknown
+    parameter, a repeated ``at``, or a carried request body; ``bad_time``
+    for a missing, blank, or malformed ``at``) completes before the machine
+    or any rotation event is read, so a parameter error takes priority even
+    against a missing machine; a valid query against a missing machine is a
+    404 ``not_found``. Only ``GET`` is routed; other methods return 405
+    without reading records or computing a result.
+
+    On success the response carries exactly ``{machine_id, at,
+    effective_key, key_version, effective_from, rotation_id}`` in this fixed
+    key order, with ``at`` echoed verbatim. An instant before the machine's
+    ``created_at`` yields ``null`` key/from/rotation and version 0. With no
+    rotations the machine's current ``public_key``/``version``/``created_at``
+    apply and ``rotation_id`` is ``null``. With rotations the machine's
+    (created_at, id)-ordered events segment time: before the first event the
+    first record's ``old_public_key`` applies with ``effective_from`` the
+    machine's ``created_at`` and a ``null`` rotation id; from an event's own
+    ``created_at`` (inclusive) its ``new_public_key``, ``version``,
+    ``created_at``, and id apply.
+
+    A broken rotation chain, a non-consecutive version or key linkage, an
+    unparseable or non-monotonic historical timestamp, a last segment that
+    does not match the machine's current ``public_key``/``version``, or any
+    read-layer failure is a 500 ``internal_error`` with no partial timeline
+    and no repair attempt. The query is strictly read-only, touches only the
+    path machine's records, and repeated calls against unchanged data are
+    byte-identical. The body is compact UTF-8 JSON terminated by a single
+    newline and contains no floating-point or non-finite value.
+    """
+    try:
+        machine = session.get(Machine, machine_id)
+        if machine is None:
+            return error_response(404, "not_found")
+
+        events = session.scalars(
+            select(KeyRotationEvent)
+            .where(KeyRotationEvent.machine_id == machine_id)
+            .order_by(KeyRotationEvent.created_at, KeyRotationEvent.id)
+        ).all()
+
+        # A damaged chain (content hash, previous-rotation link, or chain
+        # hash) makes every historical answer unreliable: report an internal
+        # error rather than a partial or repaired timeline.
+        valid, _, _ = rotation_chain.verify_chain(session, machine_id)
+        if not valid:
+            return error_response(500, "internal_error")
+
+        machine_instant = parse_utc_z_datetime(machine.created_at)
+        instants = [parse_utc_z_datetime(event.created_at) for event in events]
+    except Exception:
+        return error_response(500, "internal_error")
+
+    # The stored timeline must be internally consistent: instants
+    # non-decreasing along the (created_at, id) chain order, each event's
+    # ``old_public_key`` continuing the previous event's ``new_public_key``,
+    # versions incrementing by one, and the last segment matching the
+    # machine's current ``public_key``/``version``.
+    previous_instant: datetime | None = None
+    previous_new_public_key: str | None = None
+    previous_version: int | None = None
+    for event, instant in zip(events, instants):
+        if (
+            (previous_instant is not None and instant < previous_instant)
+            or (
+                previous_new_public_key is not None
+                and event.old_public_key != previous_new_public_key
+            )
+            or (
+                previous_version is not None
+                and event.version != previous_version + 1
+            )
+        ):
+            return error_response(500, "internal_error")
+        previous_instant = instant
+        previous_new_public_key = event.new_public_key
+        previous_version = event.version
+    if events and (
+        events[-1].new_public_key != machine.public_key
+        or events[-1].version != machine.version
+    ):
+        return error_response(500, "internal_error")
+
+    at_instant = parse_utc_z_datetime(at)
+    if at_instant < machine_instant:
+        effective_key = None
+        key_version = 0
+        effective_from = None
+        rotation_id = None
+    elif not events:
+        effective_key = machine.public_key
+        key_version = machine.version
+        effective_from = machine.created_at
+        rotation_id = None
+    elif at_instant < instants[0]:
+        first = events[0]
+        effective_key = first.old_public_key
+        key_version = first.version - 1
+        effective_from = machine.created_at
+        rotation_id = None
+    else:
+        # Instants are non-decreasing, so the segment boundary is the last
+        # event whose own ``created_at`` is not after ``at``.
+        event = events[bisect.bisect_right(instants, at_instant) - 1]
+        effective_key = event.new_public_key
+        key_version = event.version
+        effective_from = event.created_at
+        rotation_id = event.id
+
+    payload = {
+        "machine_id": machine_id,
+        "at": at,
+        "effective_key": effective_key,
+        "key_version": key_version,
+        "effective_from": effective_from,
+        "rotation_id": rotation_id,
+    }
+    # Serialize by hand so the body is guaranteed compact UTF-8 JSON in a
+    # fixed field order, terminated by a single newline, and free of any
+    # floating-point or non-finite value (allow_nan=False).
+    body = (
+        json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        + "\n"
+    )
+    return Response(content=body, media_type="application/json")
+
+
 @app.post(
     "/machines/{machine_id}/behavior-declarations",
     status_code=201,
