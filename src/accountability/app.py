@@ -34,6 +34,7 @@ from . import (
     decision_basis,
     decision_basis_integrity,
     declaration_integrity,
+    declaration_state,
     diagnostics,
     evidence_chain,
     execution_receipts,
@@ -1670,6 +1671,77 @@ def get_behavior_declaration_changes(
         + "\n"
     )
     return Response(content=body, media_type="application/json")
+
+
+@app.post(
+    "/machines/{machine_id}/behavior-declarations/{declaration_id}/enabled",
+    response_model=BehaviorDeclarationOut,
+)
+async def set_behavior_declaration_enabled(
+    machine_id: str, declaration_id: str, request: Request
+):
+    """Disable or re-enable one existing behavior declaration.
+
+    The request carries no query string and a JSON object body with exactly
+    one field: ``enabled``, a strict JSON boolean. Validation runs before
+    any machine or declaration is read:
+
+    - any query parameter (or repeated parameter) is
+      ``422 {"error":{"code":"invalid_query"}}``;
+    - a missing or unparseable body, a body that is not a JSON object, a
+      missing or extra field, or an ``enabled`` value that is not a strict
+      boolean is ``422 {"error":{"code":"invalid_declaration_state_request"}}``
+      — even against a non-existent machine the query check still wins, and
+      every body check still precedes the lookups.
+
+    After validation a missing machine, a missing declaration, or a
+    declaration owned by another machine is
+    ``404 {"error":{"code":"not_found"}}``. A declaration already carrying
+    the target ``enabled`` value is ``409 declaration_state_unchanged`` and
+    writes nothing, so concurrent same-target requests serialize on the
+    database write lock with exactly one success. Only a real change is
+    committed: just ``enabled`` and ``updated_at`` (the commit-moment UTC
+    stamp ending in ``Z``) are updated, while ``id``, ``machine_id``,
+    ``action_type``, ``resource_pattern``, and ``created_at`` keep their
+    stored values. The success body carries the seven list-view fields in
+    the fixed order ``{id, machine_id, action_type, resource_pattern,
+    enabled, created_at, updated_at}``. The toggle writes no decision
+    event, evidence, incident, grant, receipt, or diagnostic record and
+    changes no machine status, policy rule, other declaration, or hash
+    chain; already-stored decision bases, authorization events, grants,
+    and receipts keep their historical conclusions, while new decisions
+    read the updated flag. The state survives restarts.
+    """
+    # Query validation precedes body parsing and every database read.
+    if request.query_params:
+        return error_response(422, "invalid_query")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return error_response(422, "invalid_declaration_state_request")
+    if not isinstance(payload, dict) or set(payload) != {"enabled"}:
+        return error_response(422, "invalid_declaration_state_request")
+    enabled = payload["enabled"]
+    # Only a strict JSON boolean is accepted: numbers, strings, null, and
+    # nested values are the same single invalid_declaration_state_request
+    # outcome.
+    if not isinstance(enabled, bool):
+        return error_response(422, "invalid_declaration_state_request")
+
+    engine = request.app.state.engine
+    result = declaration_state.set_declaration_enabled(
+        engine,
+        machine_id=machine_id,
+        declaration_id=declaration_id,
+        enabled=enabled,
+    )
+    status = result["status"]
+    if status == "not_found":
+        return error_response(404, "not_found")
+    if status == "declaration_state_unchanged":
+        return error_response(409, "declaration_state_unchanged")
+    return BehaviorDeclarationOut(**result["declaration"])
 
 
 class PolicyRuleCreate(BaseModel):
